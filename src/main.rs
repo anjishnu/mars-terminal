@@ -36,6 +36,13 @@ mod persona;
 mod prompts;
 mod tiers;
 mod themes;
+// Syntax highlighting is optional; without the `syntax` feature an inert stub takes
+// over (renders plain, never errors) and syntect isn't compiled in.
+#[cfg(feature = "syntax")]
+mod syntax;
+#[cfg(not(feature = "syntax"))]
+#[path = "syntax_stub.rs"]
+mod syntax;
 mod worklog;
 mod tuning;
 mod ui;
@@ -4210,6 +4217,45 @@ fn selfcheck() -> Result<()> {
             );
         }
         println!("[selfcheck] color-honesty guard ........ PASS");
+    }
+
+    // 40g. Syntax engine: with the `syntax` feature, a Rust snippet highlights into
+    //      several palette-derived colors (keyword = accent); without it, the stub
+    //      returns None and the caller renders plain.
+    {
+        let pal = tuning::Palette::mission_control();
+        let hl = syntax::highlight("fn main() { let n = 42; }\n", "rs", &pal);
+        #[cfg(feature = "syntax")]
+        {
+            use ratatui::style::Color;
+            let lines = hl.expect("rust should highlight with the syntax feature on");
+            let colors: std::collections::HashSet<Option<Color>> =
+                lines.iter().flatten().map(|(st, _)| st.fg).collect();
+            assert!(colors.len() >= 3, "expected several syntax colors, got {}", colors.len());
+            assert!(colors.contains(&Some(pal.accent)), "a keyword should take the theme accent");
+        }
+        #[cfg(not(feature = "syntax"))]
+        assert!(hl.is_none(), "the syntax stub must return None (plain render)");
+
+        // Render check: a real .rs buffer paints the keyword accent into the editor
+        // pane (the per-char syntax fg reaches the frame).
+        #[cfg(feature = "syntax")]
+        {
+            use ratatui::style::Color;
+            let dir = std::env::temp_dir().join(format!("mars-syn-{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            let f = dir.join("probe.rs");
+            std::fs::write(&f, "fn main() {\n    let n = 42;\n}\n")?;
+            let mut app = App::new(None)?;
+            app.open_file_in_new_tab(f.to_str().unwrap());
+            app.tuning.palette = tuning::Palette::mission_control(); // decouple from the user's theme
+            let mut term = Terminal::new(TestBackend::new(60, 10))?;
+            term.draw(|f| ui::render(f, &mut app))?;
+            let has_accent = term.backend().buffer().content().iter().any(|c| c.fg == Color::Rgb(217, 119, 87));
+            assert!(has_accent, "editor pane did not render syntax colors (keyword accent)");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        println!("[selfcheck] syntax highlight (engine) .. PASS");
     }
 
     // 41. LLM debug logging: a record round-trips to JSONL with real token totals,

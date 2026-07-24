@@ -32,11 +32,18 @@ path = "src/main.rs"
 # memory-free terminal that must also pass --selfcheck (retrieval_stub.rs).
 # `ssh` is the key broker + `mars ssh`/`mars keyd` (broker.rs + ssh.rs).
 # Default-on on Unix and Windows; without it broker_stub.rs takes their place.
-default = ["memory", "ssh"]
+default = ["memory", "ssh", "syntax"]
 memory = []
 ssh = []
+# `syntax` is code syntax highlighting (syntect, pure-Rust via fancy-regex — no C
+# toolchain). Off ⇒ no highlighting anywhere, renders plain; syntax_stub.rs takes
+# over and the dep isn't compiled, so a highlight-free SKU pays zero cost.
+syntax = ["dep:syntect"]
 
 [dependencies]
+# Pure-Rust syntax highlighting: `fancy-regex` avoids the Oniguruma C dependency so
+# it cross-compiles and builds on Windows with no toolchain. Optional, gated by `syntax`.
+syntect = { version = "5", default-features = false, features = ["default-fancy"], optional = true }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["bracketed-paste", "serde"] }
 ropey = "1.6"

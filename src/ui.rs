@@ -502,8 +502,6 @@ fn render_editor_pane(
         let c = (pane.cursor_row, pane.cursor_col);
         if a <= c { (a, c) } else { (c, a) }
     });
-    let sel_style = Style::default().bg(app.tuning.palette.selection_bg);
-    let search_style = Style::default().bg(app.tuning.palette.search_bg);
     // Teleport labels: high-contrast chip (accent bg, dark fg, bold).
     let label_style = Style::default()
         .bg(app.tuning.palette.accent_bright)
@@ -513,6 +511,28 @@ fn render_editor_pane(
     let numbers = app.tuning.line_numbers;
     // Passive matched-bracket pair (row, col) for both ends, computed once.
     let bracket = if focused { app.bracket_pair() } else { None };
+    // Syntax highlighting: highlight the whole buffer once (multi-line state carries
+    // across lines) → a per-char style for every source line. `None` ⇒ plain (feature
+    // off, disabled, unknown language, or a very large file — capped to bound the
+    // per-frame cost until a caching pass lands).
+    let syntax_styles: Option<Vec<Vec<Style>>> = if app.tuning.syntax_highlight == 1 && line_count <= 5000 {
+        buf.path
+            .as_ref()
+            .and_then(|p| p.extension().and_then(|e| e.to_str()))
+            .and_then(|ext| crate::syntax::highlight(&buf.rope.to_string(), ext, &app.tuning.palette))
+            .map(|lines| {
+                lines
+                    .into_iter()
+                    .map(|runs| {
+                        let mut per_char: Vec<Style> = Vec::new();
+                        for (st, text) in runs {
+                            for _ in text.chars() { per_char.push(st); }
+                        }
+                        per_char
+                    })
+                    .collect()
+            })
+    } else { None };
     for row_off in 0..vp_h {
         let row = pane.scroll_row + row_off;
         if row >= line_count {
@@ -582,29 +602,34 @@ fn render_editor_pane(
                 }
             }
 
-            if hl.iter().all(|&h| h == 0) {
-                spans.push(Span::styled(content, with_bg(Style::default())));
-            } else {
-                let mut i = 0;
-                while i < chars.len() {
-                    let kind = hl[i];
-                    if kind == 3 {
-                        let ch = label_ch[i].unwrap_or(chars[i]);
-                        spans.push(Span::styled(ch.to_string(), label_style));
-                        i += 1;
-                        continue;
-                    }
-                    let mut j = i;
-                    while j < chars.len() && hl[j] == kind && hl[j] != 3 { j += 1; }
-                    let text: String = chars[i..j].iter().collect();
-                    spans.push(match kind {
-                        1 => Span::styled(text, sel_style),
-                        2 => Span::styled(text, search_style),
-                        4 => Span::styled(text, with_bg(Style::default().fg(app.tuning.palette.accent).add_modifier(Modifier::BOLD))),
-                        _ => Span::styled(text, with_bg(Style::default())),
-                    });
-                    i = j;
+            // Resolve each cell: the syntax foreground (or default) is the base, then
+            // the bg layers by kind — selection/search win on background but keep the
+            // syntax colour; a matched bracket takes the accent. Runs coalesce by
+            // equal resolved style, so a plain line is still one span.
+            let syn: Option<&Vec<Style>> = syntax_styles.as_ref().and_then(|ls| ls.get(row));
+            let cell_style = |i: usize| -> Style {
+                let base = syn.and_then(|cs| cs.get(i).copied()).unwrap_or_default();
+                match hl[i] {
+                    1 => base.bg(app.tuning.palette.selection_bg),
+                    2 => base.bg(app.tuning.palette.search_bg),
+                    4 => with_bg(Style::default().fg(app.tuning.palette.accent).add_modifier(Modifier::BOLD)),
+                    _ => with_bg(base),
                 }
+            };
+            let mut i = 0;
+            while i < chars.len() {
+                if hl[i] == 3 {
+                    let ch = label_ch[i].unwrap_or(chars[i]);
+                    spans.push(Span::styled(ch.to_string(), label_style));
+                    i += 1;
+                    continue;
+                }
+                let st = cell_style(i);
+                let mut j = i + 1;
+                while j < chars.len() && hl[j] != 3 && cell_style(j) == st { j += 1; }
+                let text: String = chars[i..j].iter().collect();
+                spans.push(Span::styled(text, st));
+                i = j;
             }
             // Extend the tint across the whole row.
             if let Some(bg) = line_bg {

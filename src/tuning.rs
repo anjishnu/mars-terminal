@@ -93,6 +93,9 @@ pub struct Tuning {
     /// Show the line-number gutter in editor panes (position always lives in
     /// the status bar).
     pub line_numbers: bool,
+    /// Syntax-highlight code in editor panes (0 = off, 1 = on). Colors come from the
+    /// active theme; unknown languages render plain. No-op without the `syntax` build.
+    pub syntax_highlight: u64,
     /// Tint the cursor's line with a subtle background (0 = off, 1 = on).
     pub highlight_current_line: u64,
     /// The current-line tint color (used when highlight_current_line = 1).
@@ -165,6 +168,7 @@ impl Default for Tuning {
             theme_status_failed: [217, 83, 79],   // #D9534F conventional error red (failed)
             theme_status_blocked: [230, 165, 60], // #E6A53C conventional amber (blocked / waiting on you)
             line_numbers: false,
+            syntax_highlight: 1,
             highlight_current_line: 1,
             current_line_bg: [42, 37, 34],   // subtle warm tint on the cursor's row
             reading_width: 90,
@@ -304,6 +308,9 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
         ("line_numbers", knob(json!(d.line_numbers),
             "Show the line-number gutter in editor panes. The cursor position \
              is always in the status bar, so this defaults to off for width.")),
+        ("syntax_highlight", knob(json!(d.syntax_highlight),
+            "Syntax-highlight code in editor panes (0/1). Colors follow the active \
+             theme; unknown languages render plain. Needs the `syntax` build feature.")),
         ("highlight_current_line", knob(json!(d.highlight_current_line),
             "Tint the cursor's line with a subtle background (0 = off, 1 = on) \
              for focus. The color is `current_line_bg`.")),
@@ -493,6 +500,7 @@ pub fn load() -> Tuning {
             .get("line_numbers")
             .and_then(|e| e.value.as_bool())
             .unwrap_or(t.line_numbers);
+        t.syntax_highlight = get_u64(&map, "syntax_highlight", t.syntax_highlight);
         t.highlight_current_line = get_u64(&map, "highlight_current_line", t.highlight_current_line);
         t.current_line_bg = get_rgb(&map, "current_line_bg", t.current_line_bg);
         t.reading_width = get_u64(&map, "reading_width", t.reading_width);
