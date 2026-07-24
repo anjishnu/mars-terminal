@@ -1948,7 +1948,13 @@ impl App {
     /// tab when it is the tab's last pane. Behind the motor-slip confirm because the
     /// key sits right beside the navigation arrows.
     fn close_focused(&mut self) {
-        self.force_close_confirm = true;
+        // Short-circuit: a clean editor pane (no unsaved edits) closes without the
+        // motor-slip confirm. Only a dirty buffer or a live terminal still gates.
+        let clean_editor = match self.focused_pane().content {
+            PaneContent::Editor(buf_id) => self.buffers.get(&buf_id).map(|b| !b.modified).unwrap_or(true),
+            PaneContent::Terminal(_) => false,
+        };
+        self.force_close_confirm = !clean_editor;
         if self.tab().layout.count() > 1 {
             self.close_pane();
         } else {
@@ -3461,8 +3467,13 @@ impl App {
                 if !t.expanded.remove(&path) { t.expanded.insert(path); }
             }
             self.refresh_tree_rows();
+        } else if commit {
+            // Enter opens the file in a NEW TAB — a clean, non-destructive open
+            // (no split, no replacing the current pane).
+            self.open_file_in_new_tab(&path.to_string_lossy());
         } else {
-            self.show_file_in_pane(&path, commit);
+            // → previews the file in the current pane (reversible peek).
+            self.show_file_in_pane(&path, false);
         }
     }
 

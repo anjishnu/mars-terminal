@@ -1531,9 +1531,11 @@ fn selfcheck() -> Result<()> {
     // A second preview of the same file must not duplicate the buffer.
     app.handle_key(k(KeyCode::Right))?;
     assert_eq!(app.buffers.len(), bufs_before + 1, "preview duplicated the buffer");
-    // Enter COMMITS: opens the top match → focus returns to the editor.
+    // Enter COMMITS: opens the top match in a NEW TAB → focus returns to the editor.
+    let tabs_before = app.tabs.len();
     app.handle_key(k(KeyCode::Enter))?;
     assert!(matches!(app.mode, mode::Mode::Edit), "Enter on a tree file did not focus the editor");
+    assert_eq!(app.tabs.len(), tabs_before + 1, "navigator open should create a new tab");
     assert!(app.tree_open, "sidebar should stay open after opening a file");
     println!("[selfcheck] file tree (preview/open) .. PASS");
 
@@ -3700,17 +3702,27 @@ fn selfcheck() -> Result<()> {
     assert!(!app.watches.contains_key(&tid), "watch state not cleaned on reap");
     println!("[selfcheck] close gate reaps PTYs ..... PASS");
 
-    // 34. Space-warp d/q confirm even with NO live terminal — motor-slip guard
-    //     for destructive keys sitting next to navigation (P0.2).
+    // 34. Close short-circuit: a CLEAN editor pane closes without the motor-slip
+    //     confirm (a nice speed-up); a DIRTY buffer still gates. Live terminals are
+    //     covered by test 33.
     let mut app = App::new(None)?;
-    app.new_tab(); // 2 plain editor tabs, no terminals
+    app.new_tab(); // 2 clean editor tabs, no edits
     app.handle_key(kc(KeyCode::Char('t')))?; // C-t → warp
     assert!(app.mode == mode::Mode::Tab, "C-t did not enter space warp");
-    app.handle_key(k(KeyCode::Char('d')))?; // close-tab verb
-    assert!(app.mode == mode::Mode::Prompt, "warp 'd' did not confirm (motor-slip guard)");
+    app.handle_key(k(KeyCode::Char('d')))?; // close a CLEAN tab → no confirm
+    assert!(app.mode != mode::Mode::Prompt, "a clean-editor close should not confirm");
+    assert_eq!(app.tabs.len(), 1, "clean tab did not close immediately");
+    // A DIRTY buffer still gates (the motor-slip guard where it matters).
+    let mut app = App::new(None)?;
+    app.new_tab();          // tab 2, focused in Edit mode
+    typ(&mut app, "edit")?; // modify the buffer
+    assert!(app.focused_buf().modified, "typing did not mark the buffer modified");
+    app.handle_key(kc(KeyCode::Char('t')))?; // warp
+    app.handle_key(k(KeyCode::Char('d')))?;  // close the DIRTY tab
+    assert!(app.mode == mode::Mode::Prompt, "a dirty-buffer close did not confirm (motor-slip guard)");
     app.handle_key(k(KeyCode::Char('n')))?;
-    assert_eq!(app.tabs.len(), 2, "declined warp 'd' still closed the tab");
-    println!("[selfcheck] warp keys motor-slip gate . PASS");
+    assert_eq!(app.tabs.len(), 2, "declined close still removed the tab");
+    println!("[selfcheck] close short-circuit + gate .. PASS");
 
     // 34b. Unified space-warp grammar: ONE directional set (arrows) walks the whole
     //      workspace — between split panes by geometry, spilling into the adjacent
@@ -3742,11 +3754,9 @@ fn selfcheck() -> Result<()> {
         assert_eq!(app.tab().zoomed, Some(left), "warp z did not zoom the focused pane");
         app.handle_key(k(KeyCode::Char(' ')))?;
         assert_eq!(app.tab().zoomed, None, "warp Space did not un-zoom");
-        // d closes the focused view: in a 2-pane split it closes the pane (behind
-        // the motor-slip gate; y completes).
+        // d closes the focused view: in a 2-pane split it closes the pane. The panes
+        // are clean editors, so it closes immediately (no motor-slip gate — see 34).
         app.handle_key(k(KeyCode::Char('d')))?;
-        assert!(app.mode == mode::Mode::Prompt, "warp d did not gate the close");
-        app.handle_key(k(KeyCode::Char('y')))?;
         assert_eq!(app.tab().layout.count(), 1, "warp d did not close the focused pane");
         println!("[selfcheck] unified warp grammar ...... PASS");
     }
