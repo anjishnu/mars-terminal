@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.5.2
+
+Syntax highlighting — on by default, and built to never get in the way — plus a
+smoother first run and sharper agent context.
+
+### Added
+- **Syntax highlighting (on by default)** — code in editor panes colorizes against
+  the active theme. It runs on a **background worker** with a per-buffer cache, so the
+  render path never blocks: a file paints plain instantly, then colorizes
+  line-by-line as the worker delivers (the visible window first). Colors are
+  synthesized from the theme palette, so switching themes restyles code too. Toggle
+  per session with `C-x C-h` or the **Syntax highlighting** entry in the command bar;
+  `syntax_highlight = 0` starts it off.
+  - **Edits stay smooth.** The cache updates in place (never cleared, so nothing
+    flashes to white), and Enter/Backspace **splice** the cached colors so they travel
+    with their characters instead of shifting out of alignment. A debounced full
+    reparse (`syntax_recolor_ms`, default 150ms) catches up once typing pauses.
+  - **Languages**: syntect's bundled grammars plus a **bundled TypeScript** grammar
+    (`.ts`/`.tsx`/`.mts`/`.cts` — syntect ships JavaScript but not TS). Drop a
+    `.sublime-syntax` in `~/.mars/syntaxes/` to add more, no rebuild.
+- **`mars setup`** — how to get a free API key (Groq or Gemini) and wire it in, with a
+  live status line. The same guidance now appears at every no-key moment: after
+  `install.sh`, from headless commands that need a key, and as a dismissible notice
+  when the editor launches unconfigured.
+- The **English→shell translator** now sees an `ENV` line (shell, OS, working
+  directory), so it fits commands to your environment — macOS BSD vs GNU tools, `brew`
+  vs `apt`, and the right shell syntax.
+
+### Changed
+- **Away/watch verdicts** name the process's **exit code** and how long it had been
+  quiet; **explain-failure** ("why did this fail?") now includes the failing command
+  and its exit code; **cursor-insert** tells the model the buffer's language — so each
+  reads the situation it's actually in.
+- **Closing a clean (unmodified) editor pane skips the confirmation** — only unsaved
+  work asks. Opening a file from the **navigator opens a new tab** rather than
+  replacing the current pane.
+
 ## 0.5.1
 
 Themes, editor polish, and observability. The look is now fully tokenized, so a
