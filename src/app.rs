@@ -32,6 +32,60 @@ pub enum InputEvent {
     Resize(u16, u16),
 }
 
+impl InputEvent {
+    /// Whether this event, by itself, warrants a repaint. Crossterm enables
+    /// any-event mouse tracking, so a pointer sweep delivers a `Moved` per cell —
+    /// blanket-repainting on those streams a full rendered frame per motion over
+    /// a session socket, which is exactly the traffic `needs_redraw` exists to
+    /// avoid. Motion earns its repaint by changing something (`handle_mouse` sets
+    /// the flag itself when it does); everything else repaints as before.
+    pub fn forces_redraw(&self) -> bool {
+        !matches!(self, InputEvent::Mouse(m) if matches!(m.kind, MouseEventKind::Moved))
+    }
+}
+
+/// Which indexed list a clicked row belongs to. Rows are the one thing a chord
+/// can't address directly — the keyboard reaches them by moving a selection, so
+/// a click resolves to "select index N, then do what Enter does."
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowKind {
+    Tab,
+    Tree,
+    Command,
+    Workspace,
+}
+
+/// What a screen region does when clicked. `Act` is the common case and the
+/// point of the whole design: the mouse reaches the action registry through the
+/// same `run_action` funnel as chords, the bar, travel mode, and the agent — so
+/// the confirm gate and frecency apply to clicking without a line of new code.
+/// `PartialEq` so hover/pressed can ask "am I the region under the pointer?".
+#[derive(Clone, Debug, PartialEq)]
+pub enum HitTarget {
+    Act(Action),
+    Row(RowKind, usize),
+    /// Open mission control — the bar has no `Action` (it is the surface every
+    /// action is reached *through*), so it gets its own target.
+    OpenBar,
+    /// Leave a focused terminal for the editor — the click twin of C-g in a terminal,
+    /// which is hardcoded behavior in `handle_terminal` rather than a remappable
+    /// action, so (like `OpenBar`) it gets its own target.
+    FocusEditor,
+    DismissNotice,
+    /// A split boundary. `path` addresses the split from the layout root;
+    /// `origin`/`span` are the parent area's extent along the split axis, which
+    /// is what turns a pointer position into a ratio. Pressing here starts a
+    /// drag rather than acting — the only target that does.
+    Divider { path: Vec<u8>, vertical: bool, origin: u16, span: u16 },
+}
+
+/// One clickable rectangle, recorded by the renderer that drew it.
+#[derive(Clone, Debug)]
+pub struct HitRegion {
+    pub rect: Rect,
+    pub target: HitTarget,
+}
+
 /// The left file-tree sidebar's state (@ / C-x d).
 pub struct FileTree {
     /// Directory the tree is rooted at (`../` re-roots to the parent).
@@ -315,6 +369,24 @@ pub struct App {
     // ── Mouse ──
     /// Pane screen rects from the last render (pane_id, rect).
     pub pane_rects: Vec<(PaneId, Rect)>,
+    /// Clickable chrome from the last render, in paint order. Refilled every
+    /// frame by `ui::render`; hit-tested back-to-front so overlays drawn last
+    /// win over what they cover — the same ordering the renderer already relies
+    /// on, rather than a second z-index to keep in sync. A `RefCell` because the
+    /// renderers that draw chrome take `&App` (see `Pane::md_rendered_total` for
+    /// the same render-derived-through-a-shared-reference pattern).
+    pub hits: std::cell::RefCell<Vec<HitRegion>>,
+    /// The clickable region the pointer is currently over (resolved against the
+    /// last frame's registry). Renderers light it; `None` = over dead space. Only
+    /// a *change* earns a repaint — bare motion is otherwise dropped
+    /// (`InputEvent::forces_redraw`), so hover costs nothing while the pointer sits.
+    pub hovered: Option<HitTarget>,
+    /// The region under a held left button, drawn pressed until release — the
+    /// tactile "I clicked that" beat. Set on left-down over a hit, cleared on up.
+    pub pressed: Option<HitTarget>,
+    /// A one-line tooltip a renderer wants shown in the status bar this frame
+    /// (e.g. a clipped tab's full name on hover). Refilled every frame like `hits`.
+    pub hover_tip: std::cell::RefCell<Option<String>>,
     /// Focused pane's cursor screen position from the last render — anchors the
     /// W3 shell-translate overlay.
     pub cursor_screen: Option<(u16, u16)>,
@@ -327,6 +399,8 @@ pub struct App {
     pending_osc: Option<String>,
     // ── Behavioral tuning knobs (~/.config/mars/tuning.json) ──
     pub tuning: Tuning,
+    /// Host-health probes (uptime, load, memory, disk, GPU) for the SPACES line.
+    pub health: crate::health::Health,
     /// Show the MARS banner in the empty scratch until the first keypress.
     pub show_splash: bool,
     /// Directory new terminals open in — the parent of the first opened file.
@@ -437,6 +511,20 @@ pub struct App {
     replace_checkpointed: bool,
     /// Live terminal mouse drag-selection (copied on release).
     pub term_sel: Option<TermSel>,
+    /// A left button held down in an editor pane: (pane, press row, press col).
+    /// The anchor is NOT set until the pointer actually moves — several call
+    /// sites read "anchor is Some" as "a region exists" (Tab indents it, Esc
+    /// clears it instead of dismissing a notice), so a plain click must leave
+    /// exactly the caret it always did. Unlike a terminal drag this copies
+    /// nothing on release: the selection is the same object Shift+arrows makes,
+    /// and C-w/M-w still decide what leaves it.
+    editor_drag: Option<(PaneId, usize, usize)>,
+    /// (when, column, row, consecutive count) of the last press. Terminals report
+    /// no click count, so double/triple clicks are timed here against
+    /// `tuning.multi_click_ms`.
+    last_click: Option<(std::time::Instant, u16, u16, u8)>,
+    /// The split boundary currently being dragged: (path, vertical, origin, span).
+    border_drag: Option<(Vec<u8>, bool, u16, u16)>,
     pub frame_tick: u64,
     /// Render only when something visible changed. Set on input and by `tick()`
     /// when it moves visible state (terminal output, agent events, the spinner,
@@ -495,6 +583,13 @@ impl App {
             bar_return: Mode::Edit,
             bar_uses: state.bar_uses,
             pane_rects: Vec::new(),
+            hits: std::cell::RefCell::new(Vec::new()),
+            hovered: None,
+            pressed: None,
+            hover_tip: std::cell::RefCell::new(None),
+            editor_drag: None,
+            last_click: None,
+            border_drag: None,
             cursor_screen: None,
             // Env gate keeps selfchecks from touching the user's real clipboard.
             clipboard: if std::env::var("MARS_NO_SYSTEM_CLIPBOARD").is_ok()
@@ -506,6 +601,7 @@ impl App {
             },
             pending_osc: None,
             tuning: tuning::load(),
+            health: crate::health::Health::new(2),
             show_splash: file.is_none(),
             startup_cwd: file
                 .as_ref()
@@ -573,6 +669,7 @@ impl App {
             next_term_id: 0,
         };
         app.syntax_on = app.tuning.syntax_highlight == 1;
+        app.health = crate::health::Health::new(app.tuning.health_sample_secs.max(1));
         let buf_id = match file {
             Some(ref path) => app.open_file(path)?,
             None => app.new_scratch(),
@@ -3572,6 +3669,102 @@ impl App {
         }
     }
 
+    /// A navigator *click*: like arrowing to the row (highlight + stay in the tree),
+    /// but a file previews into a single reusable tab instead of piling up one tab
+    /// per click. Folders expand / `../` re-roots, exactly as the keyboard does.
+    fn tree_click_open(&mut self) {
+        let sel = self.file_tree.as_ref().map(|t| t.selected).unwrap_or(0);
+        let Some(row) = self.tree_rows.get(sel) else { return };
+        if row.updir || row.is_dir {
+            self.tree_activate(false); // the dir/updir branches ignore `commit`
+            return;
+        }
+        let path = row.path.clone();
+        self.preview_file_from_tree(&path);
+    }
+
+    /// Show `path` in the preview tab, reusing it across clicks. The tab is pinned
+    /// the moment its buffer is edited: after that the dirtied tab is left alone and
+    /// the next click starts a fresh preview — VS Code's "italic tab" rule.
+    fn preview_file_from_tree(&mut self, path: &std::path::Path) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.preview) {
+            let pid = self.tabs[idx].focused_pane;
+            let reusable = match self.panes.get(&pid).map(|p| &p.content) {
+                Some(PaneContent::Editor(b)) => !self.buffers.get(b).map(|b| b.modified).unwrap_or(true),
+                _ => false, // no longer a clean editor pane → don't reuse
+            };
+            if reusable {
+                self.active_tab = idx;
+                self.swap_preview_file(idx, path);
+                return;
+            }
+            self.tabs[idx].preview = false; // edited (or repurposed) → promote to a real tab
+        }
+        self.open_preview_tab(path);
+    }
+
+    /// Swap the file shown in preview tab `idx`, reusing an already-open buffer and
+    /// discarding the outgoing preview buffer when it's clean and unreferenced — so
+    /// exploring a directory leaves neither extra tabs nor orphan buffers behind.
+    fn swap_preview_file(&mut self, idx: usize, path: &std::path::Path) {
+        let existing = self.buffers.values().find(|b| b.path.as_deref() == Some(path)).map(|b| b.id);
+        let new_buf = match existing {
+            Some(id) => id,
+            None => match self.open_file(&path.to_string_lossy()) {
+                Ok(id) => id,
+                Err(e) => { self.status_msg = Some(format!("Can't open {}: {e}", path.display())); return; }
+            },
+        };
+        let pid = self.tabs[idx].focused_pane;
+        let old_buf = match self.panes.get(&pid).map(|p| p.content.clone()) {
+            Some(PaneContent::Editor(b)) => Some(b),
+            _ => None,
+        };
+        if let Some(pane) = self.panes.get_mut(&pid) {
+            pane.content = PaneContent::Editor(new_buf);
+            pane.buffer_id = new_buf;
+            pane.cursor_row = 0; pane.cursor_col = 0; pane.scroll_row = 0;
+            pane.selection_anchor = None;
+        }
+        self.tabs[idx].name = Self::file_label(path);
+        if let Some(old) = old_buf {
+            if old != new_buf { self.gc_orphan_buffer(old); }
+        }
+    }
+
+    /// Open `path` in a NEW tab flagged as the preview slot, staying in the
+    /// navigator — unlike `open_file_in_new_tab`, which jumps focus to the editor.
+    fn open_preview_tab(&mut self, path: &std::path::Path) {
+        match self.open_file(&path.to_string_lossy()) {
+            Ok(buf_id) => {
+                let pane_id = self.alloc_pane(buf_id);
+                let id = self.alloc_tab_id();
+                let mut tab = crate::tab::Tab::new(id, Self::file_label(path), pane_id);
+                tab.preview = true;
+                self.tabs.push(tab);
+                self.active_tab = self.tabs.len() - 1;
+            }
+            Err(e) => self.status_msg = Some(format!("Can't open {}: {e}", path.display())),
+        }
+    }
+
+    /// Drop a buffer no pane shows anymore — but never a modified one, and never the
+    /// last buffer standing.
+    fn gc_orphan_buffer(&mut self, buf: BufferId) {
+        if self.buffers.len() <= 1 { return; }
+        let clean = !self.buffers.get(&buf).map(|b| b.modified).unwrap_or(true);
+        let referenced = self.panes.values().any(|p| matches!(p.content, PaneContent::Editor(id) if id == buf));
+        if clean && !referenced {
+            self.buffers.remove(&buf);
+        }
+    }
+
+    /// A file's display name (its basename), falling back to the full path.
+    fn file_label(path: &std::path::Path) -> String {
+        path.file_name().and_then(|s| s.to_str()).map(str::to_string)
+            .unwrap_or_else(|| path.to_string_lossy().to_string())
+    }
+
     /// ←: collapse an expanded folder, else jump selection to the parent row.
     fn tree_collapse(&mut self) {
         let sel = self.file_tree.as_ref().map(|t| t.selected).unwrap_or(0);
@@ -4617,6 +4810,22 @@ impl App {
                         if s.verdict == crate::briefing::Verdict::Running)
                 })
             {
+                self.needs_redraw = true;
+            }
+        }
+
+        // Host-health probes for the SPACES line. Cheap metrics sample continuously so
+        // the memory average stays warm; the GPU poll (off-thread) and the repaint only
+        // happen while the panel (bar) is open. `maybe_sample` self-throttles to the
+        // configured cadence.
+        if self.tuning.health_line == 1 {
+            let vis = matches!(self.mode, Mode::Bar);
+            let cwd = self
+                .startup_cwd
+                .clone()
+                .or_else(|| self.run_cwd.clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            if self.health.maybe_sample(&cwd, vis) && vis {
                 self.needs_redraw = true;
             }
         }
@@ -5884,11 +6093,15 @@ impl App {
             match events.recv_timeout(Duration::from_millis(self.tuning.poll_interval_ms)) {
                 Ok(first) => {
                     // Apply the first event, then drain whatever else queued.
+                    let mut visible = first.forces_redraw();
                     self.apply_input(first)?;
                     while let Ok(ev) = events.try_recv() {
+                        visible |= ev.forces_redraw();
                         self.apply_input(ev)?;
                     }
-                    self.needs_redraw = true; // input → repaint
+                    if visible {
+                        self.needs_redraw = true; // input → repaint
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break, // input source gone
@@ -5915,9 +6128,138 @@ impl App {
 
     // ── Mouse ────────────────────────────────────────────────────────────────
 
+    /// Start a fresh frame's hit registry. Called by `ui::render` before drawing.
+    pub fn hits_clear(&self) {
+        self.hits.borrow_mut().clear();
+        *self.hover_tip.borrow_mut() = None;
+    }
+
+    /// Record a clickable region. Called by whichever renderer drew it, which is
+    /// the only place that knows the rectangle.
+    pub fn hit(&self, rect: Rect, target: HitTarget) {
+        self.hits.borrow_mut().push(HitRegion { rect, target });
+    }
+
+    /// Whether `t` is the region under the pointer / held down — the two questions
+    /// a renderer asks to light a chip on hover or draw it pressed.
+    pub fn is_hovered(&self, t: &HitTarget) -> bool { self.hovered.as_ref() == Some(t) }
+    pub fn is_pressed(&self, t: &HitTarget) -> bool { self.pressed.as_ref() == Some(t) }
+
+    /// Topmost region under a point: last drawn wins.
+    fn hit_test(&self, col: u16, row: u16) -> Option<HitTarget> {
+        self.hits
+            .borrow()
+            .iter()
+            .rev()
+            .find(|h| {
+                col >= h.rect.x
+                    && col < h.rect.x + h.rect.width
+                    && row >= h.rect.y
+                    && row < h.rect.y + h.rect.height
+            })
+            .map(|h| h.target.clone())
+    }
+
+    /// Resolve a clicked region. Row targets move the selection and then run the
+    /// keyboard's own activation path, so a click can never mean something the
+    /// keyboard doesn't already mean.
+    fn dispatch_hit(&mut self, target: HitTarget) {
+        // Click-to-teach: a click flashes the chord it stands in for, so the mouse
+        // teaches the keyboard rather than replacing it (the on-ramp doctrine). Read
+        // the chord before dispatch, show it after so `run_action` can't clobber it.
+        let teach = match &target {
+            HitTarget::Act(a) => self.keys.binding_for(a),
+            HitTarget::FocusEditor => Some("C-g".to_string()),
+            HitTarget::OpenBar => {
+                let s = self
+                    .keys
+                    .bar_open
+                    .iter()
+                    .map(|c| crate::config::render_chords(std::slice::from_ref(c)))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                if s.is_empty() { None } else { Some(s) }
+            }
+            _ => None,
+        };
+        match target {
+            HitTarget::Act(a) => self.run_action(a),
+            HitTarget::OpenBar => {
+                self.bar_return = self.mode.clone();
+                self.open_bar(BarMode::Command);
+            }
+            HitTarget::FocusEditor => {
+                // Exactly what C-g does from a terminal: hand the keyboard back to the
+                // editor. The pane still shows the shell; you've just left its capture.
+                self.mode = Mode::Edit;
+            }
+            HitTarget::DismissNotice => {
+                self.dismiss_notice();
+            }
+            // Pressing a boundary arms a drag; the motion does the work.
+            HitTarget::Divider { path, vertical, origin, span } => {
+                self.border_drag = Some((path, vertical, origin, span));
+            }
+            HitTarget::Row(RowKind::Tab, i) => self.goto_tab(i + 1),
+            HitTarget::Row(RowKind::Tree, i) => {
+                // A navigator click mirrors keyboard navigation: move the highlight
+                // to this row and stay IN the tree (Tree mode → the row renders
+                // selected). A folder expands; a file previews into ONE reusable tab
+                // rather than committing a new tab per click.
+                if let Some(t) = self.file_tree.as_mut() {
+                    t.selected = i;
+                }
+                self.mode = Mode::Tree;
+                self.tree_click_open();
+            }
+            HitTarget::Row(RowKind::Command, i) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.selected = i;
+                    p.navigated = true;
+                }
+                let kind = self.bar_rows().into_iter().nth(i).map(|r| r.kind);
+                self.activate_kind(kind);
+            }
+            HitTarget::Row(RowKind::Workspace, i) => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.sel_ws = i;
+                }
+                if let Some(crate::palette::ItemKind::Surface(s)) =
+                    self.bar_workspace_rows().into_iter().nth(i).map(|r| r.kind)
+                {
+                    self.jump_to_surface(s);
+                }
+            }
+        }
+        if let Some(chord) = teach {
+            self.status_msg = Some(format!("↦ {chord}"));
+        }
+        self.needs_redraw = true;
+    }
+
     /// Click focuses a pane (and positions the cursor); wheel scrolls.
-    /// Only active in Edit/Terminal — the bar and prompts own the keyboard.
+    /// Chrome registered in the hit registry is clickable from ANY mode — the
+    /// tab bar and the navigator belong to Mars whatever owns the keyboard.
+    /// Pane interiors keep their own path below, still Edit/Terminal only.
     pub fn handle_mouse(&mut self, m: MouseEvent) {
+        // Hover, in every mode and before anything else: track the region under
+        // the pointer (resolved against the last frame's still-valid registry) so
+        // chrome can light it. Only a *change* repaints — bare motion is otherwise
+        // dropped by `forces_redraw`, so a resting pointer costs nothing.
+        if matches!(m.kind, MouseEventKind::Moved) {
+            let now = self.hit_test(m.column, m.row);
+            if now != self.hovered {
+                self.hovered = now;
+                self.needs_redraw = true;
+            }
+            return;
+        }
+        // Releasing the button ends the pressed-flash. Fall through so the border
+        // drag's own `Up` handling below still runs.
+        if matches!(m.kind, MouseEventKind::Up(MouseButton::Left)) && self.pressed.is_some() {
+            self.pressed = None;
+            self.needs_redraw = true;
+        }
         // The ask transcript scrolls under the wheel too (same as the Up/Down
         // keys), so reviewing past turns doesn't require leaving the mouse.
         if matches!(self.mode, Mode::Bar)
@@ -5934,7 +6276,47 @@ impl App {
             }
             return;
         }
-        if !matches!(self.mode, Mode::Edit | Mode::Terminal) {
+        // Registry first, in every mode: chrome and overlays are Mars's, and a
+        // click on them must work while a prompt, the bar, or the tree owns the
+        // keyboard. Pane interiors register nothing, so they fall through.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(target) = self.hit_test(m.column, m.row) {
+                self.pressed = Some(target.clone());
+                self.dispatch_hit(target);
+                return;
+            }
+        }
+        // A boundary drag outlives the press: it must keep resizing in any mode,
+        // and it outranks whatever the pointer is now over (you are allowed to
+        // drag a divider straight across another pane).
+        if let Some((path, vertical, origin, span)) = self.border_drag.clone() {
+            match m.kind {
+                // Drag only, never Moved: SGR reports held-button motion as Drag,
+                // so accepting bare motion buys nothing and would make the panes
+                // follow the pointer forever if a release were ever missed.
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if span > 0 {
+                        let at = if vertical { m.column } else { m.row };
+                        let ratio = (at.saturating_sub(origin) as u32 * 100 / span as u32) as u16;
+                        let tab = self.tab_mut();
+                        tab.layout.set_ratio(&path, ratio);
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.border_drag = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // Pane interaction (focus, selection, wheel) also works FROM the navigator:
+        // a click on a pane leaves the tree and focuses it (so you can type), and the
+        // wheel scrolls the pane under the pointer without a click first. The tree
+        // sidebar registers its own hit regions above, so a click there is dispatched
+        // before we ever reach here — only clicks on an actual pane fall through.
+        if !matches!(self.mode, Mode::Edit | Mode::Terminal | Mode::Tree) {
             return;
         }
         match m.kind {
@@ -5984,6 +6366,17 @@ impl App {
                             p.cursor_row = row;
                             p.cursor_col = col;
                             p.col_affinity = col;
+                            match self.click_count(m.column, m.row) {
+                                // Double: the word under the pointer. Triple: the
+                                // whole line. Both leave a normal selection behind,
+                                // so every existing verb (C-w, M-w, refactor) works
+                                // on it unchanged.
+                                2 => self.select_word_at(pane_id, buf_id, row, col),
+                                n if n >= 3 => self.select_line_at(pane_id, buf_id, row),
+                                // Single: remember where the press landed; a drag
+                                // (not the press) is what turns it into a region.
+                                _ => self.editor_drag = Some((pane_id, row, col)),
+                            }
                         }
                     }
                     None => {}
@@ -5996,6 +6389,44 @@ impl App {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = matches!(m.kind, MouseEventKind::ScrollUp);
                 let n = self.tuning.wheel_scroll_lines;
+                // A terminal UNDER THE POINTER scrolls even without focus or a click,
+                // so a shell keeps scrolling while the navigator (or another pane) holds
+                // the keyboard — "scroll the thing I'm pointing at". Editor panes keep
+                // their focused/Edit-mode behavior in the fallback below.
+                let ptr_term = self.pane_rects.iter()
+                    .find(|(_, r)| m.column >= r.x && m.column < r.x + r.width
+                        && m.row >= r.y && m.row < r.y + r.height)
+                    .and_then(|(id, r)| match self.panes.get(id).map(|p| p.content.clone()) {
+                        Some(PaneContent::Terminal(tid)) => Some((tid, *r)),
+                        _ => None,
+                    });
+                if let Some((tid, rect)) = ptr_term {
+                    let Some(t) = self.terms.get_mut(&tid) else { return };
+                    let screen = t.screen();
+                    let delta = if up { n as i64 } else { -(n as i64) };
+                    if t.view_offset() > 0 {
+                        t.scroll_view(delta);
+                    } else if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+                        let (mut x, mut y) = (1u16, 1u16);
+                        if m.column > rect.x && m.row > rect.y {
+                            x = (m.column - rect.x).min(rect.width.saturating_sub(2).max(1));
+                            y = (m.row - rect.y).min(rect.height.saturating_sub(2).max(1));
+                        }
+                        let bytes = encode_wheel(&screen, up, x, y);
+                        t.send_bytes(&bytes);
+                    } else if screen.alternate_screen() {
+                        let seq: &[u8] = match (up, screen.application_cursor()) {
+                            (true, false) => b"\x1b[A",
+                            (true, true) => b"\x1bOA",
+                            (false, false) => b"\x1b[B",
+                            (false, true) => b"\x1bOB",
+                        };
+                        for _ in 0..n { t.send_bytes(seq); }
+                    } else {
+                        t.scroll_view(delta);
+                    }
+                    return;
+                }
                 let fid = self.focused_pane_id();
                 let rect = self.pane_rects.iter().find(|(id, _)| *id == fid).map(|(_, r)| *r);
                 match self.focused_pane().content {
@@ -6075,12 +6506,45 @@ impl App {
                         m.column.saturating_sub(sel.ox).min(sel.vw.saturating_sub(1)),
                     );
                 }
+                // Editor drag: move the cursor; the anchor set on press makes
+                // that a selection, exactly as Shift+arrows would.
+                if let Some((pane_id, from_row, from_col)) = self.editor_drag {
+                    let rect = self.pane_rects.iter().find(|(id, _)| *id == pane_id).map(|(_, r)| *r);
+                    let buf_id = match self.panes.get(&pane_id).map(|p| p.content.clone()) {
+                        Some(PaneContent::Editor(id)) => Some(id),
+                        _ => None,
+                    };
+                    if let (Some(rect), Some(buf_id)) = (rect, buf_id) {
+                        let inner_x = rect.x + 1 + crate::ui::gutter_width(&self.tuning);
+                        let inner_y = rect.y + 1;
+                        let scroll = self.panes[&pane_id].scroll_row;
+                        // Clamp to the pane: dragging past an edge extends to it
+                        // rather than dropping the event.
+                        let vrow = m.row.max(inner_y).min(rect.y + rect.height.saturating_sub(2));
+                        let row = (scroll + (vrow - inner_y) as usize)
+                            .min(self.buffers[&buf_id].line_count().saturating_sub(1));
+                        let col = (m.column.saturating_sub(inner_x) as usize)
+                            .min(self.buffers[&buf_id].line_len(row));
+                        let p = self.panes.get_mut(&pane_id).unwrap();
+                        // First motion of this drag anchors it at the press point.
+                        if p.selection_anchor.is_none() {
+                            p.selection_anchor = Some((from_row, from_col));
+                        }
+                        p.cursor_row = row;
+                        p.cursor_col = col;
+                        p.col_affinity = col;
+                    }
+                }
             }
             // Release: copy the selected terminal text to the clipboard — but
             // only for a real drag. A plain click (anchor == end) is focus, not
             // a selection; copying a 1-char "selection" would silently clobber
             // the clipboard on every click.
             MouseEventKind::Up(MouseButton::Left) => {
+                // An editor drag ends without copying: unlike a terminal, the text
+                // is already reachable, and auto-copy is what made a plain click
+                // clobber the clipboard (P1.4).
+                self.editor_drag = None;
                 if let Some(sel) = self.term_sel.take() {
                     let text = if sel.anchor == sel.end {
                         String::new()
@@ -6097,6 +6561,59 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// How many consecutive clicks this press makes (1, 2, 3, …). A terminal
+    /// sends two clicks as two independent presses with no count, so "double"
+    /// means "same cell, within `multi_click_ms`."
+    fn click_count(&mut self, col: u16, row: u16) -> u8 {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_millis(self.tuning.multi_click_ms);
+        let n = match self.last_click {
+            Some((t, c, r, n)) if c == col && r == row && now.duration_since(t) <= window => {
+                n.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, col, row, n));
+        n
+    }
+
+    /// Select the word under (row, col) — the double-click verb. Word here is the
+    /// identifier sense (alphanumeric + `_`), matching what `move_token_*` treats
+    /// as one hop, so double-click and ⌘←/→ agree about where words end.
+    fn select_word_at(&mut self, pane_id: PaneId, buf_id: BufferId, row: usize, col: usize) {
+        let line: Vec<char> = self.buffers[&buf_id].line_str(row).chars().collect();
+        if line.is_empty() {
+            return;
+        }
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        // A click past the last character selects the last word, not nothing.
+        let at = col.min(line.len().saturating_sub(1));
+        if !is_word(line[at]) {
+            return;
+        }
+        let mut s = at;
+        while s > 0 && is_word(line[s - 1]) {
+            s -= 1;
+        }
+        let mut e = at;
+        while e + 1 < line.len() && is_word(line[e + 1]) {
+            e += 1;
+        }
+        let p = self.panes.get_mut(&pane_id).unwrap();
+        p.selection_anchor = Some((row, s));
+        p.cursor_col = e + 1;
+        p.col_affinity = e + 1;
+    }
+
+    /// Select the whole line — the triple-click verb.
+    fn select_line_at(&mut self, pane_id: PaneId, buf_id: BufferId, row: usize) {
+        let len = self.buffers[&buf_id].line_len(row);
+        let p = self.panes.get_mut(&pane_id).unwrap();
+        p.selection_anchor = Some((row, 0));
+        p.cursor_col = len;
+        p.col_affinity = len;
     }
 
     /// Extract the text under a terminal drag-selection.

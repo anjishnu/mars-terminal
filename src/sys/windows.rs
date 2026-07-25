@@ -494,3 +494,13 @@ pub mod shell {
             .unwrap_or(false)
     }
 }
+
+/// Host health probes — Windows stubs (return None until wired to
+/// GlobalMemoryStatusEx / GetDiskFreeSpaceExW). The SPACES line simply omits any
+/// segment it can't source, so `None` degrades cleanly.
+pub mod health {
+    use std::path::Path;
+    pub fn load_avg1() -> Option<f64> { None }
+    pub fn disk_free_pct(_path: &Path) -> Option<u8> { None }
+    pub fn mem_used_pct() -> Option<u8> { None }
+}

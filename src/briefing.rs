@@ -26,6 +26,17 @@ impl Verdict {
         }
     }
 
+    /// The one-word status label shown to the user (workspaces panel, tab tooltip).
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Failed => "failed",
+            Verdict::Blocked => "blocked",
+            Verdict::Done => "done",
+            Verdict::Running => "running",
+            Verdict::Context => "idle",
+        }
+    }
+
     /// Live-attention rank — needs-you first. The ONE order every live view sorts
     /// by: the tab bar's worst-pane aggregate, the bottom summary, and the
     /// command-bar board. (Deliberately distinct from the derived `Ord`, which is

@@ -61,9 +61,9 @@ impl Mode {
             // "to editor" (not "detach") — C-g leaves the pane; session detach is
             // C-x C-d.
             Mode::Terminal => &[
-                ("C-g",   "to editor"),
                 ("C-Spc", "commands"),
-                ("type",  "to shell"),
+                ("C-t",   "warp"),
+                ("C-g",   "editor"),
             ],
             Mode::Tree => &[
                 ("↑↓",   "move"),

@@ -126,6 +126,28 @@ impl PaneLayout {
         }
     }
 
+    /// Set one split's ratio outright, addressed by the path from the root (0 =
+    /// first child, 1 = second). A dragged border must move *that* boundary — the
+    /// keyboard's `resize` picks the innermost split around the focus, which is a
+    /// different split whenever the pane you grabbed the edge of sits inside a
+    /// nested one. Absolute rather than incremental so the divider tracks the
+    /// pointer exactly instead of accumulating rounding error.
+    pub fn set_ratio(&mut self, path: &[u8], ratio: u16) -> bool {
+        let r = ratio.clamp(RATIO_MIN, RATIO_MAX);
+        match (self, path.split_first()) {
+            (PaneLayout::HSplit { ratio: cur, .. }, None)
+            | (PaneLayout::VSplit { ratio: cur, .. }, None) => {
+                *cur = r;
+                true
+            }
+            (PaneLayout::HSplit { top, bottom, .. }, Some((&step, rest)))
+            | (PaneLayout::VSplit { left: top, right: bottom, .. }, Some((&step, rest))) => {
+                if step == 0 { top.set_ratio(rest, r) } else { bottom.set_ratio(rest, r) }
+            }
+            _ => false,
+        }
+    }
+
     /// Remove `id`, promoting its sibling. Returns false if this is the only pane.
     pub fn remove(&mut self, id: PaneId) -> bool {
         match self {

@@ -59,6 +59,10 @@ fn clear_panel(frame: &mut Frame, app: &App, rect: Rect) {
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    // Clickable chrome is recorded as it's drawn; the registry is only ever as
+    // current as this frame.
+    app.hits_clear();
+
     // Paint the whole frame in the theme's surface first, so a committed background
     // (Paper's cream, Hacker's black) is consistent everywhere — not just where a
     // widget happens to set a bg. Transparent for Mission Control / a Reset surface
@@ -323,24 +327,51 @@ pub(crate) fn workspace_name(app: &App, tab: &crate::tab::Tab, num: usize) -> St
 
 fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     let mut spans: Vec<Span> = Vec::new();
+    // Running x so each tab can register the cells it actually occupies.
+    let mut x = area.x;
     for (i, tab) in app.tabs.iter().enumerate() {
         // Every tab: a status BUBBLE in the same position (colored by the worst-pane
         // verdict; grey = idle) then the name. Consistent shape + position, colour the
         // only varying dimension.
-        let bubble = verdict_color(app, app.tab_status(tab));
+        let verdict = app.tab_status(tab);
+        let bubble = verdict_color(app, verdict);
         let name = workspace_name(app, tab, i + 1);
+        let target = crate::app::HitTarget::Row(crate::app::RowKind::Tab, i);
+        let hot = app.is_hovered(&target);
+        // A preview tab (the reusable navigator slot) is italic — VS Code's cue that
+        // it's ephemeral and will be swapped out by the next click.
+        let ital = if tab.preview { Modifier::ITALIC } else { Modifier::empty() };
         if i == app.active_tab {
             // The active tab is inverted chrome (you're looking at it); its bubble
             // recedes into the chip color, but stays in the same slot.
             let chip = app.tuning.palette.on_accent;
-            let accent = app.tuning.palette.accent;
+            let bg = if app.is_pressed(&target) { app.tuning.palette.accent_dark } else { app.tuning.palette.accent };
             spans.push(Span::styled(format!(" ● {name} "),
-                Style::default().fg(chip).bg(accent).add_modifier(Modifier::BOLD)));
+                Style::default().fg(chip).bg(bg).add_modifier(Modifier::BOLD | ital)));
+        } else if hot {
+            // Hover previews the ACTIVE look — filling the same `● name` cells the
+            // active chip fills (dot included), just a lighter bg — so the hover band
+            // and the switched-to band line up exactly (not a name-only highlight).
+            spans.push(Span::styled(format!(" ● {name} "),
+                Style::default().fg(app.tuning.palette.on_accent).bg(app.tuning.palette.accent_bright).add_modifier(Modifier::BOLD | ital)));
         } else {
             spans.push(Span::styled(" ● ", Style::default().fg(bubble)));
-            spans.push(Span::styled(format!("{name} "), Style::default().fg(app.tuning.palette.text_dim)));
+            spans.push(Span::styled(format!("{name} "),
+                Style::default().fg(app.tuning.palette.text_dim).add_modifier(ital)));
         }
         spans.push(Span::styled("│", Style::default().fg(app.tuning.palette.text_faint)));
+        // " ● " + name + " " — the same cells the spans above just claimed.
+        let w = (3 + name.chars().count() + 1) as u16;
+        if x < area.right() {
+            let vis = w.min(area.right() - x);
+            app.hit(Rect { x, y: area.y, width: vis, height: 1 }, target);
+            // Hovering a tab surfaces that workspace's status (and its full name, so a
+            // clipped label is legible too) in the status bar, rendered just after.
+            if hot {
+                *app.hover_tip.borrow_mut() = Some(format!("{name} · {}", verdict.label()));
+            }
+        }
+        x = x.saturating_add(w + 1); // + the │ separator
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
     // (The top-right status counter/beacon was removed: it counted finished-Done
@@ -375,6 +406,50 @@ fn compute_rects(layout: &PaneLayout, area: Rect) -> Vec<(PaneId, Rect)> {
     }
 }
 
+/// Walk the layout the same way `compute_rects` does, collecting each split's
+/// draggable boundary. `origin`/`span` are the parent area's extent along the
+/// split axis, so a drag can turn a pointer position straight into a ratio.
+/// Mirrors `compute_rects`' arithmetic — the two must stay in step, which is why
+/// they sit next to each other.
+fn compute_dividers(
+    layout: &PaneLayout,
+    area: Rect,
+    path: &mut Vec<u8>,
+    out: &mut Vec<(Rect, Vec<u8>, bool, u16, u16)>,
+) {
+    match layout {
+        PaneLayout::Single(_) => {}
+        PaneLayout::HSplit { top, bottom, ratio } => {
+            let halves = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(*ratio), Constraint::Percentage(100 - *ratio)])
+                .split(area);
+            // The seam: the first child's last row and the second's first, which
+            // is where both panes paint their own border.
+            let y = halves[0].bottom().saturating_sub(1);
+            out.push((
+                Rect { x: area.x, y, width: area.width, height: 2.min(area.bottom().saturating_sub(y)) },
+                path.clone(), false, area.y, area.height,
+            ));
+            path.push(0); compute_dividers(top, halves[0], path, out); path.pop();
+            path.push(1); compute_dividers(bottom, halves[1], path, out); path.pop();
+        }
+        PaneLayout::VSplit { left, right, ratio } => {
+            let halves = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(*ratio), Constraint::Percentage(100 - *ratio)])
+                .split(area);
+            let x = halves[0].right().saturating_sub(1);
+            out.push((
+                Rect { x, y: area.y, width: 2.min(area.right().saturating_sub(x)), height: area.height },
+                path.clone(), true, area.x, area.width,
+            ));
+            path.push(0); compute_dividers(left, halves[0], path, out); path.pop();
+            path.push(1); compute_dividers(right, halves[1], path, out); path.pop();
+        }
+    }
+}
+
 fn render_panes(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused_id = app.focused_pane_id();
 
@@ -399,6 +474,17 @@ fn render_panes(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Remember pane rects for mouse hit-testing.
     app.pane_rects = rects.clone();
+
+    // Split boundaries are draggable. Registered BEFORE the panes paint, so the
+    // pane-interior path (which registers nothing) can't shadow them, and a
+    // zoomed pane — which has no visible seams — contributes none.
+    if app.tabs[app.active_tab].zoomed.is_none() {
+        let mut dividers = Vec::new();
+        compute_dividers(&app.tabs[app.active_tab].layout, area, &mut Vec::new(), &mut dividers);
+        for (rect, path, vertical, origin, span) in dividers {
+            app.hit(rect, crate::app::HitTarget::Divider { path, vertical, origin, span });
+        }
+    }
 
     // Update scroll offsets now that we know the real viewport heights.
     let margin = app.tuning.scroll_margin;
@@ -1390,36 +1476,90 @@ fn conv_bg(app: &App, c: vt100::Color) -> Color {
 
 // ── Status bar ───────────────────────────────────────────────────────────────
 
-/// Hint pairs for the status bar. Edit-mode hints are derived live from the
-/// keymap so they stay honest after a remap; other modes are fixed UI keys.
-fn status_hints(app: &App) -> Vec<(String, String)> {
+/// One bottom-bar hint: a key badge, its label, and — when the chord maps to a
+/// real action in this mode — the click target that makes the chip a button.
+/// `None` targets (e.g. Terminal's "type to shell") render as plain, inert labels.
+type Hint = (String, String, Option<crate::app::HitTarget>);
+
+/// Render one hint chip into `spans`, register its click region when it has a
+/// target, and light it on hover / recess it on press. Returns the advanced x.
+/// A chip is ` key :label ` followed by a two-cell gap; the clickable rect covers
+/// the badge and label but not the gap. Widths are `chars().count()` to match how
+/// the tab bar measures its own cells (all hint glyphs are single-width).
+fn push_chip(
+    app: &App,
+    spans: &mut Vec<Span<'static>>,
+    x: u16,
+    y: u16,
+    key: &str,
+    label: &str,
+    target: Option<crate::app::HitTarget>,
+    key_bg: Color,
+    key_fg: Color,
+) -> u16 {
+    let badge_w = key.chars().count() as u16 + 2; // " key "
+    let label_w = label.chars().count() as u16 + 2; // ":label "
+    // Interactive feedback rides the shared hover/pressed state: brighter when the
+    // pointer is over the chip, deeper when it's held down — the "raised" then
+    // "pushed in" read a terminal can manage with color alone.
+    let (bg, fg) = match &target {
+        Some(t) if app.is_pressed(t) => (app.tuning.palette.accent_dark, app.tuning.palette.on_accent),
+        Some(t) if app.is_hovered(t) => (app.tuning.palette.accent_bright, app.tuning.palette.on_accent),
+        _ => (key_bg, key_fg),
+    };
+    spans.push(Span::styled(
+        format!(" {key} "),
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!(":{label} "),
+        Style::default().fg(app.tuning.palette.text).add_modifier(Modifier::BOLD),
+    ));
+    if let Some(t) = target {
+        app.hit(Rect { x, y, width: badge_w + label_w, height: 1 }, t);
+    }
+    spans.push(Span::styled("  ", Style::default()));
+    x + badge_w + label_w + 2
+}
+
+/// Hint pairs for the status bar. Edit/Terminal hints are derived live from the
+/// keymap so they stay honest after a remap; other modes are fixed UI keys. Each
+/// hint carries its click target (or `None` for a plain label).
+fn status_hints(app: &App) -> Vec<Hint> {
+    use crate::app::HitTarget;
     if matches!(app.mode, Mode::Edit) {
-        let mut v = vec![(bar_open_keys(app), "⌕ commands".to_string())];
+        let mut v: Vec<Hint> = vec![(bar_open_keys(app), "⌕ commands".to_string(), Some(HitTarget::OpenBar))];
+        // WARP (space warp — tabs/panes/splits): high-value and, until now, invisible
+        // on the persistent bar. Honest here — C-t is in the edit chord map.
+        if let Some(b) = app.keys.binding_for(&Action::TabMode) {
+            v.push((b, "warp".to_string(), Some(HitTarget::Act(Action::TabMode))));
+        }
         for (action, label) in [
             (Action::Save, "save"),
             (Action::ToggleFileTree, "open"),
             (Action::Search, "search"),
         ] {
             if let Some(b) = app.keys.binding_for(&action) {
-                v.push((b, label.to_string()));
+                v.push((b, label.to_string(), Some(HitTarget::Act(action))));
             }
         }
-        v.push(("C-g".to_string(), "cancel".to_string()));
         v
     } else if matches!(app.mode, Mode::Terminal) {
-        // Live-derived like Edit: the bar-open chord is remappable, and C-g here
-        // means "leave the terminal for the editor" — NOT session detach (which
-        // is C-x C-d). Naming it "detach" scared tmux refugees.
-        vec![
-            (bar_open_keys(app), "commands".to_string()),
-            ("C-g".to_string(), "to editor".to_string()),
-            ("type".to_string(), "to shell".to_string()),
-        ]
+        // Three honest, clickable affordances that make sense from a shell: commands
+        // (the bar), warp (C-t — a single-chord chrome action `handle_terminal` runs),
+        // and editor (C-g — hand the keyboard back to the editor; a real click target
+        // now, not a dead label). No "open" — its C-x prefix goes to the shell here.
+        let mut v: Vec<Hint> = vec![(bar_open_keys(app), "commands".to_string(), Some(HitTarget::OpenBar))];
+        if let Some(b) = app.keys.binding_for(&Action::TabMode) {
+            v.push((b, "warp".to_string(), Some(HitTarget::Act(Action::TabMode))));
+        }
+        v.push(("C-g".to_string(), "editor".to_string(), Some(HitTarget::FocusEditor)));
+        v
     } else {
         app.mode
             .hints()
             .iter()
-            .map(|(k, a)| (k.to_string(), a.to_string()))
+            .map(|(k, a)| (k.to_string(), a.to_string(), None))
             .collect()
     }
 }
@@ -1452,52 +1592,8 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    // Left side: mode label + hints
-    let mut spans: Vec<Span> = vec![
-        Span::styled(
-            format!(" {} ", app.mode.label()),
-            Style::default()
-                .fg(mode_fg)
-                .bg(mode_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ", Style::default()),
-    ];
-
-    for (key, action) in status_hints(app) {
-        spans.push(Span::styled(
-            format!(" {} ", key),
-            Style::default()
-                .fg(key_fg)
-                .bg(key_bg)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(
-            format!(":{} ", action),
-            Style::default()
-                .fg(app.tuning.palette.text)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled("  ", Style::default()));
-    }
-
-    // Transient info (pending prefix / status message) trails the hints on the
-    // left, so the position readout on the right is never displaced.
-    if !app.pending_prefix.is_empty() {
-        spans.push(Span::styled(
-            format!(" {}- ", crate::config::render_chords(&app.pending_prefix)),
-            Style::default().fg(app.tuning.palette.accent_bright).add_modifier(Modifier::BOLD),
-        ));
-    } else if let Some(msg) = &app.status_msg {
-        spans.push(Span::styled(
-            format!(" {msg} "),
-            Style::default().fg(app.tuning.palette.accent_bright),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-
-    // Position readout — ALWAYS right-aligned on top, so it can't be truncated
-    // by the left hints or hidden by a status message. Ln/Col for editor panes.
+    // Compute the right-aligned readout first, so the chips know how much room to
+    // leave: the position readout must never be pushed off or overwritten.
     let pane = app.focused_pane();
     let session = app.session_name.as_ref().map(|s| format!("  ⚡{s}")).unwrap_or_default();
     let readout = match pane.content {
@@ -1511,8 +1607,48 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         }
         PaneContent::Terminal(_) => format!("terminal{session} "),
     };
-    // The cross-workspace status aggregate lives in the top-right corner counter
-    // (render_tab_bar), not down here — the bottom bar stays the position readout.
+    let reserve = readout.chars().count() as u16 + 1;
+    let budget_right = area.right().saturating_sub(reserve.min(area.width));
+
+    // Left side: mode label (keyboard-first entry — deliberately NOT a button) then
+    // hint chips laid out with a running x so each can register its own click cells.
+    let label = format!(" {} ", app.mode.label());
+    let mut x = area.x + label.chars().count() as u16 + 2; // label + the "  " gap
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(label, Style::default().fg(mode_fg).bg(mode_bg).add_modifier(Modifier::BOLD)),
+        Span::styled("  ", Style::default()),
+    ];
+
+    // Priority order (commands > warp > save/editor > open > search). Stop before a
+    // chip would collide with the readout — the only truncation the bar has.
+    for (key, lbl, target) in status_hints(app) {
+        let w = (key.chars().count() + lbl.chars().count() + 6) as u16; // badge+label+gap
+        if x + w > budget_right { break; }
+        x = push_chip(app, &mut spans, x, area.y, &key, &lbl, target, key_bg, key_fg);
+    }
+
+    // Transient info trails the hints on the left, so the readout is never displaced.
+    // A hovered clipped tab's full name (set by render_tab_bar this frame) shows here.
+    if !app.pending_prefix.is_empty() {
+        spans.push(Span::styled(
+            format!(" {}- ", crate::config::render_chords(&app.pending_prefix)),
+            Style::default().fg(app.tuning.palette.accent_bright).add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(msg) = &app.status_msg {
+        spans.push(Span::styled(
+            format!(" {msg} "),
+            Style::default().fg(app.tuning.palette.accent_bright),
+        ));
+    } else if let Some(tip) = app.hover_tip.borrow().as_ref() {
+        spans.push(Span::styled(
+            format!(" {tip} "),
+            Style::default().fg(app.tuning.palette.text_dim),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // Position readout — ALWAYS right-aligned on top, so it can't be truncated
+    // by the left hints or hidden by a status message.
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             readout,
@@ -1596,19 +1732,12 @@ fn render_control_bar(frame: &mut Frame, app: &App, area: Rect) {
                 }
             }
         }
-        _ => {
-            // Idle hint — derived from the live keymap, never hardcoded.
-            let open = app.keys.binding_for(&Action::ToggleFileTree).unwrap_or_default();
-            let search = app.keys.binding_for(&Action::Search).unwrap_or_default();
-            let hint = format!(
-                "  {}  commands    {}  open    {}  search    C-g  cancel",
-                bar_open_keys(app), open, search
-            );
-            frame.render_widget(
-                Paragraph::new(Span::styled(hint, Style::default().fg(app.tuning.palette.text_faint))),
-                area,
-            );
-        }
+        // Idle (Edit/Terminal/Tab/Tree/Undo): nothing. The old idle row duplicated
+        // the status bar's commands/open/search as a faint, redundant strip; the
+        // status bar already carries the live, clickable chips. This row now exists
+        // ONLY as the home for the command query and the minibuffer (the two arms
+        // above), so it stays blank until one of them is active.
+        _ => {}
     }
 }
 
@@ -1626,12 +1755,21 @@ fn ellip(s: &str, w: usize) -> String {
 
 /// The Commands list — the classic launcher rows: in-bar quick key, live binding
 /// badge, label, dim description. `active` gates whether the selection highlights.
-fn command_lines(app: &App, rows: &[crate::palette::PaletteRow], sel: usize, navigated: bool, active: bool, max_rows: usize) -> Vec<Line<'static>> {
+fn command_lines(app: &App, rows: &[crate::palette::PaletteRow], sel: usize, navigated: bool, active: bool, max_rows: usize, inner: Rect) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let body_max = max_rows.max(1);
     let scroll = if sel >= body_max { sel + 1 - body_max } else { 0 };
     for (idx, row) in rows.iter().enumerate().skip(scroll).take(body_max) {
-        let selected = active && navigated && idx == sel;
+        // Registered where the scroll offset is known, so a click can never
+        // resolve to a different row than the one under the pointer.
+        let target = crate::app::HitTarget::Row(crate::app::RowKind::Command, idx);
+        app.hit(
+            Rect { x: inner.x, y: inner.y + out.len() as u16, width: inner.width, height: 1 },
+            target.clone(),
+        );
+        // Hover paints a row exactly like arrow-selection — same fill AND same label
+        // color — so the mouse and keyboard agree on "this is the row that fires".
+        let selected = (active && navigated && idx == sel) || app.is_hovered(&target);
         let bg = if selected { app.tuning.palette.select_row_bg } else { app.tuning.palette.surface };
         let has_sub = matches!(row.kind, ItemKind::Submenu(_));
         let quick = match &row.kind { ItemKind::Run(a) => crate::palette::bar_quick_key(a), _ => None };
@@ -1658,14 +1796,21 @@ fn command_lines(app: &App, rows: &[crate::palette::PaletteRow], sel: usize, nav
 
 /// One row per workspace: current marker ‹, verdict glyph (class color), id · name
 /// (ellipsized), age right-aligned. Scrolls to keep the selection visible.
-fn workspace_lines(app: &App, rows: &[crate::palette::PaletteRow], sel: usize, active: bool, width: u16, max_rows: usize) -> Vec<Line<'static>> {
+fn workspace_lines(app: &App, rows: &[crate::palette::PaletteRow], sel: usize, active: bool, width: u16, max_rows: usize, inner: Rect) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     let body_max = max_rows.max(1);
     let scroll = if sel >= body_max { sel + 1 - body_max } else { 0 };
     for (idx, row) in rows.iter().enumerate().skip(scroll).take(body_max) {
-        let s = active && idx == sel;
+        let target = crate::app::HitTarget::Row(crate::app::RowKind::Workspace, idx);
+        app.hit(
+            Rect { x: inner.x, y: inner.y + out.len() as u16, width: inner.width, height: 1 },
+            target.clone(),
+        );
         // Selected row: inverted teal (dark text on a teal bar) so it's clearly
         // visible — the old DarkGray highlight vanished against the dark ground.
+        // Hover mirrors selection fully (fill + fg) so it can't render text on a
+        // same-color band.
+        let s = (active && idx == sel) || app.is_hovered(&target);
         let bg = if s { app.tuning.palette.info } else { app.tuning.palette.surface };
         let sel_fg = app.tuning.palette.on_accent;
         let (glyph, vcolor, id, cur) = match &row.kind {
@@ -1752,10 +1897,7 @@ fn detail_lines(app: &App, row: Option<&crate::palette::PaletteRow>, width: u16)
     ))];
     let Some(ItemKind::Surface(s)) = row.map(|r| &r.kind) else { return out };
     let vcolor = verdict_color(app, s.verdict);
-    let vlabel = match s.verdict {
-        Verdict::Blocked => "blocked", Verdict::Failed => "failed",
-        Verdict::Running => "running", Verdict::Done => "done", Verdict::Context => "idle",
-    };
+    let vlabel = s.verdict.label();
     let teal = app.tuning.palette.info;
     let rail = || Span::styled(" ▌ ", Style::default().fg(teal));
     let content_w = w.saturating_sub(5); // " ▌ " + right padding
@@ -1841,22 +1983,44 @@ fn render_workspaces_panel(frame: &mut Frame, app: &App, rect: Rect) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
+    // Optional host-health line pinned to the top of the panel; the board flows below.
+    // Rendered in the bright accent (text_faint was too dim to notice) and shown even
+    // in a short panel.
+    let show_health = app.tuning.health_line == 1 && inner.height >= 2;
+    if show_health {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {}", app.health.line()),
+                Style::default().fg(app.tuning.palette.accent_bright).add_modifier(Modifier::BOLD),
+            ))),
+            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
+        );
+    }
+    let head = if show_health { 1u16 } else { 0 };
+    let body = Rect {
+        x: inner.x,
+        y: inner.y + head,
+        width: inner.width,
+        height: inner.height.saturating_sub(head),
+    };
+
     let rows = app.bar_workspace_rows();
-    let ih = inner.height as usize;
+    let ih = body.height as usize;
     // Summary box for the highlighted workspace; the list gets what's left above it.
-    let dlines = detail_lines(app, rows.get(sel), inner.width);
+    let dlines = detail_lines(app, rows.get(sel), body.width);
     let summ_h = dlines.len().min(ih);
     let list_h = rows.len().min(ih.saturating_sub(summ_h));
-    frame.render_widget(Paragraph::new(Text::from(workspace_lines(app, &rows, sel, active, inner.width, list_h))),
-        Rect { x: inner.x, y: inner.y, width: inner.width, height: list_h as u16 });
+    let list_rect = Rect { x: body.x, y: body.y, width: body.width, height: list_h as u16 };
+    frame.render_widget(Paragraph::new(Text::from(workspace_lines(app, &rows, sel, active, body.width, list_h, list_rect))),
+        list_rect);
     frame.render_widget(Paragraph::new(Text::from(dlines)),
-        Rect { x: inner.x, y: inner.y + list_h as u16, width: inner.width, height: summ_h as u16 });
+        Rect { x: body.x, y: body.y + list_h as u16, width: body.width, height: summ_h as u16 });
     // The empty bottom is the sky.
     let used = list_h + summ_h;
     if ih > used {
         frame.render_widget(
-            Paragraph::new(Text::from(starfield(app, inner.width, (ih - used) as u16))),
-            Rect { x: inner.x, y: inner.y + used as u16, width: inner.width, height: (ih - used) as u16 },
+            Paragraph::new(Text::from(starfield(app, body.width, (ih - used) as u16))),
+            Rect { x: body.x, y: body.y + used as u16, width: body.width, height: (ih - used) as u16 },
         );
     }
 }
@@ -1880,7 +2044,7 @@ fn render_command_panel(frame: &mut Frame, app: &App, rect: Rect, left_border: b
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let rows = app.bar_rows();
-    let lines = command_lines(app, &rows, palette.selected, palette.navigated, active, inner.height as usize);
+    let lines = command_lines(app, &rows, palette.selected, palette.navigated, active, inner.height as usize, inner);
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
@@ -1951,6 +2115,26 @@ fn render_notice(frame: &mut Frame, app: &App, pane_area: Rect) {
     };
     let more = if app.notices.len() > 1 { format!("  (+{} more)", app.notices.len() - 1) } else { String::new() };
     let text = format!(" {glyph} {}{more}   Esc dismiss ", n.text);
+    // The whole line expands the queue into a digest; the trailing "Esc dismiss"
+    // affordance dismisses. Registered in that order so dismiss (drawn last,
+    // hit-tested first) wins on the cells it labels. This is also the mouse's
+    // way around P1.2: over a focused terminal, Esc goes to the shell — a click
+    // needs no mode.
+    // "Esc dismiss" trails the text inline, so its cells are counted, not assumed.
+    let dismiss_at = (3 + n.text.chars().count() + more.chars().count() + 3) as u16;
+    let dismiss_w = "Esc dismiss ".chars().count() as u16;
+    app.hit(row, crate::app::HitTarget::Act(Action::ExpandNotices));
+    if dismiss_at < row.width {
+        app.hit(
+            Rect {
+                x: row.x + dismiss_at,
+                y: row.y,
+                width: dismiss_w.min(row.width - dismiss_at),
+                height: 1,
+            },
+            crate::app::HitTarget::DismissNotice,
+        );
+    }
     clear_panel(frame, app, row);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2008,8 +2192,12 @@ fn render_file_tree(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for (idx, row) in app.tree_rows.iter().enumerate().skip(scroll).take(max_show) {
         let is_sel = idx == selected && focused;
-        // Selected row: a full-width accent band (unmistakable), like a chip.
-        let bg = if is_sel { accent } else { app.tuning.palette.surface };
+        let hovered = app.is_hovered(&crate::app::HitTarget::Row(crate::app::RowKind::Tree, idx));
+        // Selected row: a full-width accent band (unmistakable), like a chip. Hover
+        // previews that band — and must adopt the SAME foreground as selection, or a
+        // folder (accent text) vanishes against the accent band.
+        let hot = is_sel || hovered;
+        let bg = if hot { accent } else { app.tuning.palette.surface };
         let indent = "  ".repeat(row.depth);
         let glyph = if row.updir {
             "↑ "
@@ -2026,7 +2214,7 @@ fn render_file_tree(frame: &mut Frame, app: &App, area: Rect) {
         // Foreground: readable on the band when selected; folders bold+accent,
         // files white, `../` dim — otherwise.
         let chip = app.tuning.palette.on_accent;
-        let name_fg = if is_sel {
+        let name_fg = if hot {
             chip
         } else if row.updir {
             app.tuning.palette.accent_bright // visible "go up" affordance
@@ -2035,7 +2223,7 @@ fn render_file_tree(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             app.tuning.palette.text
         };
-        let glyph_fg = if is_sel { chip } else { accent };
+        let glyph_fg = if hot { chip } else { accent };
         let mut modifier = Modifier::empty();
         if row.is_dir && !row.updir {
             modifier |= Modifier::BOLD;
@@ -2048,6 +2236,10 @@ fn render_file_tree(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(label, Style::default().fg(name_fg).bg(bg).add_modifier(modifier)),
             Span::styled(pad, Style::default().bg(bg)),
         ]));
+        // The row's band spans the full inner width — so does its click target.
+        let y = inner.y + (lines.len() as u16 - 1);
+        app.hit(Rect { x: inner.x, y, width: inner.width, height: 1 },
+                crate::app::HitTarget::Row(crate::app::RowKind::Tree, idx));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }

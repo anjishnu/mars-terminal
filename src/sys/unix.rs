@@ -185,3 +185,106 @@ pub mod shell {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
     }
 }
+
+/// Host health probes for the SPACES status line (load, disk, memory). Only this
+/// PAL adapter may name `libc`; callers reach these through `sys::health`.
+pub mod health {
+    use std::path::Path;
+
+    /// 1-minute load average, if the OS reports one.
+    pub fn load_avg1() -> Option<f64> {
+        let mut avg = [0f64; 3];
+        let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+        if n >= 1 { Some(avg[0]) } else { None }
+    }
+
+    /// Percent of the filesystem holding `path` that is FREE to a normal user (0..=100).
+    pub fn disk_free_pct(path: &Path) -> Option<u8> {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 { return None; }
+        let total = s.f_blocks as u128;
+        if total == 0 { return None; }
+        let free = s.f_bavail as u128;
+        Some(((free * 100 / total) as u8).min(100))
+    }
+
+    /// Percent of host RAM currently in use (0..=100).
+    pub fn mem_used_pct() -> Option<u8> { imp::mem_used_pct() }
+
+    #[cfg(target_os = "macos")]
+    mod imp {
+        // `mach_host_self` is marked deprecated in `libc` (it points at the `mach2`
+        // crate), but it's the stable Mach entry point and adding a dependency just for
+        // the rename isn't worth it — the call is correct.
+        #[allow(deprecated)]
+        pub fn mem_used_pct() -> Option<u8> {
+            let total = memsize()? as u128;
+            if total == 0 { return None; }
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if page <= 0 { return None; }
+            let page = page as u64;
+            let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+            let mut count = (std::mem::size_of::<libc::vm_statistics64>()
+                / std::mem::size_of::<libc::integer_t>()) as libc::mach_msg_type_number_t;
+            let kr = unsafe {
+                libc::host_statistics64(
+                    libc::mach_host_self(),
+                    libc::HOST_VM_INFO64,
+                    &mut stats as *mut _ as *mut libc::integer_t,
+                    &mut count,
+                )
+            };
+            if kr != libc::KERN_SUCCESS { return None; }
+            // Activity-Monitor-style "used": active + wired + compressed pages.
+            let used_pages = stats.active_count as u64
+                + stats.wire_count as u64
+                + stats.compressor_page_count as u64;
+            let used = used_pages.saturating_mul(page) as u128;
+            Some(((used * 100 / total) as u8).min(100))
+        }
+
+        fn memsize() -> Option<u64> {
+            let mut val: u64 = 0;
+            let mut len = std::mem::size_of::<u64>();
+            let name = b"hw.memsize\0";
+            let r = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr() as *const libc::c_char,
+                    &mut val as *mut _ as *mut libc::c_void,
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if r == 0 && val > 0 { Some(val) } else { None }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod imp {
+        // From /proc/meminfo. `MemAvailable` is the kernel's own "usable without
+        // swapping" figure — the right basis for a used% matching `free`. NOT verified
+        // on Linux from the macOS dev box.
+        pub fn mem_used_pct() -> Option<u8> {
+            let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let (mut total, mut avail) = (0u64, 0u64);
+            for line in txt.lines() {
+                if let Some(v) = line.strip_prefix("MemTotal:") {
+                    total = v.split_whitespace().next()?.parse().ok()?;
+                } else if let Some(v) = line.strip_prefix("MemAvailable:") {
+                    avail = v.split_whitespace().next()?.parse().ok()?;
+                }
+            }
+            if total == 0 { return None; }
+            let used = total.saturating_sub(avail) as u128;
+            Some(((used * 100 / total as u128) as u8).min(100))
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    mod imp {
+        pub fn mem_used_pct() -> Option<u8> { None }
+    }
+}

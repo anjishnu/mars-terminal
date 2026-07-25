@@ -499,8 +499,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                             }
                         }
                         ev => {
+                            let visible = ev.forces_redraw();
                             let _ = app.apply_input(ev);
-                            app.needs_redraw = true;
+                            if visible {
+                                app.needs_redraw = true;
+                            }
                         }
                     }
                 }

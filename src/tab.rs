@@ -9,6 +9,10 @@ pub struct Tab {
     pub focused_pane: PaneId,
     /// Some(pane) when zoomed to fill the tab (tmux prefix-z).
     pub zoomed: Option<PaneId>,
+    /// The ephemeral "preview" tab a navigator click reuses (VS-Code's italic tab):
+    /// exploring swaps the file in place instead of piling up tabs. The first edit
+    /// pins it (`preview = false`) so the next click starts a fresh preview.
+    pub preview: bool,
 }
 
 impl Tab {
@@ -19,6 +23,7 @@ impl Tab {
             layout: PaneLayout::Single(root_pane),
             focused_pane: root_pane,
             zoomed: None,
+            preview: false,
         }
     }
 }

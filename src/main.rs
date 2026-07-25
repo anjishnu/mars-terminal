@@ -14,6 +14,7 @@ mod broker;
 mod buffer;
 mod config;
 mod fleet;
+mod health;
 mod layout;
 mod llm_log;
 mod mode;
@@ -589,6 +590,12 @@ fn selfcheck() -> Result<()> {
         "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
         "MARS_LLM_KEY", "MARS_LLM_URL", "ARES_LLM_KEY", "ARES_LLM_URL",
         "MARS_AUTH_SOCK", "MARS_LLM_DEBUG",
+        // Developing Mars from inside a Mars pane is the normal workflow, and the
+        // session env it exports is not inert: MARS_OPEN_TERMINAL makes a daemon
+        // open a terminal pane at startup (moving the layout the daemon block
+        // drives), and MARS_SESSION/_ID send detect_broker_sock() to the PARENT
+        // session for a route instead of this process's own.
+        "MARS_SESSION", "MARS_SESSION_ID", "MARS_OPEN_TERMINAL",
     ] {
         std::env::remove_var(key);
     }
@@ -4807,6 +4814,437 @@ fn selfcheck() -> Result<()> {
         let _ = std::fs::remove_file(&gwl);
         let _ = std::fs::remove_file(gwl.with_file_name("goals.json"));
         println!("[selfcheck] goals capture + recall ... PASS");
+    }
+
+    // 44. Mouse: chrome is clickable. Renderers record what they drew into the
+    //     hit registry, so a click resolves through the SAME funnel as a chord —
+    //     no surface gets a private dialect. Every coordinate below is read back
+    //     from the registry the frame actually produced, never hardcoded: the
+    //     test asserts "what was drawn is what is clickable," which is the whole
+    //     invariant. Registry chrome is live in every mode, so these clicks work
+    //     while the bar, a prompt, or the tree owns the keyboard.
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        fn click(app: &mut App, r: ratatui::layout::Rect) {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x, row: r.y, modifiers: KeyModifiers::NONE,
+            });
+        }
+        // The first region whose target matches a predicate, as drawn this frame.
+        fn region_of(app: &App, pred: impl Fn(&app::HitTarget) -> bool) -> ratatui::layout::Rect {
+            app.hits.borrow().iter().find(|h| pred(&h.target))
+                .unwrap_or_else(|| panic!("no hit region matched")).rect
+        }
+
+        let mut term = Terminal::new(TestBackend::new(110, 24))?;
+
+        // (a) Tab bar. Two tabs, click the first: the mouse reaches tab switching
+        //     without the keyboard's M-1..9 or travel mode.
+        let mut app = App::new(None)?;
+        app.run_action(palette::Action::NewTab);
+        assert_eq!(app.active_tab, 1, "NewTab did not focus the new tab");
+        term.draw(|f| ui::render(f, &mut app))?;
+        let tab0 = region_of(&app, |t| matches!(t, app::HitTarget::Row(app::RowKind::Tab, 0)));
+        click(&mut app, tab0);
+        assert_eq!(app.active_tab, 0, "clicking a tab did not switch to it");
+        // Regions are per-frame: a stale registry must never dispatch.
+        app.hits_clear();
+        click(&mut app, tab0);
+        assert_eq!(app.active_tab, 0, "a cleared registry still dispatched");
+
+        // (b) The idle control bar opens mission control — the discovery on-ramp.
+        //     It is the surface every action is reached through, so it is the one
+        //     target with no Action behind it.
+        let mut app = App::new(None)?;
+        term.draw(|f| ui::render(f, &mut app))?;
+        let bar = region_of(&app, |t| matches!(t, app::HitTarget::OpenBar));
+        click(&mut app, bar);
+        assert_eq!(app.mode, mode::Mode::Bar, "clicking the control bar did not open it");
+
+        // (c) A dropdown row runs its action — through run_action, so the confirm
+        //     gate and frecency apply to clicking exactly as to Enter.
+        term.draw(|f| ui::render(f, &mut app))?;
+        let rows = app.bar_rows();
+        let idx = rows.iter().position(|r| matches!(&r.kind,
+            palette::ItemKind::Run(palette::Action::ToggleFileTree)))
+            .expect("navigator row missing from the launcher");
+        let row = region_of(&app, |t| matches!(t, app::HitTarget::Row(app::RowKind::Command, i) if *i == idx));
+        click(&mut app, row);
+        assert!(app.tree_open, "clicking the navigator row did not open the tree");
+
+        // (d) Tree rows, clicked while TREE mode owns the keyboard — the mode gate
+        //     that used to swallow every non-Edit/Terminal click.
+        assert_eq!(app.mode, mode::Mode::Tree, "navigator did not take focus");
+        term.draw(|f| ui::render(f, &mut app))?;
+        let n_rows = app.tree_rows.len();
+        assert!(n_rows > 1, "no tree rows to click");
+        let r1 = region_of(&app, |t| matches!(t, app::HitTarget::Row(app::RowKind::Tree, i) if *i == 1));
+        click(&mut app, r1);
+        assert_eq!(app.file_tree.as_ref().map(|t| t.selected), Some(1),
+            "clicking a tree row did not select it");
+
+        // (e) The notice line: click dismisses without Esc. Over a focused
+        //     terminal Esc belongs to the shell (P1.2) — a click needs no mode.
+        let mut app = App::new(None)?;
+        app.show_splash = false; // the splash outranks the notice line
+        app.notices.push(app::Notice {
+            kind: app::NoticeKind::Failure,
+            text: "tests failed".into(),
+        });
+        term.draw(|f| ui::render(f, &mut app))?;
+        let dismiss = region_of(&app, |t| matches!(t, app::HitTarget::DismissNotice));
+        click(&mut app, dismiss);
+        assert!(app.notices.is_empty(), "clicking dismiss did not clear the notice");
+
+        // (f) Pointer motion is not a repaint. Crossterm reports any-event
+        //     tracking, so a sweep is one Moved per cell; blanket-repainting on
+        //     those ships a full frame per motion over a session socket.
+        assert!(!app::InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved, column: 4, row: 4, modifiers: KeyModifiers::NONE,
+        }).forces_redraw(), "a bare Moved event still forces a repaint");
+        assert!(app::InputEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: 4, row: 4,
+            modifiers: KeyModifiers::NONE,
+        }).forces_redraw(), "a click must still repaint");
+        println!("[selfcheck] mouse: clickable chrome ... PASS");
+    }
+
+    // 44f. The bottom-bar hints are real BUTTONS now, not inert labels: each chip
+    //      registers its own click cells (routed through run_action), lights on
+    //      hover, recesses when pressed, and flashes the chord it stands for on
+    //      click (mouse as on-ramp to the keyboard). Also asserts the old invisible
+    //      whole-row OpenBar is gone, and the priority reshuffle (warp surfaced).
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        fn at(app: &mut App, kind: MouseEventKind, r: ratatui::layout::Rect) {
+            app.handle_mouse(MouseEvent { kind, column: r.x, row: r.y, modifiers: KeyModifiers::NONE });
+        }
+        fn region_of(app: &App, pred: impl Fn(&app::HitTarget) -> bool) -> Option<ratatui::layout::Rect> {
+            app.hits.borrow().iter().find(|h| pred(&h.target)).map(|h| h.rect)
+        }
+        let mut term = Terminal::new(TestBackend::new(110, 24))?;
+
+        // (a) Clicking the `save` status-bar chip flashes its chord — the chip is a
+        //     registered Act target (not a label), and click-to-teach fires after
+        //     dispatch so run_action can't clobber the lesson.
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        term.draw(|f| ui::render(f, &mut app))?;
+        let save_chip = region_of(&app, |t| matches!(t, app::HitTarget::Act(palette::Action::Save)))
+            .expect("save chip is not a registered click target");
+        at(&mut app, MouseEventKind::Down(MouseButton::Left), save_chip);
+        let chord = app.keys.binding_for(&palette::Action::Save).unwrap();
+        assert_eq!(app.status_msg.as_deref(), Some(format!("↦ {chord}").as_str()),
+            "clicking the save chip did not flash its chord (click-to-teach)");
+
+        // (b) Pressed-flash: left-down over a chip records it; release clears it.
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        term.draw(|f| ui::render(f, &mut app))?;
+        let warp = region_of(&app, |t| matches!(t, app::HitTarget::Act(palette::Action::TabMode)))
+            .expect("warp chip missing from the Edit status bar (priority reshuffle)");
+        at(&mut app, MouseEventKind::Down(MouseButton::Left), warp);
+        assert!(app.pressed.is_some(), "left-down did not set the pressed-flash");
+        at(&mut app, MouseEventKind::Up(MouseButton::Left), warp);
+        assert!(app.pressed.is_none(), "release did not clear the pressed-flash");
+
+        // (c) Hover: a Moved over a chip sets `hovered` and asks for a repaint; the
+        //     same target again does NOT repaint (bare motion is otherwise free);
+        //     moving to dead space clears the hover.
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        term.draw(|f| ui::render(f, &mut app))?;
+        let cmds = region_of(&app, |t| matches!(t, app::HitTarget::OpenBar)).expect("commands chip missing");
+        app.needs_redraw = false;
+        at(&mut app, MouseEventKind::Moved, cmds);
+        assert!(app.hovered.is_some() && app.needs_redraw, "hover over a chip did not register / repaint");
+        app.needs_redraw = false;
+        at(&mut app, MouseEventKind::Moved, cmds);
+        assert!(!app.needs_redraw, "an unchanged hover still forced a repaint");
+        at(&mut app, MouseEventKind::Moved, ratatui::layout::Rect { x: 109, y: 23, width: 1, height: 1 });
+        assert!(app.hovered.is_none(), "moving to dead space did not clear the hover");
+
+        // (d) The redundant idle control bar (the bottom row, y=23 at height 24) is
+        //     gone entirely: it registers NO click regions, and no near-full-width
+        //     invisible target survives anywhere. Its command affordances live on the
+        //     status bar now (the clickable chips exercised above).
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        term.draw(|f| ui::render(f, &mut app))?;
+        assert!(!app.hits.borrow().iter().any(|h| h.rect.y == 23),
+            "the idle control bar still registers clicks on the bottom row");
+        assert!(!app.hits.borrow().iter().any(|h| h.rect.width >= 100),
+            "a near-full-width invisible click target still exists");
+
+        // (e) Terminal-bar priority (static fallback parity): warp is advertised and
+        //     "to shell" is gone. The live path additionally verifies C-t honesty in
+        //     a real terminal — see the manual pass in the plan.
+        let th = mode::Mode::Terminal.hints();
+        assert!(th.iter().any(|(k, _)| *k == "C-t"), "terminal hints lost warp");
+        assert!(!th.iter().any(|(_, a)| a.contains("shell")), "terminal hints still say 'to shell'");
+
+        println!("[selfcheck] mouse: hint buttons + hover ... PASS");
+    }
+
+    // 44g. Navigator clicks PREVIEW instead of piling up tabs. A click is like
+    //      arrowing to the row — highlight, stay in the tree — and a file swaps into
+    //      one reusable preview tab. Editing that file pins it, so the next click
+    //      starts a fresh preview (VS Code's italic-tab rule).
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        fn click(app: &mut App, r: ratatui::layout::Rect) {
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: r.x, row: r.y, modifiers: KeyModifiers::NONE,
+            });
+        }
+        fn tree_row(app: &App, idx: usize) -> ratatui::layout::Rect {
+            app.hits.borrow().iter()
+                .find(|h| matches!(&h.target, app::HitTarget::Row(app::RowKind::Tree, i) if *i == idx))
+                .unwrap_or_else(|| panic!("tree row {idx} not clickable")).rect
+        }
+
+        let mut term = Terminal::new(TestBackend::new(110, 24))?;
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        app.run_action(palette::Action::ToggleFileTree);
+        assert_eq!(app.mode, mode::Mode::Tree, "navigator did not take focus");
+        term.draw(|f| ui::render(f, &mut app))?;
+
+        // Two distinct file rows (the repo root has plenty: Cargo.toml, README.md…).
+        let files: Vec<usize> = app.tree_rows.iter().enumerate()
+            .filter(|(_, r)| !r.is_dir && !r.updir).map(|(i, _)| i).take(2).collect();
+        assert!(files.len() == 2, "need two file rows in the tree to exercise preview");
+        let base = app.tabs.len();
+
+        // (a) Click file A: opens ONE preview tab, stays in the navigator, highlights.
+        let ra = tree_row(&app, files[0]);
+        click(&mut app, ra);
+        assert_eq!(app.mode, mode::Mode::Tree, "a navigator click left the tree");
+        assert_eq!(app.tabs.len(), base + 1, "preview did not open a tab");
+        let pv = app.active_tab;
+        assert!(app.tabs[pv].preview, "the opened tab is not flagged preview");
+        assert_eq!(app.file_tree.as_ref().map(|t| t.selected), Some(files[0]), "clicked row not selected/highlighted");
+
+        // (b) Click file B: the SAME preview tab is reused — no new tab.
+        term.draw(|f| ui::render(f, &mut app))?;
+        let rb = tree_row(&app, files[1]);
+        click(&mut app, rb);
+        assert_eq!(app.tabs.len(), base + 1, "a second click spawned a tab instead of swapping the preview");
+        assert_eq!(app.active_tab, pv, "the preview tab changed identity mid-swap");
+
+        // (c) Edit the preview, then click A again: the dirtied tab is PINNED and a
+        //     fresh preview opens.
+        let pid = app.tabs[pv].focused_pane;
+        if let Some(pane::PaneContent::Editor(b)) = app.panes.get(&pid).map(|p| p.content.clone()) {
+            app.buffers.get_mut(&b).unwrap().mark_edited();
+        } else {
+            panic!("preview tab is not showing an editor");
+        }
+        term.draw(|f| ui::render(f, &mut app))?;
+        let ra2 = tree_row(&app, files[0]);
+        click(&mut app, ra2);
+        assert_eq!(app.tabs.len(), base + 2, "an edited preview was not pinned; the click should have opened a new preview");
+        assert!(!app.tabs[pv].preview, "the edited preview tab was not promoted to a real tab");
+
+        println!("[selfcheck] navigator: click previews (reuse + pin) ... PASS");
+    }
+
+    // 44h. From the navigator, a click on a PANE focuses it (so you can type) — pane
+    //      interaction is no longer gated to Edit/Terminal, so the tree isn't a trap.
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut term = Terminal::new(TestBackend::new(110, 24))?;
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        app.run_action(palette::Action::ToggleFileTree);
+        assert_eq!(app.mode, mode::Mode::Tree, "navigator did not open");
+        term.draw(|f| ui::render(f, &mut app))?;
+        let (_, r) = app.pane_rects[0]; // the editor pane, right of the sidebar
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: r.x + r.width / 2, row: r.y + r.height / 2, modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.mode, mode::Mode::Edit, "clicking a pane from the navigator did not focus it");
+        println!("[selfcheck] navigator: click a pane to focus it ... PASS");
+    }
+
+    // 44i. The terminal status bar's `editor` (C-g) chip is a real clickable target
+    //      now — clicking it hands the keyboard back to the editor, exactly as C-g
+    //      does — not the dead label it used to be.
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut term = Terminal::new(TestBackend::new(110, 24))?;
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        app.open_terminal(); // focused pane → a shell; enters Terminal mode
+        assert_eq!(app.mode, mode::Mode::Terminal, "open_terminal did not enter Terminal mode");
+        term.draw(|f| ui::render(f, &mut app))?;
+        let chip = app.hits.borrow().iter()
+            .find(|h| matches!(h.target, app::HitTarget::FocusEditor)).map(|h| h.rect)
+            .expect("no clickable editor (C-g) chip in the terminal status bar");
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: chip.x, row: chip.y, modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.mode, mode::Mode::Edit, "clicking the editor chip did not return to the editor");
+        println!("[selfcheck] terminal: editor chip returns focus ... PASS");
+    }
+
+    // 44j. Host-health probes: uptime is always present, the line self-trims to
+    //      whatever the OS answers, and GPU is omitted when not polled. The printed
+    //      line doubles as a live read of this machine's probes.
+    {
+        let mut h = health::Health::new(1);
+        let _ = h.maybe_sample(std::path::Path::new("."), false);
+        let line = h.line();
+        assert!(line.starts_with("up "), "health line missing uptime: {line}");
+        assert!(!line.contains("gpu"), "gpu segment present without a GPU poll: {line}");
+        println!("[selfcheck] health probes ({line}) ... PASS");
+    }
+
+    // 44k. The host-health line actually RENDERS in the SPACES panel once it shows
+    //      (≥2 tabs). Reads the rendered cell grid (not the ANSI stream) for "up ".
+    {
+        let mut term = Terminal::new(TestBackend::new(120, 30))?;
+        let mut app = App::new(None)?;
+        app.show_splash = false;
+        app.run_action(palette::Action::NewTab); // 2 tabs → the SPACES panel shows
+        app.handle_key(kc(KeyCode::Char(' ')))?; // Ctrl+Space → mission control
+        assert_eq!(app.mode, mode::Mode::Bar, "Ctrl+Space did not open mission control");
+        app.tick(); // populate probes (uptime is present regardless)
+        term.draw(|f| ui::render(f, &mut app))?;
+        assert!(screen_text(&term).contains("up "),
+            "health line not visible in the SPACES panel with 2 tabs");
+        println!("[selfcheck] health line renders in SPACES ... PASS");
+    }
+
+    // 44b. Mouse selection in an EDITOR pane — key_design §7 rules "Selection =
+    //      Shift+arrows + mouse", and the mouse half did not exist (P1.8). Drag,
+    //      double-click (word), triple-click (line). All three leave the same
+    //      selection object Shift+arrows makes, so every verb that consumes a
+    //      selection works on them unchanged — and none of them touches the
+    //      clipboard, which is what made a plain terminal click clobber it.
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        fn press(app: &mut App, col: u16, row: u16, kind: MouseEventKind) {
+            app.handle_mouse(MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE });
+        }
+        let mut app = App::new(None)?;
+        let mut term = Terminal::new(TestBackend::new(80, 12))?;
+        typ(&mut app, "alpha beta gamma")?;
+        app.handle_key(k(KeyCode::Enter))?;
+        typ(&mut app, "second line here")?;
+        term.draw(|f| ui::render(f, &mut app))?;
+        // Text origin: pane border + gutter.
+        let (px, py) = {
+            let (_, r) = app.pane_rects[0];
+            (r.x + 1 + ui::gutter_width(&app.tuning), r.y + 1)
+        };
+        let sel_text = |app: &App| {
+            app.selection_range().map(|(b, s, e)| app.buffers[&b].rope.slice(s..e).to_string())
+        };
+
+        // Drag from "beta"'s start rightwards across "beta".
+        press(&mut app, px + 6, py, MouseEventKind::Down(MouseButton::Left));
+        assert!(sel_text(&app).is_none(), "a bare press must not select anything yet");
+        // …and must not leave an ANCHOR either. Three call sites read "anchor is
+        // Some" as "a region exists" — with a phantom empty one, Tab would indent
+        // the line instead of inserting spaces and Esc would stop dismissing
+        // notices. A plain click has to leave exactly the caret it always did.
+        assert!(app.focused_pane().selection_anchor.is_none(),
+            "a plain click left a phantom selection anchor");
+        press(&mut app, px + 10, py, MouseEventKind::Drag(MouseButton::Left));
+        assert_eq!(sel_text(&app).as_deref(), Some("beta"), "drag did not select the dragged span");
+        let ring = app.kill_ring.len();
+        press(&mut app, px + 10, py, MouseEventKind::Up(MouseButton::Left));
+        assert_eq!(sel_text(&app).as_deref(), Some("beta"), "release dropped the selection");
+        assert_eq!(app.kill_ring.len(), ring, "an editor drag must not copy on release");
+
+        // Double-click inside "gamma" selects the word — from a click anywhere in it.
+        press(&mut app, px + 13, py, MouseEventKind::Down(MouseButton::Left));
+        press(&mut app, px + 13, py, MouseEventKind::Down(MouseButton::Left));
+        assert_eq!(sel_text(&app).as_deref(), Some("gamma"), "double-click did not select the word");
+
+        // A third click at the same cell takes the whole line.
+        press(&mut app, px + 13, py, MouseEventKind::Down(MouseButton::Left));
+        assert_eq!(sel_text(&app).as_deref(), Some("alpha beta gamma"),
+            "triple-click did not select the line");
+
+        // A slow second click is two single clicks, not a double: the selection
+        // collapses back to a caret.
+        let slow = app.tuning.multi_click_ms + 50;
+        press(&mut app, px + 2, py, MouseEventKind::Down(MouseButton::Left));
+        std::thread::sleep(std::time::Duration::from_millis(slow));
+        press(&mut app, px + 2, py, MouseEventKind::Down(MouseButton::Left));
+        assert!(sel_text(&app).is_none(), "clicks outside the window still counted as a double");
+
+        // A selection made by mouse is a first-class one: the existing copy verb
+        // takes it, with no mouse-specific path.
+        press(&mut app, px, py, MouseEventKind::Down(MouseButton::Left));
+        press(&mut app, px, py, MouseEventKind::Down(MouseButton::Left));
+        assert_eq!(sel_text(&app).as_deref(), Some("alpha"), "word select at line start");
+        app.run_action(palette::Action::CopyRegion);
+        assert_eq!(app.kill_ring.last().map(|s| s.as_str()), Some("alpha"),
+            "CopyRegion did not consume a mouse-made selection");
+        println!("[selfcheck] mouse: editor selection .. PASS");
+    }
+
+    // 44c. Drag a split boundary to resize (Tier 2). The dragged divider must be
+    //      the one you grabbed — the keyboard's `resize` adjusts the innermost
+    //      split around the FOCUS, which is a different split whenever the pane
+    //      you grabbed the edge of sits inside a nested one. Hence set_ratio by
+    //      path, and hence a nested layout in this test.
+    {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        fn ev(app: &mut App, col: u16, row: u16, kind: MouseEventKind) {
+            app.handle_mouse(MouseEvent { kind, column: col, row, modifiers: KeyModifiers::NONE });
+        }
+        let mut app = App::new(None)?;
+        let mut term = Terminal::new(TestBackend::new(100, 30))?;
+        // Vertical split at the root, then split the RIGHT side horizontally: the
+        // vertical divider's split is not the innermost one around the focus.
+        app.run_action(palette::Action::SplitVertical);
+        app.run_action(palette::Action::SplitHorizontal);
+        term.draw(|f| ui::render(f, &mut app))?;
+
+        let dividers: Vec<(ratatui::layout::Rect, Vec<u8>, bool)> = app.hits.borrow().iter()
+            .filter_map(|h| match &h.target {
+                app::HitTarget::Divider { path, vertical, .. } => Some((h.rect, path.clone(), *vertical)),
+                _ => None,
+            }).collect();
+        assert_eq!(dividers.len(), 2, "expected one divider per split, got {dividers:?}");
+        let (vrect, _, _) = *dividers.iter().find(|(_, _, v)| *v).expect("no vertical divider");
+
+        let width_of = |app: &App, i: usize| app.pane_rects[i].1.width;
+        let before = width_of(&app, 0);
+        // Grab the seam, drag it right; the left pane must grow to meet it.
+        ev(&mut app, vrect.x, vrect.y + 1, MouseEventKind::Down(MouseButton::Left));
+        ev(&mut app, vrect.x + 15, vrect.y + 1, MouseEventKind::Drag(MouseButton::Left));
+        term.draw(|f| ui::render(f, &mut app))?;
+        let after = width_of(&app, 0);
+        assert!(after > before + 10, "drag right did not widen the left pane ({before} → {after})");
+        // The divider tracks the pointer rather than accumulating a fixed nudge.
+        assert!((app.pane_rects[0].1.right() as i32 - (vrect.x + 15) as i32).abs() <= 2,
+            "divider did not follow the pointer: edge {} vs pointer {}",
+            app.pane_rects[0].1.right(), vrect.x + 15);
+
+        // Release ends it: further motion must not keep resizing.
+        ev(&mut app, vrect.x + 15, vrect.y + 1, MouseEventKind::Up(MouseButton::Left));
+        let settled = width_of(&app, 0);
+        ev(&mut app, vrect.x + 40, vrect.y + 1, MouseEventKind::Drag(MouseButton::Left));
+        term.draw(|f| ui::render(f, &mut app))?;
+        assert_eq!(width_of(&app, 0), settled, "panes kept resizing after the button came up");
+
+        // Clamped: a drag to the far edge cannot make a pane vanish.
+        let seam = app.pane_rects[0].1.right() - 1;
+        ev(&mut app, seam, vrect.y + 1, MouseEventKind::Down(MouseButton::Left));
+        ev(&mut app, 0, vrect.y + 1, MouseEventKind::Drag(MouseButton::Left));
+        term.draw(|f| ui::render(f, &mut app))?;
+        assert!(app.pane_rects.iter().all(|(_, r)| r.width >= 3),
+            "a dragged divider collapsed a pane: {:?}", app.pane_rects);
+        println!("[selfcheck] mouse: drag to resize ... PASS");
     }
 
     let _ = std::fs::remove_file(&worklog_default);

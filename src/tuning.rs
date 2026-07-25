@@ -72,6 +72,7 @@ pub struct Tuning {
     pub scroll_margin: usize,
     pub page_overlap: usize,
     pub wheel_scroll_lines: usize,
+    pub multi_click_ms: u64,
     pub dropdown_max_rows: u16,
     pub panel_max_height_pct: u16,
     pub ask_panel_max_pct: u16,
@@ -100,6 +101,12 @@ pub struct Tuning {
     /// live via cache splicing; this only governs how soon a full reparse catches up
     /// after you pause typing.
     pub syntax_recolor_ms: u64,
+    /// Show the host-health line at the top of the SPACES panel (0 = off, 1 = on):
+    /// session uptime, load, memory %, free disk, and GPU % where available.
+    pub health_line: u64,
+    /// How often (seconds) the health probes refresh. Memory is smoothed across a few
+    /// minutes regardless; this only sets the sampling cadence.
+    pub health_sample_secs: u64,
     /// Tint the cursor's line with a subtle background (0 = off, 1 = on).
     pub highlight_current_line: u64,
     /// The current-line tint color (used when highlight_current_line = 1).
@@ -154,6 +161,7 @@ impl Default for Tuning {
             scroll_margin: 3,
             page_overlap: 2,
             wheel_scroll_lines: 3,
+            multi_click_ms: 400,
             dropdown_max_rows: 20,
             panel_max_height_pct: 60,
             ask_panel_max_pct: 30,
@@ -174,6 +182,8 @@ impl Default for Tuning {
             line_numbers: false,
             syntax_highlight: 1,
             syntax_recolor_ms: 150,
+            health_line: 1,
+            health_sample_secs: 2,
             highlight_current_line: 1,
             current_line_bg: [42, 37, 34],   // subtle warm tint on the cursor's row
             reading_width: 90,
@@ -270,6 +280,12 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "Lines of overlap kept on PageUp/PageDown so context isn't lost.")),
         ("wheel_scroll_lines", knob(json!(d.wheel_scroll_lines),
             "Lines moved per mouse-wheel step.")),
+        ("multi_click_ms", knob(json!(d.multi_click_ms),
+            "How long after a click a second one still counts as a double-click \
+             (milliseconds). Terminals report no click count — two clicks arrive as \
+             two independent presses — so Mars times them itself: double selects the \
+             word under the pointer, triple selects the line. Raise it if your \
+             double-clicks are being read as two single clicks.")),
         ("dropdown_max_rows", knob(json!(d.dropdown_max_rows),
             "Maximum visible rows in the command-bar dropdown.")),
         ("panel_max_height_pct", knob(json!(d.panel_max_height_pct),
@@ -324,6 +340,14 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
              catch up sooner after you pause; higher = fewer background reparses while \
              typing fast. Colors already track edits live via cache splicing, so this \
              is just the fallback reparse cadence.")),
+        ("health_line", knob(json!(d.health_line),
+            "Show the host-health line atop the SPACES panel (0/1): session uptime, 1-min \
+             load, host memory %, free disk on the working dir, and — on machines with \
+             `nvidia-smi` — GPU memory %. Any probe the OS can't answer is dropped, so the \
+             line self-trims. Sampled only while the panel is open (GPU polled off-thread).")),
+        ("health_sample_secs", knob(json!(d.health_sample_secs),
+            "How often (seconds) the health probes refresh. Memory is smoothed over a few \
+             minutes regardless; this is just the sampling cadence.")),
         ("highlight_current_line", knob(json!(d.highlight_current_line),
             "Tint the cursor's line with a subtle background (0 = off, 1 = on) \
              for focus. The color is `current_line_bg`.")),
@@ -492,6 +516,7 @@ pub fn load() -> Tuning {
         t.scroll_margin         = get_u64(&map, "scroll_margin", t.scroll_margin as u64) as usize;
         t.page_overlap          = get_u64(&map, "page_overlap", t.page_overlap as u64) as usize;
         t.wheel_scroll_lines    = get_u64(&map, "wheel_scroll_lines", t.wheel_scroll_lines as u64) as usize;
+        t.multi_click_ms        = get_u64(&map, "multi_click_ms", t.multi_click_ms);
         t.dropdown_max_rows     = get_u64(&map, "dropdown_max_rows", t.dropdown_max_rows as u64) as u16;
         t.panel_max_height_pct  = get_u64(&map, "panel_max_height_pct", t.panel_max_height_pct as u64) as u16;
         t.ask_panel_max_pct     = get_u64(&map, "ask_panel_max_pct", t.ask_panel_max_pct as u64) as u16;
@@ -515,6 +540,8 @@ pub fn load() -> Tuning {
             .unwrap_or(t.line_numbers);
         t.syntax_highlight = get_u64(&map, "syntax_highlight", t.syntax_highlight);
         t.syntax_recolor_ms = get_u64(&map, "syntax_recolor_ms", t.syntax_recolor_ms);
+        t.health_line = get_u64(&map, "health_line", t.health_line);
+        t.health_sample_secs = get_u64(&map, "health_sample_secs", t.health_sample_secs);
         t.highlight_current_line = get_u64(&map, "highlight_current_line", t.highlight_current_line);
         t.current_line_bg = get_rgb(&map, "current_line_bg", t.current_line_bg);
         t.reading_width = get_u64(&map, "reading_width", t.reading_width);
