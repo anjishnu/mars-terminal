@@ -1,1 +1,1 @@
-The process just exited.
+The process just exited.{code}

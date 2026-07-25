@@ -1,1 +1,1 @@
-The output has gone quiet (it may still be running).
+The output has gone quiet{secs} (it may still be running).

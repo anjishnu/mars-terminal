@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// the whole set; the default below is "Mission Control", byte-identical to the
 /// shipped look. Neutrals default to ANSI-named colors so they honor the terminal
 /// palette exactly as before.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 pub struct Palette {
     pub accent: Color,        // primary brand (focus, active chrome)
     pub accent_bright: Color, // bright brand (teaching, emphasis)
@@ -96,6 +96,10 @@ pub struct Tuning {
     /// Syntax-highlight code in editor panes (0 = off, 1 = on). Colors come from the
     /// active theme; unknown languages render plain. No-op without the `syntax` build.
     pub syntax_highlight: u64,
+    /// Milliseconds of edit-quiet before code is re-highlighted. Colors track edits
+    /// live via cache splicing; this only governs how soon a full reparse catches up
+    /// after you pause typing.
+    pub syntax_recolor_ms: u64,
     /// Tint the cursor's line with a subtle background (0 = off, 1 = on).
     pub highlight_current_line: u64,
     /// The current-line tint color (used when highlight_current_line = 1).
@@ -169,6 +173,7 @@ impl Default for Tuning {
             theme_status_blocked: [230, 165, 60], // #E6A53C conventional amber (blocked / waiting on you)
             line_numbers: false,
             syntax_highlight: 1,
+            syntax_recolor_ms: 150,
             highlight_current_line: 1,
             current_line_bg: [42, 37, 34],   // subtle warm tint on the cursor's row
             reading_width: 90,
@@ -309,8 +314,16 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "Show the line-number gutter in editor panes. The cursor position \
              is always in the status bar, so this defaults to off for width.")),
         ("syntax_highlight", knob(json!(d.syntax_highlight),
-            "Syntax-highlight code in editor panes (0/1). Colors follow the active \
-             theme; unknown languages render plain. Needs the `syntax` build feature.")),
+            "Start with syntax highlighting on (0/1). On by default; toggle per session \
+             from the command bar. Highlighting runs on a background thread and is cached, so it \
+             never blocks: a file paints plain immediately, then colorizes line-by-line \
+             as the worker delivers. Colors follow the active theme; unknown languages \
+             render plain. Needs the `syntax` build feature.")),
+        ("syntax_recolor_ms", knob(json!(d.syntax_recolor_ms),
+            "Milliseconds of edit-quiet before a full re-highlight runs. Lower = colors \
+             catch up sooner after you pause; higher = fewer background reparses while \
+             typing fast. Colors already track edits live via cache splicing, so this \
+             is just the fallback reparse cadence.")),
         ("highlight_current_line", knob(json!(d.highlight_current_line),
             "Tint the cursor's line with a subtle background (0 = off, 1 = on) \
              for focus. The color is `current_line_bg`.")),
@@ -501,6 +514,7 @@ pub fn load() -> Tuning {
             .and_then(|e| e.value.as_bool())
             .unwrap_or(t.line_numbers);
         t.syntax_highlight = get_u64(&map, "syntax_highlight", t.syntax_highlight);
+        t.syntax_recolor_ms = get_u64(&map, "syntax_recolor_ms", t.syntax_recolor_ms);
         t.highlight_current_line = get_u64(&map, "highlight_current_line", t.highlight_current_line);
         t.current_line_bg = get_rgb(&map, "current_line_bg", t.current_line_bg);
         t.reading_width = get_u64(&map, "reading_width", t.reading_width);

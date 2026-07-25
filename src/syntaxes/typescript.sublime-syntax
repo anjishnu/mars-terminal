@@ -1,0 +1,98 @@
+%YAML 1.2
+---
+# A compact, self-contained TypeScript grammar — syntect's bundled set ships
+# JavaScript but not TypeScript, so `.ts`/`.tsx` would otherwise render plain.
+# Covers comments, strings (incl. template literals with interpolation), numbers,
+# the TS keyword set (including type-level keywords), capitalized type names,
+# decorators, and function-call names. Scopes match MARS's theme mapping in
+# `syntax.rs::theme_for` (keyword→accent, type→info, function→accent-bright, …).
+name: TypeScript
+file_extensions:
+  - ts
+  - tsx
+  - mts
+  - cts
+scope: source.ts
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - include: decorators
+    - include: keywords
+    - include: names
+
+  comments:
+    - match: //
+      scope: punctuation.definition.comment.ts
+      push:
+        - meta_scope: comment.line.double-slash.ts
+        - match: $\n?
+          pop: true
+    - match: /\*
+      scope: punctuation.definition.comment.ts
+      push:
+        - meta_scope: comment.block.ts
+        - match: \*/
+          pop: true
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.ts
+      push:
+        - meta_scope: string.quoted.double.ts
+        - match: \\.
+          scope: constant.character.escape.ts
+        - match: '"'
+          scope: punctuation.definition.string.end.ts
+          pop: true
+    - match: "'"
+      scope: punctuation.definition.string.begin.ts
+      push:
+        - meta_scope: string.quoted.single.ts
+        - match: \\.
+          scope: constant.character.escape.ts
+        - match: "'"
+          scope: punctuation.definition.string.end.ts
+          pop: true
+    - match: '`'
+      scope: punctuation.definition.string.begin.ts
+      push:
+        - meta_scope: string.template.ts
+        - match: '`'
+          scope: punctuation.definition.string.end.ts
+          pop: true
+        - match: \\.
+          scope: constant.character.escape.ts
+        - match: \$\{
+          scope: punctuation.definition.template-expression.begin.ts
+          push:
+            - clear_scopes: 1
+            - match: \}
+              scope: punctuation.definition.template-expression.end.ts
+              pop: true
+            - include: main
+
+  numbers:
+    - match: '\b(0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|(\d[\d_]*)(\.[\d_]+)?([eE][+-]?\d+)?)n?\b'
+      scope: constant.numeric.ts
+
+  decorators:
+    - match: '@[A-Za-z_$][\w$]*'
+      scope: entity.name.function.decorator.ts
+
+  keywords:
+    - match: \b(as|asserts|await|break|case|catch|const|continue|debugger|default|delete|do|else|export|extends|finally|for|from|if|implements|import|in|infer|instanceof|is|keyof|new|of|return|satisfies|switch|throw|try|typeof|void|while|with|yield)\b
+      scope: keyword.control.ts
+    - match: \b(abstract|async|declare|enum|function|get|interface|namespace|override|package|private|protected|public|readonly|set|static|type|var|let|class)\b
+      scope: storage.type.ts
+    - match: \b(any|bigint|boolean|never|null|number|object|string|symbol|undefined|unique|unknown)\b
+      scope: support.type.primitive.ts
+    - match: \b(true|false|this|super)\b
+      scope: constant.language.ts
+
+  names:
+    - match: '\b([A-Z][A-Za-z0-9_$]*)\b'
+      scope: entity.name.type.ts
+    - match: '\b([a-z_$][\w$]*)\s*(?=\()'
+      scope: entity.name.function.ts

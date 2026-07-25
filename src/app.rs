@@ -126,6 +126,76 @@ pub struct WatchState {
 #[derive(Clone, Copy)]
 pub enum WatchReason { Exit, Quiet }
 
+/// A request to highlight a buffer, handed to the background syntax worker. Carries a
+/// content snapshot so the worker never touches live app state on its thread.
+// Without the `syntax` feature the stub worker ignores the payload — don't warn.
+#[cfg_attr(not(feature = "syntax"), allow(dead_code))]
+pub struct SyntaxJob {
+    pub buf_id: BufferId,
+    /// The buffer revision this snapshot is of — the result is discarded if the
+    /// buffer has moved on by the time it lands.
+    pub rev: u64,
+    /// Identity of the theme palette the colors were computed for.
+    pub palette_id: u64,
+    pub code: String,
+    pub ext: String,
+    pub palette: crate::tuning::Palette,
+    /// Last visible line — the worker publishes the chunk covering `0..=this` first.
+    pub viewport_bottom: usize,
+}
+
+/// A slice of highlight results streaming back from the worker. Chunks for one job
+/// arrive in order and tile the buffer (`start_line` = lines already delivered).
+pub enum SyntaxEvent {
+    Chunk {
+        buf_id: BufferId,
+        rev: u64,
+        palette_id: u64,
+        start_line: usize,
+        styles: Vec<Vec<ratatui::style::Style>>,
+        complete: bool,
+    },
+}
+
+/// The cached highlight for one buffer: per-character styles per line, tagged with the
+/// `(rev, palette)` they were computed for. Rendered as-is even when stale — the old
+/// colors bridge the ~½s until a fresh pass for the current revision lands.
+pub struct SyntaxCache {
+    pub rev: u64,
+    pub palette_id: u64,
+    pub lines: Vec<Vec<ratatui::style::Style>>,
+}
+
+/// A human-readable language name for a file extension, so the agent can be told
+/// what language to write. Empty-mapped extensions fall back to "plain text".
+fn lang_label(ext: &str) -> &'static str {
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" => "Rust",
+        "py" | "pyi" => "Python",
+        "js" | "mjs" | "cjs" => "JavaScript",
+        "ts" => "TypeScript",
+        "tsx" | "jsx" => "React/JSX",
+        "go" => "Go",
+        "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" => "C++",
+        "rb" => "Ruby",
+        "java" => "Java",
+        "kt" | "kts" => "Kotlin",
+        "swift" => "Swift",
+        "sh" | "bash" | "zsh" => "shell",
+        "json" => "JSON",
+        "toml" => "TOML",
+        "yaml" | "yml" => "YAML",
+        "md" | "markdown" => "Markdown",
+        "html" | "htm" => "HTML",
+        "css" => "CSS",
+        "sql" => "SQL",
+        "lua" => "Lua",
+        "php" => "PHP",
+        _ => "plain text",
+    }
+}
+
 /// Pull the selected cells from a terminal screen as text — reading order,
 /// trailing spaces trimmed per row (linear/text-flow, like a normal terminal
 /// copy). `a`/`b` are normalized (a ≤ b) screen cells; `last_col` bounds
@@ -377,6 +447,18 @@ pub struct App {
     pub terms: HashMap<TermId, Term>,
     pub term_tx: mpsc::Sender<TermEvent>,
     pub term_rx: mpsc::Receiver<TermEvent>,
+    // ── Syntax highlighting (background worker + per-buffer cache) ──
+    /// Whether highlighting is showing this session — a per-session toggle
+    /// (C-x C-h) seeded from `tuning.syntax_highlight`. Off by default.
+    pub syntax_on: bool,
+    pub syntax_tx: mpsc::Sender<SyntaxEvent>,
+    pub syntax_rx: mpsc::Receiver<SyntaxEvent>,
+    pub syntax_cache: HashMap<BufferId, SyntaxCache>,
+    /// Buffer → the `(rev, palette_id)` pass we currently want displayed. Set when a
+    /// highlight is requested; the drain applies only chunks matching it, so a worker
+    /// superseded by a newer edit (or theme change) is ignored — its stale colors are
+    /// dropped rather than clobbering the current pass.
+    pub syntax_want: HashMap<BufferId, (u64, u64)>,
     next_buffer_id: usize,
     next_pane_id: usize,
     next_tab_id: usize,
@@ -389,6 +471,7 @@ impl App {
         let state = PersistedState::load();
         let (agent_tx, agent_rx) = mpsc::channel();
         let (term_tx, term_rx) = mpsc::channel();
+        let (syntax_tx, syntax_rx) = mpsc::channel();
         let mut app = App {
             buffers: HashMap::new(),
             panes: HashMap::new(),
@@ -479,11 +562,17 @@ impl App {
             terms: HashMap::new(),
             term_tx,
             term_rx,
+            syntax_on: false,
+            syntax_tx,
+            syntax_rx,
+            syntax_cache: HashMap::new(),
+            syntax_want: HashMap::new(),
             next_buffer_id: 0,
             next_pane_id: 0,
             next_tab_id: 0,
             next_term_id: 0,
         };
+        app.syntax_on = app.tuning.syntax_highlight == 1;
         let buf_id = match file {
             Some(ref path) => app.open_file(path)?,
             None => app.new_scratch(),
@@ -883,7 +972,10 @@ impl App {
         {
             let buf = self.buffers.get_mut(&buf_id).unwrap();
             buf.rope.insert_char(char_idx, c);
-            buf.modified = true;
+            buf.mark_edited();
+        }
+        if c == '\n' {
+            self.syntax_split_line(buf_id, row, col); // keep colors aligned across the split
         }
         let p = self.focused_pane_mut();
         if c == '\n' {
@@ -933,7 +1025,10 @@ impl App {
         {
             let buf = self.buffers.get_mut(&buf_id).unwrap();
             buf.rope.remove(char_idx - 1..char_idx);
-            buf.modified = true;
+            buf.mark_edited();
+        }
+        if col == 0 {
+            self.syntax_join_line(buf_id, row); // joined a line up — merge its colors
         }
         let p = self.focused_pane_mut();
         p.cursor_row = new_pos.0;
@@ -1364,7 +1459,7 @@ impl App {
         if idx < buf.rope.len_chars() {
             buf.checkpoint();
             buf.rope.remove(idx..idx + 1);
-            buf.modified = true;
+            buf.mark_edited();
         }
     }
 
@@ -1379,7 +1474,7 @@ impl App {
             if end > start {
                 let k = buf.rope.slice(start..end).to_string();
                 buf.rope.remove(start..end);
-                buf.modified = true;
+                buf.mark_edited();
                 k
             } else {
                 String::new()
@@ -1395,7 +1490,7 @@ impl App {
                 buf.checkpoint();
                 let k = buf.rope.slice(s..e).to_string();
                 buf.rope.remove(s..e);
-                buf.modified = true;
+                buf.mark_edited();
                 k
             };
             self.push_kill(killed);
@@ -1457,7 +1552,7 @@ impl App {
         {
             let buf = self.buffers.get_mut(&buf_id).unwrap();
             buf.rope.remove(start..start + len);
-            buf.modified = true;
+            buf.mark_edited();
         }
         let (r, c) = self.rowcol_of(buf_id, start);
         self.set_cursor(r, c);
@@ -1479,7 +1574,7 @@ impl App {
             buf.checkpoint();
             let k = buf.rope.slice(s..e).to_string();
             buf.rope.remove(s..e);
-            buf.modified = true;
+            buf.mark_edited();
             k
         };
         let (r, c) = self.rowcol_of(buf_id, s);
@@ -2375,7 +2470,7 @@ impl App {
                 self.buffers.get_mut(&buf_id).unwrap().rope.insert(line_start, "    ");
             }
         }
-        self.buffers.get_mut(&buf_id).unwrap().modified = true;
+        self.buffers.get_mut(&buf_id).unwrap().mark_edited();
         if sel.is_some() {
             // Re-select the affected lines so the block stays highlighted for repeats.
             let end_len = self.buffers[&buf_id].line_len(end_row);
@@ -2428,7 +2523,7 @@ impl App {
         let buf = self.buffers.get_mut(&buf_id).unwrap();
         buf.rope.remove(idx..idx + flen);
         buf.rope.insert(idx, to);
-        buf.modified = true;
+        buf.mark_edited();
     }
 
     fn qr_finish(&mut self) {
@@ -2478,7 +2573,7 @@ impl App {
                 let buf = self.buffers.get_mut(&buf_id).unwrap();
                 buf.checkpoint();
                 buf.rope.remove(s..e);
-                buf.modified = true;
+                buf.mark_edited();
             }
             let (r, c) = self.rowcol_of(buf_id, s);
             self.set_cursor(r, c);
@@ -3539,7 +3634,7 @@ impl App {
         }
         let cfg = agent::AgentConfig::from_env();
         if !cfg.is_configured() {
-            self.status_msg = Some("No API key — set GEMINI_API_KEY to translate".into());
+            self.status_msg = Some("No LLM key — run `mars setup` for a free key to translate".into());
             return;
         }
         self.agent_pending = true;
@@ -3588,6 +3683,29 @@ impl App {
 
     /// W1/W2: open the Ask bar with a canned question and submit it at once —
     /// a zero-typing "explain / triage" gesture grounded in the live screen.
+    /// The Explain-failure query, enriched with the focused terminal's failing
+    /// command and exit code — facts the model needs to triage but that may have
+    /// scrolled off the visible screen (or, for the exit code, never appear there).
+    fn explain_failure_prompt(&self) -> String {
+        let base = crate::prompts::EXPLAIN_FAILURE.trim_end();
+        let tid = match self.focused_pane().content {
+            PaneContent::Terminal(t) => t,
+            _ => return base.to_string(),
+        };
+        let cmd = self
+            .watches
+            .get(&tid)
+            .and_then(|w| w.last_command.as_ref())
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty());
+        let exit = self.terms.get(&tid).and_then(|t| t.exit_code());
+        match (cmd, exit) {
+            (Some(c), Some(code)) => format!("{base}\n\nLAST COMMAND: {c} (exit {code})"),
+            (Some(c), None) => format!("{base}\n\nLAST COMMAND: {c}"),
+            _ => base.to_string(),
+        }
+    }
+
     fn ask_prefilled(&mut self, question: &str) {
         self.open_bar(BarMode::Ask);
         if let Some(p) = self.palette.as_mut() {
@@ -3608,7 +3726,8 @@ impl App {
         cfg.temperature = self.tuning.agent_temperature;
         if !cfg.is_configured() {
             self.agent_answer = Some(
-                "⚠ No API key. Export GROQ_API_KEY, GEMINI_API_KEY, or MARS_LLM_KEY and retry."
+                "⚠ No LLM key set — agent features are off. Quit and run `mars setup` for a \
+                 free key (Groq/Gemini), or set GROQ_API_KEY, then relaunch."
                     .into(),
             );
             self.agent_directive = None;
@@ -3642,10 +3761,17 @@ impl App {
             };
             let at = self.buffers[&buf_id].char_at(row, col);
             self.refactor_target = Some((buf_id, at, at));
+            let ext = self.buffers[&buf_id]
+                .path
+                .as_ref()
+                .and_then(|p| p.extension().and_then(|e| e.to_str()))
+                .or_else(|| self.buffers[&buf_id].name.rsplit('.').nth(0))
+                .unwrap_or("");
             context.push_str(
                 &crate::prompts::CURSOR_INSERT
                     .replace("{line}", &(row + 1).to_string())
-                    .replace("{file}", &self.buffers[&buf_id].name),
+                    .replace("{file}", &self.buffers[&buf_id].name)
+                    .replace("{lang}", lang_label(ext)),
             );
         }
         agent::ask(
@@ -3675,7 +3801,7 @@ impl App {
             buf.checkpoint(); // one reversible chunk
             buf.rope.remove(s..e);
             buf.rope.insert(s, &code);
-            buf.modified = true;
+            buf.mark_edited();
         }
         let (r, c) = self.rowcol_of(buf_id, s + code.chars().count());
         self.close_bar();
@@ -3898,6 +4024,142 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// A cheap identity for the current theme palette — the syntax cache invalidates
+    /// when it changes (a live theme switch recolors code).
+    fn palette_id(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.tuning.palette.hash(&mut h);
+        h.finish()
+    }
+
+    /// Toggle syntax highlighting for this session (C-x C-h). The cache persists
+    /// across a toggle, so flipping it back on is instant; turning it on kicks an
+    /// immediate highlight of the focused buffer rather than waiting for the idle pass.
+    fn toggle_syntax_highlight(&mut self) {
+        self.syntax_on = !self.syntax_on;
+        if self.syntax_on {
+            if let PaneContent::Editor(buf_id) = self.focused_pane().content {
+                let vp = self.focused_pane().scroll_row + 80;
+                self.request_highlight(buf_id, vp);
+            }
+            self.status_msg = Some("Syntax highlighting on".into());
+        } else {
+            self.status_msg = Some("Syntax highlighting off".into());
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Snapshot the buffer and hand it to the background highlight worker, unless a
+    /// pass for the current `(rev, palette)` is already cached or in flight. Never
+    /// blocks: the worker runs off-thread and streams results back via `syntax_rx`.
+    fn request_highlight(&mut self, buf_id: BufferId, viewport_bottom: usize) {
+        if !self.syntax_on {
+            return;
+        }
+        let Some(buf) = self.buffers.get(&buf_id) else { return };
+        let Some(ext) = buf
+            .path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(str::to_string)
+        else {
+            return; // no extension → nothing to key a language on
+        };
+        let rev = buf.rev;
+        let palette_id = self.palette_id();
+        // Already displaying this exact pass, or already requested it → nothing to do.
+        if self
+            .syntax_cache
+            .get(&buf_id)
+            .map(|c| c.rev == rev && c.palette_id == palette_id)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if self.syntax_want.get(&buf_id) == Some(&(rev, palette_id)) {
+            return;
+        }
+        self.syntax_want.insert(buf_id, (rev, palette_id));
+        let job = SyntaxJob {
+            buf_id,
+            rev,
+            palette_id,
+            code: buf.rope.to_string(),
+            ext,
+            palette: self.tuning.palette,
+            viewport_bottom,
+        };
+        crate::syntax::highlight_stream(job, self.syntax_tx.clone());
+    }
+
+    /// Merge one streamed highlight chunk into the cache by **overwriting its line
+    /// range in place** — the cache is never emptied, so on-screen cells only ever go
+    /// color→color as a new pass streams in, never color→white→color. Chunks from a
+    /// superseded pass (an older `(rev, palette)` than we now want) are dropped. The
+    /// stale tail (if the file shrank) is trimmed only when the pass `complete`s, and
+    /// the cache's `(rev, palette)` advances then too — one clean swap.
+    fn apply_syntax_chunk(
+        &mut self,
+        buf_id: BufferId,
+        rev: u64,
+        palette_id: u64,
+        start_line: usize,
+        styles: Vec<Vec<ratatui::style::Style>>,
+        complete: bool,
+    ) {
+        // Only accept the pass we're currently waiting for.
+        if self.syntax_want.get(&buf_id) != Some(&(rev, palette_id)) {
+            return;
+        }
+        let c = self.syntax_cache.entry(buf_id).or_insert_with(|| SyntaxCache {
+            rev, palette_id, lines: Vec::new(),
+        });
+        let end = start_line + styles.len();
+        if c.lines.len() < end {
+            c.lines.resize(end, Vec::new());
+        }
+        for (k, s) in styles.into_iter().enumerate() {
+            c.lines[start_line + k] = s;
+        }
+        if complete {
+            c.lines.truncate(end); // drop any stale tail from the previous, longer pass
+            c.rev = rev;
+            c.palette_id = palette_id;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Keep the color cache aligned with a newline INSERT: split the cached line at
+    /// the cursor column so the colors travel with their characters — the tail keeps
+    /// its own colors on the new line instead of every line below showing the wrong
+    /// (shifted) colors until the next re-highlight. A no-op if the line isn't cached.
+    fn syntax_split_line(&mut self, buf_id: BufferId, row: usize, col: usize) {
+        if let Some(c) = self.syntax_cache.get_mut(&buf_id) {
+            if row < c.lines.len() {
+                let at = col.min(c.lines[row].len());
+                let tail = c.lines[row].split_off(at);
+                c.lines.insert(row + 1, tail);
+            }
+        }
+    }
+
+    /// The newline-DELETE counterpart (Backspace at column 0, joining `row` up into
+    /// `row - 1`): merge the two cached color-lines so nothing below shifts out of
+    /// alignment. A no-op at the top of the buffer or if the line isn't cached.
+    fn syntax_join_line(&mut self, buf_id: BufferId, row: usize) {
+        if row == 0 {
+            return;
+        }
+        if let Some(c) = self.syntax_cache.get_mut(&buf_id) {
+            if row < c.lines.len() {
+                let tail = c.lines.remove(row);
+                c.lines[row - 1].extend(tail);
+            }
+        }
+    }
+
     /// True when the focused pane is showing the read-only Markdown view.
     fn md_view_active(&self) -> bool {
         let p = self.focused_pane();
@@ -3974,6 +4236,7 @@ impl App {
             Action::Save               => self.do_save(),
             Action::ToggleFileTree     => self.toggle_file_tree(),
             Action::ToggleMarkdown     => self.toggle_markdown(),
+            Action::ToggleSyntaxHighlight => self.toggle_syntax_highlight(),
             Action::SetTheme(name)     => self.set_theme_live(&name),
             Action::RefreshIndex       => {
                 self.project_index = None;
@@ -4025,7 +4288,7 @@ impl App {
             Action::OpenTerminal       => self.open_terminal(),
             Action::AskAgent           => self.open_bar(BarMode::Ask),
             Action::ExplainThis        => self.ask_prefilled(crate::prompts::EXPLAIN_THIS.trim_end()),
-            Action::ExplainFailure     => self.ask_prefilled(crate::prompts::EXPLAIN_FAILURE.trim_end()),
+            Action::ExplainFailure     => { let q = self.explain_failure_prompt(); self.ask_prefilled(&q); }
             Action::WatchPane          => self.toggle_watch_pane(),
             Action::ExpandNotices      => self.expand_notices(),
             Action::AwayDigest         => self.show_away_digest(),
@@ -4426,6 +4689,31 @@ impl App {
             }
         }
 
+        // Drain streamed syntax-highlight chunks into the per-buffer cache.
+        let mut chunks = Vec::new();
+        while let Ok(ev) = self.syntax_rx.try_recv() {
+            chunks.push(ev);
+        }
+        for ev in chunks {
+            match ev {
+                SyntaxEvent::Chunk { buf_id, rev, palette_id, start_line, styles, complete } => {
+                    self.apply_syntax_chunk(buf_id, rev, palette_id, start_line, styles, complete);
+                }
+            }
+        }
+        // Idle re-highlight: ~½s after the last edit, refresh the focused code buffer
+        // so its colors catch up to the current revision. Debounced off `last_input_tick`
+        // so it never fires mid-keystroke — the stale cache bridges the gap on screen.
+        if self.syntax_on {
+            let debounce = (self.tuning.syntax_recolor_ms / self.tuning.poll_interval_ms.max(1)).max(1);
+            if self.frame_tick.saturating_sub(self.last_input_tick) >= debounce {
+                if let PaneContent::Editor(buf_id) = self.focused_pane().content {
+                    let vp = self.focused_pane().scroll_row + 80;
+                    self.request_highlight(buf_id, vp);
+                }
+            }
+        }
+
         // Drain background LLM-agent events.
         let mut events = Vec::new();
         while let Ok(ev) = self.agent_rx.try_recv() {
@@ -4706,6 +4994,16 @@ impl App {
     }
 
     /// Append an event to the bounded away-log ring (the Away Digest source).
+    /// First-run nudge when no LLM key is configured: one dismissible notice. The
+    /// editor and multiplexer work without a key — this only points the way to the
+    /// agent features. Esc clears it like any other notice.
+    pub fn notice_no_key(&mut self) {
+        self.notices.push(Notice {
+            text: "No LLM key set — agent features are off. Run `mars setup` for a free key.".into(),
+            kind: NoticeKind::Info,
+        });
+    }
+
     pub fn push_away(&mut self, kind: AwayKind, text: String, dur_ticks: Option<u64>) {
         self.away_log.push(AwayEvent {
             tick: self.frame_tick,
@@ -5406,7 +5704,7 @@ impl App {
             w.fired_exit = exit;
         }
         self.bg_busy = true;
-        agent::watch_summary(cfg, id, reason, tail, self.agent_tx.clone());
+        agent::watch_summary(cfg, id, reason, tail, exit, self.tuning.watch_quiet_secs, self.agent_tx.clone());
     }
 
     /// Workspaces-panel `s`: pull an on-demand summary for the highlighted surface.

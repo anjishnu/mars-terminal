@@ -9,6 +9,10 @@ pub struct Buffer {
     pub path: Option<PathBuf>,
     pub rope: Rope,
     pub modified: bool,
+    /// Monotonic edit counter — bumped on every content change. The syntax
+    /// highlighter keys its cache on this, so a stale (pre-edit) highlight is
+    /// shown until a fresh one for the current `rev` lands.
+    pub rev: u64,
     undo_stack: Vec<Rope>,
     redo_stack: Vec<Rope>,
 }
@@ -21,6 +25,7 @@ impl Buffer {
             path: None,
             rope: Rope::new(),
             modified: false,
+            rev: 0,
             undo_stack: vec![],
             redo_stack: vec![],
         }
@@ -38,6 +43,7 @@ impl Buffer {
             path: Some(path),
             rope: Rope::from_str(&content),
             modified: false,
+            rev: 0,
             undo_stack: vec![],
             redo_stack: vec![],
         })
@@ -63,6 +69,13 @@ impl Buffer {
         Ok(())
     }
 
+    /// Record a content edit: flag the buffer dirty and bump the revision the
+    /// syntax highlighter caches against. Call after any rope mutation.
+    pub fn mark_edited(&mut self) {
+        self.modified = true;
+        self.rev += 1;
+    }
+
     /// Snapshot the current state so the next `undo()` can return to it.
     /// Call before any user-visible edit batch (entering insert mode, dd, etc.)
     pub fn checkpoint(&mut self) {
@@ -75,6 +88,7 @@ impl Buffer {
             self.redo_stack.push(self.rope.clone());
             self.rope = prev;
             self.modified = true;
+            self.rev += 1;
             true
         } else {
             false
@@ -86,6 +100,7 @@ impl Buffer {
             self.undo_stack.push(self.rope.clone());
             self.rope = next;
             self.modified = true;
+            self.rev += 1;
             true
         } else {
             false

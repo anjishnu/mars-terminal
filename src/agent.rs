@@ -6,6 +6,28 @@
 
 use std::sync::mpsc;
 
+/// First-run / no-key setup instructions — printed by `mars setup`, by headless
+/// commands that need a key, by `install.sh`, and surfaced as a dismissible notice
+/// when the editor launches unconfigured. Plain text, wrapped for an 80-col terminal.
+pub const SETUP_HELP: &str = "\
+Mars uses an LLM for its agent features — Ask, English→shell, watch summaries, and
+away briefings. The editor and terminal multiplexer work fully without one.
+
+Get a free API key in about 30 seconds:
+  • Groq   (recommended — fast, generous free tier):  https://console.groq.com/keys
+  • Gemini (Google, free tier):                       https://aistudio.google.com/apikey
+
+Then give it to Mars either way:
+  • Shell rc (~/.zshrc or ~/.bashrc), then restart your shell:
+      export GROQ_API_KEY=\"gsk_your_key_here\"
+  • Or ~/.mars/config.json (Mars reads this on startup):
+      { \"env\": { \"GROQ_API_KEY\": \"gsk_your_key_here\" } }
+
+Other providers also work: ANTHROPIC_API_KEY, OPENAI_API_KEY, or MARS_LLM_KEY
+(+ MARS_LLM_URL for a custom or local endpoint such as Ollama).
+
+Re-print these instructions anytime with:  mars setup";
+
 #[cfg(feature = "ssh")]
 pub const PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
     "MARS_LLM_KEY",
@@ -17,7 +39,7 @@ pub const PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
     "GROQ_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
-];
+    ];
 
 /// What the model asked the editor to do (always user-confirmed before firing).
 #[derive(Clone, Debug, PartialEq)]
@@ -504,10 +526,12 @@ pub fn watch_summary(
     term_id: usize,
     reason: crate::app::WatchReason,
     tail: String,
+    exit: Option<i32>,
+    quiet_secs: u64,
     tx: mpsc::Sender<AgentEvent>,
 ) {
     std::thread::spawn(move || {
-        let messages = build_watch_messages(reason, &tail);
+        let messages = build_watch_messages(reason, &tail, exit, quiet_secs);
         match chat(&cfg, messages, "watch") {
             Ok(text) => {
                 let verdict = text.trim().lines().next().unwrap_or("").trim().to_string();
@@ -533,7 +557,7 @@ pub fn watch_summary(
 /// SurfaceSummary (no notice side-effects).
 pub fn summarize_surface(cfg: AgentConfig, term_id: usize, tail: String, tx: mpsc::Sender<AgentEvent>) {
     std::thread::spawn(move || {
-        let messages = build_watch_messages(crate::app::WatchReason::Quiet, &tail);
+        let messages = build_watch_messages(crate::app::WatchReason::Quiet, &tail, None, 0);
         match chat(&cfg, messages, "summarize") {
             Ok(text) => {
                 let line = text.trim().lines().next().unwrap_or("").trim().to_string();
@@ -553,10 +577,31 @@ pub fn summarize_surface(cfg: AgentConfig, term_id: usize, tail: String, tx: mps
 /// Watch is a VOICE task: the verdict is prose the user reads many times a
 /// day, so the persona rides along — bounded by WATCH_SYSTEM's one-line rule,
 /// which the persona preamble forbids overriding. Pure, for the selfcheck.
-pub fn build_watch_messages(reason: crate::app::WatchReason, tail: &str) -> Vec<serde_json::Value> {
+pub fn build_watch_messages(
+    reason: crate::app::WatchReason,
+    tail: &str,
+    exit: Option<i32>,
+    quiet_secs: u64,
+) -> Vec<serde_json::Value> {
+    // Hand the model the ground truth it was missing: the shell's exit code on exit
+    // (0 vs non-zero decides success/failure), and how long "quiet" has actually been.
     let hint = match reason {
-        crate::app::WatchReason::Exit => crate::prompts::WATCH_HINT_EXIT,
-        crate::app::WatchReason::Quiet => crate::prompts::WATCH_HINT_QUIET,
+        crate::app::WatchReason::Exit => {
+            let code = match exit {
+                Some(0) => " Its exit code was 0 — a clean exit.".to_string(),
+                Some(c) => format!(" Its exit code was {c} (non-zero — this usually means it failed)."),
+                None => String::new(),
+            };
+            crate::prompts::WATCH_HINT_EXIT.trim_end().replace("{code}", &code)
+        }
+        crate::app::WatchReason::Quiet => {
+            let secs = if quiet_secs > 0 {
+                format!(" — no new output for about {quiet_secs}s")
+            } else {
+                String::new()
+            };
+            crate::prompts::WATCH_HINT_QUIET.trim_end().replace("{secs}", &secs)
+        }
     };
     let mut messages = vec![serde_json::json!({ "role": "system",
         "content": crate::prompts::WATCH_SYSTEM.trim_end().replace("{hint}", hint.trim_end()) })];
@@ -719,6 +764,21 @@ pub fn shift_brief(
 
 /// FORMAT-task builder for translate: machine-parsed output, so the persona
 /// NEVER appears here (selfcheck-pinned). Pure.
+/// A compact environment line the model can't read off the screen but that changes
+/// the correct command — the shell (bash/zsh/fish), the OS (macOS `sed -i ''` vs GNU
+/// `sed -i`, brew vs apt, path flags), and the working directory.
+pub fn env_context() -> String {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .and_then(|s| s.rsplit(['/', '\\']).next().map(str::to_string))
+        .unwrap_or_else(|| "sh".into());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    format!("ENV: shell={shell} · os={} · cwd={cwd}", std::env::consts::OS)
+}
+
 pub fn build_translate_messages(
     reasoning_cap: &str,
     examples_block: &str,
@@ -729,9 +789,10 @@ pub fn build_translate_messages(
         .trim_end()
         .replace("{reasoning_cap}", reasoning_cap)
         .replace("{examples_block}", examples_block);
+    let user = format!("{}\nSCREEN:\n{screen}\n\nREQUEST: {request}", env_context());
     vec![
         serde_json::json!({ "role": "system", "content": system }),
-        serde_json::json!({ "role": "user", "content": format!("SCREEN:\n{screen}\n\nREQUEST: {request}") }),
+        serde_json::json!({ "role": "user", "content": user }),
     ]
 }
 

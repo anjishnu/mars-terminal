@@ -109,3 +109,12 @@ case ":$PATH:" in
   *) say "add this to your shell rc so future shells find mars:
     export PATH=\"\$HOME/.cargo/bin:\$PATH\"" ;;
 esac
+
+# Agent setup: the editor works out of the box; the AI features need a free key.
+echo
+if mars setup 2>/dev/null | grep -q "✓ a key is configured"; then
+  say "agent features: a key is already configured — you're all set."
+else
+  say "agent features (Ask, English→shell, briefings) need a free API key."
+  echo "    Get one in ~30s and set it up:  mars setup"
+fi

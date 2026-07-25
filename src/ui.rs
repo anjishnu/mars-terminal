@@ -511,27 +511,13 @@ fn render_editor_pane(
     let numbers = app.tuning.line_numbers;
     // Passive matched-bracket pair (row, col) for both ends, computed once.
     let bracket = if focused { app.bracket_pair() } else { None };
-    // Syntax highlighting: highlight the whole buffer once (multi-line state carries
-    // across lines) → a per-char style for every source line. `None` ⇒ plain (feature
-    // off, disabled, unknown language, or a very large file — capped to bound the
-    // per-frame cost until a caching pass lands).
-    let syntax_styles: Option<Vec<Vec<Style>>> = if app.tuning.syntax_highlight == 1 && line_count <= 5000 {
-        buf.path
-            .as_ref()
-            .and_then(|p| p.extension().and_then(|e| e.to_str()))
-            .and_then(|ext| crate::syntax::highlight(&buf.rope.to_string(), ext, &app.tuning.palette))
-            .map(|lines| {
-                lines
-                    .into_iter()
-                    .map(|runs| {
-                        let mut per_char: Vec<Style> = Vec::new();
-                        for (st, text) in runs {
-                            for _ in text.chars() { per_char.push(st); }
-                        }
-                        per_char
-                    })
-                    .collect()
-            })
+    // Syntax highlighting reads a per-buffer cache populated off-thread by the
+    // background worker (`App::request_highlight`). Never computes here — the render
+    // path stays O(visible cells). The cache may be stale (a keystroke ahead) or
+    // partial (still streaming); the per-cell lookup below clamps, so missing lines
+    // and characters simply render plain until the fresh pass tiles in.
+    let syntax_styles: Option<&Vec<Vec<Style>>> = if app.syntax_on {
+        app.syntax_cache.get(&buf_id).map(|c| &c.lines)
     } else { None };
     for row_off in 0..vp_h {
         let row = pane.scroll_row + row_off;
@@ -606,9 +592,14 @@ fn render_editor_pane(
             // the bg layers by kind — selection/search win on background but keep the
             // syntax colour; a matched bracket takes the accent. Runs coalesce by
             // equal resolved style, so a plain line is still one span.
-            let syn: Option<&Vec<Style>> = syntax_styles.as_ref().and_then(|ls| ls.get(row));
+            let syn: Option<&Vec<Style>> = syntax_styles.and_then(|ls| ls.get(row));
             let cell_style = |i: usize| -> Style {
-                let base = syn.and_then(|cs| cs.get(i).copied()).unwrap_or_default();
+                // A character typed past the cached line length (Tab, mid-line insert)
+                // holds its line's trailing color rather than flashing white — the
+                // fresh highlight recolors it a moment later.
+                let base = syn
+                    .and_then(|cs| cs.get(i).copied().or_else(|| cs.last().copied()))
+                    .unwrap_or_default();
                 match hl[i] {
                     1 => base.bg(app.tuning.palette.selection_bg),
                     2 => base.bg(app.tuning.palette.search_bg),

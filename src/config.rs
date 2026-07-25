@@ -204,6 +204,7 @@ fn default_edit_pairs() -> Vec<(&'static str, Action)> {
             // C-x C-f / C-x p / C-x b are muscle-memory aliases for the one
             // find-file surface Mars actually has: the file tree.
             ("C-x C-f", Action::ToggleFileTree),
+            ("C-x C-h", Action::ToggleSyntaxHighlight), // highlight — toggle code coloring
             ("C-x p",   Action::ToggleFileTree),
             ("C-x d",   Action::ToggleFileTree),
             ("C-x b",   Action::ToggleFileTree),

@@ -20,7 +20,7 @@ categories = ["command-line-utilities", "text-editors"]
 # Leading "/" anchors to the package root (gitignore glob semantics) so a bare
 # "README.md" doesn't also sweep in design_ideas/README.md. install.sh is REQUIRED:
 # broker.rs embeds it via include_str!, so the crate won't compile without it.
-include = ["src/**/*.rs", "src/prompts/*.md", "src/**/*.json", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md", "/install.sh"]
+include = ["src/**/*.rs", "src/prompts/*.md", "src/**/*.json", "src/syntaxes/*.sublime-syntax", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md", "/install.sh"]
 
 [[bin]]
 name = "mars"

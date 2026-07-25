@@ -98,6 +98,7 @@ SESSIONS  (work survives closed windows and disconnects)
   C-x g opens the full Away Digest (timeline + durations).
 
 AGENT  (BETA — an assistant, not an authority; review what it proposes)
+  mars setup                     how to get a free API key and turn on the agent
   mars ask \"<question>\"          one-shot answer from the LLM agent
   Keys (paid-first): ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY,
                      GEMINI_API_KEY, or MARS_LLM_KEY + MARS_LLM_URL (any
@@ -277,6 +278,18 @@ fn main() -> Result<()> {
             match std::fs::read_to_string(&p) {
                 Ok(s) => print!("\n{s}"),
                 Err(_) => println!("\n(no config file yet — create it to set env overrides or a theme)\nexample: {{ \"theme\": \"eclipse\", \"env\": {{ \"MARS_LLM_DEBUG\": \"1\" }} }}"),
+            }
+            return Ok(());
+        }
+        // Setup instructions: how to get and configure a free LLM API key.
+        Some("setup") | Some("keys") => {
+            println!("{}", agent::SETUP_HELP);
+            let cfg = agent::AgentConfig::from_env();
+            println!();
+            if cfg.is_configured() {
+                println!("Status: ✓ a key is configured (provider: {}).", cfg.provider);
+            } else {
+                println!("Status: ✗ no key detected yet — agent features are off until you add one.");
             }
             return Ok(());
         }
@@ -470,6 +483,11 @@ fn main() -> Result<()> {
     if !had_file {
         app.open_terminal(); // no file → open a shell, not a scratch buffer
     }
+    // First-run nudge: unconfigured → a single dismissible notice pointing at setup.
+    // The editor/multiplexer work regardless; this never blocks.
+    if !agent::AgentConfig::from_env().is_configured() {
+        app.notice_no_key();
+    }
     let result = app.run(&mut terminal, &rx);
 
     disable_raw_mode()?;
@@ -497,8 +515,8 @@ fn translate_cli(request: String) -> Result<()> {
     }
     let cfg = agent::AgentConfig::from_env();
     if !cfg.is_configured() {
-        anyhow::bail!("no API key: export ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, \
-                       GEMINI_API_KEY, or MARS_LLM_KEY (+ MARS_LLM_URL for a custom endpoint)");
+        eprintln!("{}\n", agent::SETUP_HELP);
+        anyhow::bail!("no API key configured");
     }
     let (command, _call_id) = agent::translate_once(&cfg, &request, "")?;
     println!("{command}");
@@ -511,8 +529,8 @@ fn ask_cli(question: String) -> Result<()> {
     }
     let cfg = agent::AgentConfig::from_env();
     if !cfg.is_configured() {
-        anyhow::bail!("no API key: export ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, \
-                       GEMINI_API_KEY, or MARS_LLM_KEY (+ MARS_LLM_URL for a custom endpoint)");
+        eprintln!("{}\n", agent::SETUP_HELP);
+        anyhow::bail!("no API key configured");
     }
     println!("provider: {}   model: {}", cfg.provider, cfg.model);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1031,7 +1049,7 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] ask agent (key set) ........ PASS");
     } else {
         let ans = app.agent_answer.clone().unwrap_or_default();
-        assert!(ans.contains("API key"), "expected no-key notice, got: {ans:?}");
+        assert!(ans.contains("mars setup"), "expected no-key setup nudge, got: {ans:?}");
         println!("[selfcheck] ask agent (no key) ......... PASS");
     }
     app.handle_key(k(KeyCode::Esc))?;
@@ -1731,7 +1749,7 @@ fn selfcheck() -> Result<()> {
     );
     // …and it submitted (no key in this env → the no-key notice proves the attempt).
     assert!(
-        app.agent_answer.as_deref().unwrap_or("").contains("API key"),
+        app.agent_answer.as_deref().unwrap_or("").contains("mars setup"),
         "ExplainThis did not auto-submit"
     );
     println!("[selfcheck] explain-this / failure .... PASS");
@@ -2860,14 +2878,14 @@ fn selfcheck() -> Result<()> {
             ("translate_reasoning_cap", prompts::TRANSLATE_REASONING_CAP, vec![]),
             ("translate_examples", prompts::TRANSLATE_EXAMPLES, vec!["{examples}"]),
             ("watch_system", prompts::WATCH_SYSTEM, vec!["{hint}"]),
-            ("watch_hint_exit", prompts::WATCH_HINT_EXIT, vec![]),
-            ("watch_hint_quiet", prompts::WATCH_HINT_QUIET, vec![]),
+            ("watch_hint_exit", prompts::WATCH_HINT_EXIT, vec!["{code}"]),
+            ("watch_hint_quiet", prompts::WATCH_HINT_QUIET, vec!["{secs}"]),
             ("mission_system", prompts::MISSION_SYSTEM, vec![]),
             ("auto_name_system", prompts::AUTO_NAME_SYSTEM, vec![]),
             ("name_session_system", prompts::NAME_SESSION_SYSTEM, vec![]),
             #[cfg(feature = "memory")]
             ("docs_context_preamble", prompts::DOCS_CONTEXT_PREAMBLE, vec!["{body}"]),
-            ("cursor_insert", prompts::CURSOR_INSERT, vec!["{file}", "{line}"]),
+            ("cursor_insert", prompts::CURSOR_INSERT, vec!["{file}", "{line}", "{lang}"]),
             ("explain_this", prompts::EXPLAIN_THIS, vec![]),
             ("explain_failure", prompts::EXPLAIN_FAILURE, vec![]),
             ("persona_preamble", prompts::PERSONA_PREAMBLE, vec![]),
@@ -2922,12 +2940,21 @@ fn selfcheck() -> Result<()> {
         assert!(msgs[1]["content"].as_str().unwrap().contains("talk like a pirate"),
             "persona edit not hot-read");
         // Watch (VOICE) carries it, before its user payload.
-        let w = agent::build_watch_messages(app::WatchReason::Quiet, "the tail");
+        let w = agent::build_watch_messages(app::WatchReason::Quiet, "the tail", None, 0);
         assert!(w.iter().any(|m| m["content"].as_str().unwrap_or("").contains("pirate")),
             "watch lost the voice");
         assert_eq!(w.last().unwrap()["role"], "user", "watch payload must come last");
+        // Early-harvest: the exit code and quiet duration reach the verdict prompt.
+        let we = agent::build_watch_messages(app::WatchReason::Exit, "boom", Some(127), 0);
+        let we_sys = we[0]["content"].as_str().unwrap();
+        assert!(we_sys.contains("127") && we_sys.contains("non-zero"), "watch verdict lost the exit code");
+        let wq = agent::build_watch_messages(app::WatchReason::Quiet, "...", None, 20);
+        assert!(wq[0]["content"].as_str().unwrap().contains("20s"), "quiet verdict lost the silence duration");
         // FORMAT tasks: machine-parsed output — persona must never appear.
         let t = agent::build_translate_messages("", "", "list files", "scr");
+        let t_user = t[1]["content"].as_str().unwrap();
+        assert!(t_user.contains("ENV: shell=") && t_user.contains("os="),
+            "translator lost the ENV context line");
         let n = agent::format_task_messages(prompts::AUTO_NAME_SYSTEM, "scr");
         let m = agent::format_task_messages(prompts::MISSION_SYSTEM, "snapshots");
         for (name, ms) in [("translate", &t), ("naming", &n), ("mission", &m)] {
@@ -4243,29 +4270,174 @@ fn selfcheck() -> Result<()> {
                 lines.iter().flatten().map(|(st, _)| st.fg).collect();
             assert!(colors.len() >= 3, "expected several syntax colors, got {}", colors.len());
             assert!(colors.contains(&Some(pal.accent)), "a keyword should take the theme accent");
+
+            // TypeScript is bundled (not in syntect's defaults) — `.ts` must color,
+            // with `interface`/type keywords taking the accent.
+            let ts = syntax::highlight(
+                "interface User { id: number }\nconst greet = (): string => 42;\n", "ts", &pal,
+            ).expect("typescript should highlight (bundled grammar)");
+            let ts_colors: std::collections::HashSet<Option<Color>> =
+                ts.iter().flatten().map(|(st, _)| st.fg).collect();
+            assert!(ts_colors.len() >= 3, "expected several TS colors, got {}", ts_colors.len());
+            assert!(ts_colors.contains(&Some(pal.accent)), "a TS keyword should take the theme accent");
         }
         #[cfg(not(feature = "syntax"))]
         assert!(hl.is_none(), "the syntax stub must return None (plain render)");
 
-        // Render check: a real .rs buffer paints the keyword accent into the editor
-        // pane (the per-char syntax fg reaches the frame).
+        // Worker seam: the real background worker streams chunks back over the channel,
+        // colors keywords with the theme accent, and ends with a `complete` chunk.
+        // Deterministic — recv() blocks on the thread, no polling.
+        #[cfg(feature = "syntax")]
+        {
+            use ratatui::style::Color;
+            let code = "fn main() {\n    let n = 42;\n}\n";
+            let job = app::SyntaxJob {
+                buf_id: 999, rev: 7, palette_id: 3,
+                code: code.into(), ext: "rs".into(),
+                palette: tuning::Palette::mission_control(), viewport_bottom: 2,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            syntax::highlight_stream(job, tx);
+            let (mut saw_accent, mut saw_complete, mut chunks) = (false, false, 0u32);
+            while let Ok(app::SyntaxEvent::Chunk { styles, complete, rev, buf_id, .. }) =
+                rx.recv_timeout(std::time::Duration::from_secs(5))
+            {
+                assert_eq!((rev, buf_id), (7, 999), "worker echoed the wrong job identity");
+                if styles.iter().flatten().any(|s| s.fg == Some(Color::Rgb(217, 119, 87))) {
+                    saw_accent = true;
+                }
+                chunks += 1;
+                if complete { saw_complete = true; break; }
+            }
+            assert!(saw_accent, "worker did not color keywords with the theme accent");
+            assert!(saw_complete, "worker stream never completed");
+            assert!(chunks >= 1, "worker produced no chunks");
+        }
+
+        // Render check: the async pipeline paints the keyword accent into the editor.
+        // Drive it deterministically — feed a chunk through the real channel and let
+        // tick() drain it into the cache (no worker-thread timing), then render. When
+        // syntax is toggled OFF, the same buffer must render with NO accent (plain).
         #[cfg(feature = "syntax")]
         {
             use ratatui::style::Color;
             let dir = std::env::temp_dir().join(format!("mars-syn-{}", std::process::id()));
             std::fs::create_dir_all(&dir)?;
             let f = dir.join("probe.rs");
-            std::fs::write(&f, "fn main() {\n    let n = 42;\n}\n")?;
+            let code = "fn main() {\n    let n = 42;\n}\n";
+            std::fs::write(&f, code)?;
             let mut app = App::new(None)?;
             app.open_file_in_new_tab(f.to_str().unwrap());
+            app.show_splash = false; // the start banner overlays the editor until a keypress
             app.tuning.palette = tuning::Palette::mission_control(); // decouple from the user's theme
+            // On by default now; the cold cache still renders plain until the worker delivers.
+            assert!(app.syntax_on, "syntax highlighting should be on by default");
             let mut term = Terminal::new(TestBackend::new(60, 10))?;
+            // The accent hue also paints chrome (focus border, cursor-line marker), so
+            // count accent cells and require syntax to add MORE (the colored keywords).
+            let accent_cells = |t: &Terminal<TestBackend>| {
+                t.backend().buffer().content().iter().filter(|c| c.fg == Color::Rgb(217, 119, 87)).count()
+            };
+            // Baseline: with an empty cache the buffer paints plain (only chrome accent).
+            app.syntax_on = false;
             term.draw(|f| ui::render(f, &mut app))?;
-            let has_accent = term.backend().buffer().content().iter().any(|c| c.fg == Color::Rgb(217, 119, 87));
-            assert!(has_accent, "editor pane did not render syntax colors (keyword accent)");
+            let plain = accent_cells(&term);
+
+            // Build the per-char styles the worker would produce, feed them through the
+            // channel, and let tick() apply them to the cache.
+            let per_char: Vec<Vec<ratatui::style::Style>> = syntax::highlight(code, "rs", &app.tuning.palette)
+                .unwrap()
+                .iter()
+                .map(|runs| runs.iter().flat_map(|(st, txt)| std::iter::repeat(*st).take(txt.chars().count())).collect())
+                .collect();
+            let buf_id = app.focused_buf_id();
+            app.syntax_on = true;
+            // The drain applies only the pass we're waiting for — declare it, then feed
+            // the chunk through the real channel and let tick() merge it into the cache.
+            app.syntax_want.insert(buf_id, (1, 1));
+            app.syntax_tx.send(app::SyntaxEvent::Chunk {
+                buf_id, rev: 1, palette_id: 1, start_line: 0, styles: per_char, complete: true,
+            }).unwrap();
+            app.tick(); // drains syntax_rx → apply_syntax_chunk → cache
+            assert!(app.syntax_cache.contains_key(&buf_id), "chunk did not reach the cache");
+            term.draw(|f| ui::render(f, &mut app))?;
+            assert!(accent_cells(&term) > plain, "syntax colors (keyword accent) did not reach the editor pane");
             let _ = std::fs::remove_dir_all(&dir);
         }
-        println!("[selfcheck] syntax highlight (engine) .. PASS");
+        println!("[selfcheck] syntax highlight (engine + cache) .. PASS");
+    }
+
+    // 40h. No-flash cache update: a fresh pass OVERWRITES in place (never clears), so
+    //      lines not yet re-streamed keep their old colors instead of flashing white;
+    //      a straggler chunk from a superseded pass is dropped.
+    #[cfg(feature = "syntax")]
+    {
+        use ratatui::style::{Color, Style};
+        let mut app = App::new(None)?;
+        let bid = 4242usize;
+        let x = Style::default().fg(Color::Rgb(1, 1, 1)); // pass A color
+        let y = Style::default().fg(Color::Rgb(2, 2, 2)); // pass B color
+        let fg = |app: &App, line: usize| app.syntax_cache[&bid].lines[line][0].fg;
+        // Pass A: three lines, complete.
+        app.syntax_want.insert(bid, (1, 9));
+        app.syntax_tx.send(app::SyntaxEvent::Chunk {
+            buf_id: bid, rev: 1, palette_id: 9, start_line: 0,
+            styles: vec![vec![x], vec![x], vec![x]], complete: true,
+        }).unwrap();
+        app.tick();
+        assert_eq!(app.syntax_cache[&bid].lines.len(), 3);
+        // An edit supersedes → pass B. Its PARTIAL first chunk recolors only line 0.
+        app.syntax_want.insert(bid, (2, 9));
+        app.syntax_tx.send(app::SyntaxEvent::Chunk {
+            buf_id: bid, rev: 2, palette_id: 9, start_line: 0, styles: vec![vec![y]], complete: false,
+        }).unwrap();
+        app.tick();
+        assert_eq!(fg(&app, 0), Some(Color::Rgb(2, 2, 2)), "new pass did not recolor line 0");
+        assert_eq!(fg(&app, 1), Some(Color::Rgb(1, 1, 1)), "re-highlight cleared un-streamed lines (would flash white)");
+        assert_eq!(app.syntax_cache[&bid].lines.len(), 3, "cache lost coverage mid-pass");
+        // A late straggler from the superseded pass A must be ignored.
+        app.syntax_tx.send(app::SyntaxEvent::Chunk {
+            buf_id: bid, rev: 1, palette_id: 9, start_line: 1, styles: vec![vec![y]], complete: true,
+        }).unwrap();
+        app.tick();
+        assert_eq!(fg(&app, 1), Some(Color::Rgb(1, 1, 1)), "a stale straggler clobbered the current pass");
+        // Pass B completes: the rest recolors and the cache advances to rev 2.
+        app.syntax_tx.send(app::SyntaxEvent::Chunk {
+            buf_id: bid, rev: 2, palette_id: 9, start_line: 1, styles: vec![vec![y], vec![y]], complete: true,
+        }).unwrap();
+        app.tick();
+        assert!(app.syntax_cache[&bid].lines.iter().all(|l| l[0].fg == Some(Color::Rgb(2, 2, 2))), "completed pass not fully applied");
+        assert_eq!(app.syntax_cache[&bid].rev, 2);
+        println!("[selfcheck] syntax cache (no-flash overwrite) .. PASS");
+    }
+
+    // 40i. Cache splicing: Enter splits the cached color-line at the cursor (colors
+    //      travel with their characters, so lines below don't show shifted colors);
+    //      Backspace-join merges them back. Driven through the real key path.
+    {
+        use ratatui::style::{Color, Style};
+        let mut app = App::new(None)?;
+        typ(&mut app, "abcdef")?;
+        let bid = app.focused_buf_id();
+        // A distinct color per character so a mis-split is visible.
+        let styled: Vec<Style> = (0..6).map(|i| Style::default().fg(Color::Rgb(i as u8, 0, 0))).collect();
+        app.syntax_cache.insert(bid, app::SyntaxCache { rev: 1, palette_id: 1, lines: vec![styled] });
+        // Cursor to column 3 (between 'c' and 'd'), then Enter.
+        for _ in 0..3 { app.handle_key(k(KeyCode::Left))?; }
+        app.handle_key(k(KeyCode::Enter))?;
+        let fgs = |app: &App, line: usize| -> Vec<Option<Color>> {
+            app.syntax_cache[&bid].lines[line].iter().map(|s| s.fg).collect()
+        };
+        assert_eq!(app.syntax_cache[&bid].lines.len(), 2, "Enter did not split the cached line");
+        assert_eq!(fgs(&app, 0), vec![Some(Color::Rgb(0,0,0)), Some(Color::Rgb(1,0,0)), Some(Color::Rgb(2,0,0))],
+            "split kept the wrong colors on the first line (colors did not travel with chars)");
+        assert_eq!(fgs(&app, 1), vec![Some(Color::Rgb(3,0,0)), Some(Color::Rgb(4,0,0)), Some(Color::Rgb(5,0,0))],
+            "split kept the wrong colors on the new line");
+        // Backspace at column 0 joins the line back and merges the colors.
+        app.handle_key(k(KeyCode::Backspace))?;
+        assert_eq!(app.syntax_cache[&bid].lines.len(), 1, "Backspace did not join the cached lines");
+        assert_eq!(fgs(&app, 0).len(), 6, "join lost characters' colors");
+        println!("[selfcheck] syntax cache (line splice) .. PASS");
     }
 
     // 41. LLM debug logging: a record round-trips to JSONL with real token totals,
