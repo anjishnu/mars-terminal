@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.6.0
+
+Mars becomes usable with the mouse without ever punishing the keyboard: the bottom
+bar and navigator turn into real, clickable, hover-lit surfaces, and mission control
+gains a host-health readout.
+
+### Added
+- **Clickable, hover-lit chrome.** The bottom-bar hint chips are now real buttons,
+  routed through the same `run_action` funnel as chords — so the confirm gate and
+  frecency apply to a click exactly as to a keystroke. They **lighten on hover** and
+  **recess when pressed**, and every click **flashes the chord it stands for**
+  (`↦ C-x C-s`) — the mouse as an on-ramp to the keyboard, not a replacement. Tabs,
+  command/workspace/tree rows, and dropdown rows all light on hover too.
+- **Navigator preview.** A click in the file navigator now mirrors keyboard
+  navigation: it highlights the row, keeps focus in the tree, and **previews the file
+  into one reusable tab** — exploring a directory swaps that tab instead of piling up
+  a dozen. The first edit **pins** the tab (VS Code's italic-tab rule), so the next
+  click starts a fresh preview. Clicking a **pane** focuses it, and the **wheel scrolls
+  the terminal under the pointer** — the navigator is no longer a keyboard-only trap.
+- **Host-health line in SPACES.** The top of the SPACES panel shows session **uptime**,
+  1-minute **load**, host **memory %** (smoothed over a few minutes), **free disk** on
+  the working dir, and **GPU memory %** on machines with `nvidia-smi`. Any probe the OS
+  can't answer is dropped, so the line self-trims. Probes live in the platform
+  abstraction layer; the GPU poll runs off-thread so it never hitches the UI. Gated by
+  `health_line` (default on) and `health_sample_secs`.
+- **Tab hover shows workspace status** (`build · running`), and a **tooltip** surfaces a
+  clipped tab's full name.
+
+### Changed
+- The redundant idle **control row** at the very bottom is gone — its commands lived on
+  the status bar already, and clicking its empty space silently opened the command bar
+  with no visual cue. The status bar's chips are the real, visible buttons now.
+- The **Terminal** bar carries only what makes sense from a shell — `commands`, `warp`
+  (`C-t`), and `editor` (`C-g`, now a real clickable target) — dropping the low-value
+  `type to shell` reminder and surfacing space-warp.
+
 ## 0.5.2
 
 Syntax highlighting — on by default, and built to never get in the way — plus a
