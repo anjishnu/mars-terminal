@@ -42,3 +42,16 @@ failure smells like encoding rather than logic.
 - Local Cargo.toml version can lag crates.io: 0.3.0 was published out-of-band
   (2026-07-11) while the repo said 0.2.0 — check `crates.io/api/v1/crates/
   mars-terminal` max_version before bumping for publish.
+
+## GOTCHA: a running session server keeps the OLD binary (2026-07-25)
+- Reinstalling (`cargo install --path .`) updates `~/.cargo/bin/mars` on disk, but a live
+  `mars --server <name>` process keeps running the binary it launched with. The SERVER
+  renders (not the client), so `mars attach`/reattach shows the OLD code — a fresh on-disk
+  binary changes nothing until that process restarts. Cost ~an hour chasing a "health line
+  doesn't render" that was really just a stale server.
+- DIAGNOSE: `ps -o lstart= -p $(pgrep -f "mars --server")` vs `stat -f %Sm ~/.cargo/bin/mars`
+  — if the server started before the binary's mtime, it's stale. Note `mars --selfcheck`
+  runs the fresh on-disk binary standalone, so a passing selfcheck ≠ what the live session
+  shows; don't conclude "works" from selfcheck when the user is on an attached session.
+- FIX: `mars kill <name> && mars <name>` — the session's goals/worklog persist to disk and
+  reload. Standalone (no session): just quit and relaunch. See [[sessions-daemon]].

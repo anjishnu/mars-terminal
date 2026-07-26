@@ -2,7 +2,7 @@
 
 Format: - `<topic>.md` — <one-sentence description> [keyword1, keyword2, keyword3]
 
-- `build-verify.md` — how Mars is compiled, selfchecked, and published, plus the build gotchas that cost an hour each [build, cargo, selfcheck, test, verify, fingerprint, publish, install, feature, stub]
+- `build-verify.md` — how Mars is compiled, selfchecked, and published, plus the build gotchas that cost an hour each [build, cargo, selfcheck, test, verify, fingerprint, publish, install, feature, stub, restart, server, stale, reattach]
 - `terminal-io.md` — byte-level terminal behavior: key encodings, PTY/vt100, scrollback, clipboard, and how to test against a real terminal [terminal, key, chord, encoding, crossterm, kitty, vt100, pty, ansi, scrollback, clipboard, pyte]
 - `sessions-daemon.md` — the client/server session split, daemon lifecycle, CLI surface, TTY hygiene [session, daemon, socket, detach, attach, client, server, tty, cli, rename, nested]
 - `ssh-broker.md` — `mars keyd` + `mars ssh`: the key never leaves home, the fleet registry, route and credential invariants [ssh, broker, keyd, remote, fleet, auth, capability, credential, tunnel]
