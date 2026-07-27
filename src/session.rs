@@ -369,10 +369,13 @@ enum SrvEvent {
 /// Push the current structured board (and briefing, when one exists) to every
 /// mobile subscriber, dropping any whose socket has closed. Inert with no
 /// subscribers — the JSON is never built unless a phone is listening.
-fn push_mobile(app: &App, subs: &mut Vec<crate::sys::control::Stream>) {
+fn push_mobile(app: &mut App, subs: &mut Vec<crate::sys::control::Stream>) {
     if subs.is_empty() {
         return;
     }
+    // Sample host health so the phone's ambient stats stay live even while the session
+    // is detached (the render loop that normally samples isn't running headless).
+    app.health.maybe_sample(std::path::Path::new("."), false);
     let board = app.mobile_board_json();
     let briefing = app.mobile_briefing_json();
     subs.retain_mut(|s| {
@@ -587,7 +590,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             Ok(SrvEvent::Subscribe { stream }) => {
                 subscribers.push(stream);
                 // Greet the new subscriber immediately with a full snapshot.
-                push_mobile(&app, &mut subscribers);
+                push_mobile(&mut app, &mut subscribers);
                 last_mobile_push = Some(std::time::Instant::now());
             }
             Ok(SrvEvent::PaneInput { pane, data }) => {
@@ -612,7 +615,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 })
                 .unwrap_or(true);
             if due {
-                push_mobile(&app, &mut subscribers);
+                push_mobile(&mut app, &mut subscribers);
                 // Stream the watched pane's live screen (the phone reading a terminal).
                 if let Some(p) = watched_pane {
                     if let Some(json) = app.pane_screen_json(p) {

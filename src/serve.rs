@@ -351,8 +351,8 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
         }
         // Read one inbound WS message (times out via the socket read timeout).
         match ws.read() {
-            Ok(Message::Text(txt)) => handle_client_msg(&mut writer, &action_tx, &txt),
-            Ok(Message::Binary(b)) => handle_client_msg(&mut writer, &action_tx, &String::from_utf8_lossy(&b)),
+            Ok(Message::Text(txt)) => handle_client_msg(&mut writer, &action_tx, socket, &txt),
+            Ok(Message::Binary(b)) => handle_client_msg(&mut writer, &action_tx, socket, &String::from_utf8_lossy(&b)),
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(WsError::Io(e))
@@ -387,7 +387,7 @@ fn run_agent_ask(question: String) -> String {
 
 /// Handle an inbound Rover message. `ask`/`summarize` are proxied to the host LLM (async,
 /// result pushed back over `tx`); raw keystrokes/paste go to the pane.
-fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, txt: &str) {
+fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket: &std::path::Path, txt: &str) {
     let v: serde_json::Value = match serde_json::from_str(txt) {
         Ok(v) => v,
         Err(_) => return,
@@ -448,6 +448,20 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, txt: &s
         }
         Some("unwatch") => {
             let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None });
+        }
+        // Rename the session from the phone — reflected on the host. Carried on a FRESH
+        // short-lived connection: the daemon closes the stream that sends Rename, so using
+        // our subscribe writer would drop the live board. The daemon does the fs-rename and
+        // the next board snapshot carries the new name back.
+        Some("rename") => {
+            if let Some(name) = v.get("name").and_then(|x| x.as_str()) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    if let Ok(mut conn) = crate::sys::control::connect(socket) {
+                        let _ = session::write_frame(&mut conn, &ClientFrame::Rename { to: name.to_string() });
+                    }
+                }
+            }
         }
         // Structured intents (run/jump…) land here once the daemon has a JSON action
         // sink; until then they're recorded, not silently dropped.

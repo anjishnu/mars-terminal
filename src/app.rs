@@ -909,6 +909,7 @@ impl App {
         serde_json::json!({
             "session": self.session_name.clone().unwrap_or_default(),
             "rows": rows,
+            "health": self.health.line(), // ambient host stats for the phone's console
             "ts": ts,
         })
         .to_string()
