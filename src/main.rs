@@ -5277,9 +5277,17 @@ fn selfcheck() -> Result<()> {
         assert_eq!(app.mode, mode::Mode::Bar, "Ctrl+Space did not open mission control");
         app.tick(); // populate probes (uptime is present regardless)
         term.draw(|f| ui::render(f, &mut app))?;
-        assert!(screen_text(&term).contains("up "),
-            "health line not visible in the SPACES panel with 2 tabs");
-        println!("[selfcheck] health line renders in SPACES ... PASS");
+        // Chunk the flat cell grid into rows to check WHERE the health line lands.
+        let w = term.backend().buffer().area.width as usize;
+        let flat: Vec<char> = screen_text(&term).chars().collect();
+        let rows: Vec<String> = flat.chunks(w).map(|c| c.iter().collect()).collect();
+        let title_row = rows.iter().position(|r| r.contains("SPACES")).expect("SPACES title row");
+        let health_row = rows.iter().position(|r| r.contains("up ")).expect("health line row");
+        assert!(
+            health_row > title_row + 2,
+            "health line should sit at the BOTTOM of the SPACES panel, not the top (SPACES row {title_row}, health row {health_row})"
+        );
+        println!("[selfcheck] health line renders at SPACES bottom ... PASS");
     }
 
     // 44b. Mouse selection in an EDITOR pane — key_design §7 rules "Selection =

@@ -29,6 +29,20 @@ pub struct Health {
     gpu_rx: Receiver<Option<u8>>,
 }
 
+/// Severity of a single health metric — drives its colour (cool unless dangerous).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HealthLevel {
+    Ok,
+    Warn,
+    Danger,
+}
+
+/// One metric, ready to render: its text (`"load 1.40"`) and how alarming it is.
+pub struct HealthMetric {
+    pub text: String,
+    pub level: HealthLevel,
+}
+
 impl Health {
     pub fn new(interval_secs: u64) -> Self {
         let (gpu_tx, gpu_rx) = channel();
@@ -106,6 +120,35 @@ impl Health {
             parts.push(format!("gpu {g}%"));
         }
         parts.join(" · ")
+    }
+
+    /// The same probes as `line()`, but structured with a severity level so the SPACES
+    /// panel can render each metric in a cool hue — warming to amber, then red, only when
+    /// a value is genuinely alarming. Uptime and GPU stay cool: a pinned GPU is the point
+    /// of an ML box, not a warning. Load thresholds scale with the core count.
+    pub fn metrics(&self) -> Vec<HealthMetric> {
+        let cores = std::thread::available_parallelism().map(|n| n.get() as f64).unwrap_or(8.0);
+        let mut v = vec![HealthMetric {
+            text: format!("up {}", fmt_uptime(self.start.elapsed().as_secs())),
+            level: HealthLevel::Ok,
+        }];
+        if let Some(l) = self.load1 {
+            let level = if l > cores * 1.5 { HealthLevel::Danger } else if l > cores { HealthLevel::Warn } else { HealthLevel::Ok };
+            v.push(HealthMetric { text: format!("load {l:.2}"), level });
+        }
+        if let Some(m) = self.mem_ema {
+            let m = m.round() as u8;
+            let level = if m >= 92 { HealthLevel::Danger } else if m >= 80 { HealthLevel::Warn } else { HealthLevel::Ok };
+            v.push(HealthMetric { text: format!("mem {m}%"), level });
+        }
+        if let Some(d) = self.disk_free_pct {
+            let level = if d < 7 { HealthLevel::Danger } else if d < 15 { HealthLevel::Warn } else { HealthLevel::Ok };
+            v.push(HealthMetric { text: format!("disk {d}% free"), level });
+        }
+        if let Some(g) = self.gpu_pct {
+            v.push(HealthMetric { text: format!("gpu {g}%"), level: HealthLevel::Ok });
+        }
+        v
     }
 }
 

@@ -1988,25 +1988,15 @@ fn render_workspaces_panel(frame: &mut Frame, app: &App, rect: Rect) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    // Optional host-health line pinned to the top of the panel; the board flows below.
-    // Rendered in the bright accent (text_faint was too dim to notice) and shown even
-    // in a short panel.
+    // The host-health line is pinned to the BOTTOM of the panel (rendered after the body,
+    // below the sky); reserve a row for it here so the board flows above.
     let show_health = app.tuning.health_line == 1 && inner.height >= 2;
-    if show_health {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(" {}", app.health.line()),
-                Style::default().fg(app.tuning.palette.accent_bright).add_modifier(Modifier::BOLD),
-            ))),
-            Rect { x: inner.x, y: inner.y, width: inner.width, height: 1 },
-        );
-    }
-    let head = if show_health { 1u16 } else { 0 };
+    let foot = if show_health { 1u16 } else { 0 };
     let body = Rect {
         x: inner.x,
-        y: inner.y + head,
+        y: inner.y,
         width: inner.width,
-        height: inner.height.saturating_sub(head),
+        height: inner.height.saturating_sub(foot),
     };
 
     let rows = app.bar_workspace_rows();
@@ -2028,6 +2018,52 @@ fn render_workspaces_panel(frame: &mut Frame, app: &App, rect: Rect) {
             Rect { x: body.x, y: body.y + used as u16, width: body.width, height: (ih - used) as u16 },
         );
     }
+
+    // Host-health line, pinned to the very bottom, colour-coded and justified.
+    if show_health {
+        render_health_line(frame, app, Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 });
+    }
+}
+
+/// The SPACES host-health line: each metric in a cool hue (teal), warming to amber then
+/// red only when it's alarming, spread across the width in a justified layout.
+fn render_health_line(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::health::HealthLevel;
+    let metrics = app.health.metrics();
+    if metrics.is_empty() || area.width < 4 {
+        return;
+    }
+    let p = &app.tuning.palette;
+    let colour = |lvl: HealthLevel| match lvl {
+        HealthLevel::Ok => p.info,       // cool teal
+        HealthLevel::Warn => p.warning,  // amber
+        HealthLevel::Danger => p.danger, // red
+    };
+    let pad = 1usize;
+    let n = metrics.len();
+    let total: usize = metrics.iter().map(|m| m.text.chars().count()).sum();
+    let avail = (area.width as usize).saturating_sub(pad * 2);
+    let gap_budget = avail.saturating_sub(total);
+    // Distribute the slack evenly between metrics (justify); never less than one space.
+    let gap = |i: usize| -> usize {
+        if n <= 1 {
+            0
+        } else {
+            (gap_budget / (n - 1) + usize::from(i < gap_budget % (n - 1))).max(1)
+        }
+    };
+    let mut spans = vec![Span::raw(" ".repeat(pad))];
+    for (i, m) in metrics.iter().enumerate() {
+        let mut style = Style::default().fg(colour(m.level));
+        if m.level == HealthLevel::Danger {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        spans.push(Span::styled(m.text.clone(), style));
+        if i < n - 1 {
+            spans.push(Span::raw(" ".repeat(gap(i))));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The Commands launcher — the classic single-column dropdown, in its own bordered
