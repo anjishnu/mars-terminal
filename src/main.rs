@@ -2249,6 +2249,7 @@ fn selfcheck() -> Result<()> {
                             Ok(session::ServerFrame::BrokerRoute { .. }) => {}
                             Ok(session::ServerFrame::Board { .. }) => {}
                             Ok(session::ServerFrame::Briefing { .. }) => {}
+                            Ok(session::ServerFrame::PaneScreen { .. }) => {}
                             Err(_) => {}
                         },
                         Err(_) => {} // timeout tick — keep waiting until deadline

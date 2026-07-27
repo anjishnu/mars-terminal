@@ -91,6 +91,8 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
         "http://{ip}:{port}/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
     );
 
+    print_wordmark();
+    println!();
     print_qr(&url);
     println!();
     println!("  \x1b[38;5;208mRover\x1b[0m — scan to pair  ·  session \x1b[1m{session}\x1b[0m");
@@ -99,8 +101,9 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Render a QR as dark-on-white cells (two spaces per module, ANSI bg) so it scans
-/// regardless of terminal theme, with a white quiet border.
+/// Render a compact QR with half-block characters — one glyph encodes TWO vertical
+/// modules (▀ ▄ █ space), so it's ~half the height of a full-cell QR while still
+/// scanning on any terminal theme (black ink on a white quiet zone).
 fn print_qr(text: &str) {
     let qr = match qrcodegen::QrCode::encode_text(text, qrcodegen::QrCodeEcc::Medium) {
         Ok(q) => q,
@@ -110,39 +113,41 @@ fn print_qr(text: &str) {
         }
     };
     let n = qr.size();
-    let quiet = 2;
-    let white = "\x1b[47m  \x1b[0m";
-    let black = "\x1b[40m  \x1b[0m";
-    let border_row = |out: &mut String| {
-        for _ in 0..(n + quiet * 2) {
-            out.push_str(white);
-        }
-    };
+    let q = 2i32; // quiet zone; get_module() returns false (white) out of bounds
+    let dark = |x: i32, y: i32| qr.get_module(x, y);
     let mut s = String::new();
-    for _ in 0..quiet {
-        s.push_str("  ");
-        border_row(&mut s);
-        s.push('\n');
-    }
-    for y in 0..n {
-        s.push_str("  ");
-        for _ in 0..quiet {
-            s.push_str(white);
+    let mut y = -q;
+    while y < n + q {
+        s.push_str("  \x1b[30;47m"); // indent + black-on-white
+        for x in -q..n + q {
+            let top = dark(x, y);
+            let bot = dark(x, y + 1);
+            s.push(match (top, bot) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
         }
-        for x in 0..n {
-            s.push_str(if qr.get_module(x, y) { black } else { white });
-        }
-        for _ in 0..quiet {
-            s.push_str(white);
-        }
-        s.push('\n');
-    }
-    for _ in 0..quiet {
-        s.push_str("  ");
-        border_row(&mut s);
-        s.push('\n');
+        s.push_str("\x1b[0m\n");
+        y += 2;
     }
     print!("{s}");
+}
+
+/// The ROVER wordmark with a small left-justified `mars` above it.
+fn print_wordmark() {
+    println!("  \x1b[38;5;244mmars\x1b[0m");
+    for line in [
+        "██████╗  ██████╗ ██╗   ██╗███████╗██████╗",
+        "██╔══██╗██╔═══██╗██║   ██║██╔════╝██╔══██╗",
+        "██████╔╝██║   ██║██║   ██║█████╗  ██████╔╝",
+        "██╔══██╗██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗",
+        "██║  ██║╚██████╔╝ ╚████╔╝ ███████╗██║  ██║",
+        "╚═╝  ╚═╝ ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝",
+    ] {
+        println!("  \x1b[38;5;208m{line}\x1b[0m");
+    }
 }
 
 // ── mars serve ───────────────────────────────────────────────────────────────
@@ -167,6 +172,8 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
         "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
     );
 
+    print_wordmark();
+    println!();
     print_qr(&app_url);
     println!();
     println!("  \x1b[38;5;208mRover\x1b[0m — scan to pair · session \x1b[1m{session}\x1b[0m");
@@ -310,6 +317,14 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                             break;
                         }
                     }
+                    // Live pane screen (the phone watching a terminal). `{pane,text}` →
+                    // `{t:"screen",pane,text}`.
+                    ServerFrame::PaneScreen { json } => {
+                        let wrapped = format!("{{\"t\":\"screen\",{}", &json[1..]);
+                        if tx.send(wrapped).is_err() {
+                            break;
+                        }
+                    }
                     // Raw ANSI (the peek rung) — present only on an attach, not a Subscribe.
                     ServerFrame::Output { b64 } => {
                         if tx
@@ -414,11 +429,28 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, txt: &s
         }
         Some("key") | Some("paste") => {
             if let Some(data) = v.get("data").or_else(|| v.get("text")).and_then(|d| d.as_str()) {
-                let _ = session::write_frame(writer, &ClientFrame::Paste(data.to_string()));
+                // Pane-targeted when the phone names a pane (typing into a specific
+                // terminal, e.g. sending a command to Claude Code); else the focused pane.
+                match v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()) {
+                    Some(pane) => {
+                        let _ = session::write_frame(writer, &ClientFrame::PaneInput { pane, data: data.to_string() });
+                    }
+                    None => {
+                        let _ = session::write_frame(writer, &ClientFrame::Paste(data.to_string()));
+                    }
+                }
             }
         }
-        // Structured intents (answer/run/jump/summarize…) land here once the daemon has
-        // a JSON action sink; until then they're recorded, not silently dropped.
+        // Watch/stop-watching a pane's live screen (the phone reading a terminal).
+        Some("watch") => {
+            let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
+            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane });
+        }
+        Some("unwatch") => {
+            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None });
+        }
+        // Structured intents (run/jump…) land here once the daemon has a JSON action
+        // sink; until then they're recorded, not silently dropped.
         Some(other) => crate::session::debug_log(&format!("[rover] intent not yet wired: {other}")),
         None => {}
     }

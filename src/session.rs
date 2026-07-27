@@ -71,6 +71,9 @@ pub enum ClientFrame {
     /// Pane-targeted raw input from a Rover subscriber (answering a `[y/N]`) — written
     /// straight to that pane's terminal, WITHOUT taking over the session.
     PaneInput { pane: usize, data: String },
+    /// Start (`Some`) or stop (`None`) streaming a pane's screen to this subscriber —
+    /// the phone watching a terminal (e.g. Claude Code) live.
+    WatchPane { pane: Option<usize> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,6 +97,8 @@ pub enum ServerFrame {
     /// Pre-serialized reattach-briefing JSON (the seam's `Briefing`), pushed to
     /// subscribers only while a shift report exists.
     Briefing { json: String },
+    /// Pre-serialized `{pane, text}` — the live screen of a watched pane.
+    PaneScreen { json: String },
 }
 
 pub fn write_frame<T: Serialize>(w: &mut impl Write, frame: &T) -> io::Result<()> {
@@ -357,6 +362,8 @@ enum SrvEvent {
     Subscribe { stream: crate::sys::control::Stream },
     /// A subscriber wrote raw input to a pane (the phone answering a prompt).
     PaneInput { pane: usize, data: String },
+    /// A subscriber wants to watch (or stop watching) a pane's screen.
+    WatchPane { pane: Option<usize> },
 }
 
 /// Push the current structured board (and briefing, when one exists) to every
@@ -478,6 +485,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // pushed here on a throttled cadence and dead streams are pruned on write.
     let mut subscribers: Vec<crate::sys::control::Stream> = Vec::new();
     let mut last_mobile_push: Option<std::time::Instant> = None;
+    let mut watched_pane: Option<usize> = None;
 
     loop {
         app.tick();
@@ -586,6 +594,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // The phone answered a prompt — write it to that pane's terminal.
                 app.write_to_pane(pane, &data);
             }
+            Ok(SrvEvent::WatchPane { pane }) => {
+                watched_pane = pane;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -602,6 +613,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 .unwrap_or(true);
             if due {
                 push_mobile(&app, &mut subscribers);
+                // Stream the watched pane's live screen (the phone reading a terminal).
+                if let Some(p) = watched_pane {
+                    if let Some(json) = app.pane_screen_json(p) {
+                        subscribers.retain_mut(|s| {
+                            write_frame(s, &ServerFrame::PaneScreen { json: json.clone() }).is_ok()
+                        });
+                    }
+                }
                 last_mobile_push = Some(std::time::Instant::now());
             }
         }
@@ -732,14 +751,20 @@ fn client_connection(
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                // The one write a non-takeover subscriber may perform: pane-targeted
-                // input (the phone answering a prompt). Everything else is ignored.
-                if let Ok(ClientFrame::PaneInput { pane, data }) =
-                    serde_json::from_str::<ClientFrame>(line.trim())
-                {
-                    if tx.send(SrvEvent::PaneInput { pane, data }).is_err() {
-                        break;
+                // What a non-takeover subscriber may send: pane-targeted input (answering
+                // a prompt) and watch/unwatch a pane's screen. Everything else is ignored.
+                match serde_json::from_str::<ClientFrame>(line.trim()) {
+                    Ok(ClientFrame::PaneInput { pane, data }) => {
+                        if tx.send(SrvEvent::PaneInput { pane, data }).is_err() {
+                            break;
+                        }
                     }
+                    Ok(ClientFrame::WatchPane { pane }) => {
+                        if tx.send(SrvEvent::WatchPane { pane }).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
             }
             return;
@@ -917,6 +942,7 @@ pub fn client_main(name: &str) -> Result<()> {
                         Ok(ServerFrame::BrokerRoute { .. }) => {} // not expected mid-attach
                         Ok(ServerFrame::Board { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::Briefing { .. }) => {} // subscriber-only, never on an attach
+                        Ok(ServerFrame::PaneScreen { .. }) => {} // subscriber-only, never on an attach
                         Err(_) => {}
                     },
                 }

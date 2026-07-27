@@ -895,6 +895,7 @@ impl App {
                     "verdict": s.verdict.label(), // failed|blocked|done|running|idle
                     "why": description,
                     "ageSecs": s.age_secs,
+                    "paneId": s.pane_id.to_string(), // so the phone can type into this pane
                 });
                 if blocked {
                     row["blocked"] = serde_json::json!({
@@ -1593,6 +1594,29 @@ impl App {
         if let Some(t) = self.terms.get_mut(&tid) {
             t.send_bytes(data.as_bytes());
         }
+    }
+
+    /// The current screen of a pane's terminal as JSON (`{pane, text}`) — streamed to a
+    /// Rover subscriber watching that pane (the phone reading, e.g., Claude Code). Pure;
+    /// only built when a phone is actively watching.
+    pub fn pane_screen_json(&self, pane_id: crate::pane::PaneId) -> Option<String> {
+        let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
+            Some(PaneContent::Terminal(t)) => *t,
+            _ => return None,
+        };
+        let t = self.terms.get(&tid)?;
+        let screen = t.screen();
+        let (_, cols) = screen.size();
+        // Per-row ANSI (SGR colours + attributes) so the phone renders colour, not just
+        // white text — rows_formatted re-emits each row's styling self-contained.
+        let mut text = String::new();
+        for (i, row) in screen.rows_formatted(0, cols).enumerate() {
+            if i > 0 {
+                text.push('\n');
+            }
+            text.push_str(&String::from_utf8_lossy(&row));
+        }
+        Some(serde_json::json!({ "pane": pane_id.to_string(), "text": text }).to_string())
     }
 
     pub fn paste_text(&mut self, s: &str) {
