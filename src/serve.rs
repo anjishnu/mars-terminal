@@ -369,22 +369,42 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
 /// The LLM proxy: run the agent on the HOST, with the key that's already in this
 /// process's environment (or reached via `mars keyd`). The phone sends only the question;
 /// the key never leaves the machine. Mirrors `ask_cli` — blocking. Returns
-/// `(answer, provenance)` where provenance is e.g. `"groq · llama-3.3-70b-versatile"`.
-fn run_agent_ask(question: String) -> (String, String) {
+/// `(answer, provenance, usable)`: `usable == false` means the host has no working key
+/// (none set, or its limits/credits are expired) and the phone should use its fallback.
+fn run_agent_ask(question: String) -> (String, String, bool) {
     let cfg = crate::agent::AgentConfig::from_env();
     if !cfg.is_configured() {
-        return ("No LLM key on the host — set MARS_LLM_KEY or run `mars keyd`.".to_string(), "none".to_string());
+        return ("No LLM key on the host.".to_string(), "none".to_string(), false);
     }
     let provenance = agent_provenance(&cfg);
     let (tx, rx) = mpsc::channel();
     crate::agent::ask(cfg, question, crate::palette::registry_context(), String::new(), Vec::new(), tx);
     loop {
         match rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(crate::agent::AgentEvent::Answer { text, .. }) => return (text, provenance),
+            Ok(crate::agent::AgentEvent::Answer { text, .. }) => {
+                let usable = !looks_like_key_failure(&text);
+                return (text, provenance, usable);
+            }
             Ok(_) => continue, // streaming/progress events — wait for the final answer
-            Err(_) => return ("The agent didn't respond in time.".to_string(), provenance),
+            Err(_) => return ("The agent didn't respond in time.".to_string(), provenance, false),
         }
     }
+}
+
+/// Heuristic: does this answer look like an auth / quota / rate-limit failure (so the phone
+/// should fall back)? Provider errors come back as the Answer text; scoped to short,
+/// error-shaped strings so a real answer that merely mentions "rate limit" isn't misread.
+fn looks_like_key_failure(text: &str) -> bool {
+    if text.len() > 240 {
+        return false;
+    }
+    let t = text.to_ascii_lowercase();
+    [
+        "auth failed", "unauthorized", "invalid api key", "rate limit", "rate-limit", "quota",
+        "insufficient", "credit", "exceeded", "billing", " 401", " 429", "payment required",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
 }
 
 /// A short "who answered" label for the phone: provider + the model's short name
@@ -423,13 +443,14 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 json_str(&id)
             ));
             thread::spawn(move || {
-                let (answer, provenance) = run_agent_ask(q);
-                let _ = tx2.send(format!(
-                    "{{\"t\":\"summary\",\"id\":{},\"summary\":{{\"text\":{},\"computedBy\":{}}}}}",
-                    json_str(&id),
-                    json_str(&answer),
-                    json_str(&provenance)
-                ));
+                let (answer, provenance, usable) = run_agent_ask(q);
+                let summary = if usable {
+                    format!("{{\"text\":{},\"computedBy\":{}}}", json_str(&answer), json_str(&provenance))
+                } else {
+                    // No usable key on the host — tell the phone to use its server fallback.
+                    "{\"text\":\"\",\"fallback\":true}".to_string()
+                };
+                let _ = tx2.send(format!("{{\"t\":\"summary\",\"id\":{},\"summary\":{}}}", json_str(&id), summary));
             });
         }
         // Pane-targeted write-back — the phone answering a prompt (`y\n` / `n\n`).
