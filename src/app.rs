@@ -873,6 +873,75 @@ impl App {
         ranked.into_iter().map(|(_, _, r)| r).collect()
     }
 
+    /// The mobile board as JSON — the Rover seam's `WorkspaceRow[]` plus the
+    /// session name and a timestamp. Built from `bar_workspace_rows()` so the
+    /// phone and the command bar read one ranking and one verdict. Pure; only
+    /// serialized when a phone is actually subscribed.
+    pub fn mobile_board_json(&self) -> String {
+        use crate::briefing::Verdict;
+        use crate::palette::{ItemKind, PaletteRow};
+        let ts = crate::worklog::now_secs();
+        let rows: Vec<serde_json::Value> = self
+            .bar_workspace_rows()
+            .into_iter()
+            .filter_map(|r| {
+                let PaletteRow { label, description, kind } = r;
+                let ItemKind::Surface(s) = kind else { return None };
+                let blocked = s.verdict == Verdict::Blocked;
+                let prompt = description.clone();
+                let mut row = serde_json::json!({
+                    "id": s.tab_index.to_string(),
+                    "name": label,
+                    "verdict": s.verdict.label(), // failed|blocked|done|running|idle
+                    "why": description,
+                    "ageSecs": s.age_secs,
+                });
+                if blocked {
+                    row["blocked"] = serde_json::json!({
+                        "prompt": prompt,
+                        "paneId": s.pane_id.to_string(),
+                    });
+                }
+                Some(row)
+            })
+            .collect();
+        serde_json::json!({
+            "session": self.session_name.clone().unwrap_or_default(),
+            "rows": rows,
+            "ts": ts,
+        })
+        .to_string()
+    }
+
+    /// The reattach briefing as JSON — the seam's `Briefing` — when a shift
+    /// report exists, else `None` (the phone keeps its last board).
+    pub fn mobile_briefing_json(&self) -> Option<String> {
+        let report = self.shift_report.as_ref()?;
+        let rows: Vec<serde_json::Value> = report
+            .rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "verdict": r.verdict.label(),
+                    "tab": r.tab,
+                    "text": r.text,
+                    "agoSecs": r.ago_secs,
+                })
+            })
+            .collect();
+        Some(
+            serde_json::json!({
+                "awaySecs": report.away_secs,
+                "mission": report.mission,
+                "narrative": report.narrative,
+                "rows": rows,
+                "suggestion": report.suggestion,
+                "ts": crate::worklog::now_secs(),
+            })
+            .to_string(),
+        )
+    }
+
     /// Name / why-snippet / age for one surface, from its pane + terminal + watch.
     fn surface_row_parts(&self, pid: crate::pane::PaneId, now: u64, ms: u64) -> (String, String, u64) {
         let tid = match self.panes.get(&pid).map(|p| &p.content) {
@@ -1513,6 +1582,19 @@ impl App {
     }
 
     /// Bracketed paste from the host terminal (Cmd+V etc.) — routed by mode.
+    /// Write raw bytes to a specific pane's terminal (the Rover phone answering a
+    /// prompt). Pane-targeted and non-takeover — the desktop client's focus is
+    /// untouched, and a non-terminal pane is a silent no-op.
+    pub fn write_to_pane(&mut self, pane_id: crate::pane::PaneId, data: &str) {
+        let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
+            Some(PaneContent::Terminal(t)) => *t,
+            _ => return,
+        };
+        if let Some(t) = self.terms.get_mut(&tid) {
+            t.send_bytes(data.as_bytes());
+        }
+    }
+
     pub fn paste_text(&mut self, s: &str) {
         match self.mode {
             Mode::Terminal => {

@@ -62,6 +62,15 @@ pub enum ClientFrame {
     /// Return the daemon's current broker route to a Mars subprocess running
     /// inside one of its persistent terminal panes.
     BrokerRoute,
+    /// Read-only board/briefing subscription (the Rover phone bridge). Unlike
+    /// `Hello` this NEVER becomes the owning client — the desktop attach and its
+    /// `latest_client_gen` are untouched — it only asks the daemon to start
+    /// pushing structured `Board`/`Briefing` frames on the tick cadence. A phone
+    /// glancing must not kick the person at the keyboard.
+    Subscribe,
+    /// Pane-targeted raw input from a Rover subscriber (answering a `[y/N]`) — written
+    /// straight to that pane's terminal, WITHOUT taking over the session.
+    PaneInput { pane: usize, data: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -78,6 +87,13 @@ pub enum ServerFrame {
         broker_sock: Option<String>,
         broker_capability: Option<String>,
     },
+    /// Pre-serialized workspace-board JSON (the mobile seam's WorkspaceRow[]
+    /// plus session + ts). Pushed ONLY to `Subscribe`d clients, so app types
+    /// stay out of the protocol and normal attach clients never see it.
+    Board { json: String },
+    /// Pre-serialized reattach-briefing JSON (the seam's `Briefing`), pushed to
+    /// subscribers only while a shift report exists.
+    Briefing { json: String },
 }
 
 pub fn write_frame<T: Serialize>(w: &mut impl Write, frame: &T) -> io::Result<()> {
@@ -336,6 +352,33 @@ enum SrvEvent {
     Rename(String),
     /// A nested `mars <file>` — open it as a new tab here.
     OpenFile(String),
+    /// A read-only mobile subscriber joined: start pushing board/briefing frames
+    /// to this stream. Does NOT touch client ownership (non-takeover glance).
+    Subscribe { stream: crate::sys::control::Stream },
+    /// A subscriber wrote raw input to a pane (the phone answering a prompt).
+    PaneInput { pane: usize, data: String },
+}
+
+/// Push the current structured board (and briefing, when one exists) to every
+/// mobile subscriber, dropping any whose socket has closed. Inert with no
+/// subscribers — the JSON is never built unless a phone is listening.
+fn push_mobile(app: &App, subs: &mut Vec<crate::sys::control::Stream>) {
+    if subs.is_empty() {
+        return;
+    }
+    let board = app.mobile_board_json();
+    let briefing = app.mobile_briefing_json();
+    subs.retain_mut(|s| {
+        if write_frame(s, &ServerFrame::Board { json: board.clone() }).is_err() {
+            return false;
+        }
+        if let Some(b) = &briefing {
+            if write_frame(s, &ServerFrame::Briefing { json: b.clone() }).is_err() {
+                return false;
+            }
+        }
+        true
+    });
 }
 
 struct BrokerRouteReset;
@@ -430,6 +473,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     let mut client: Option<(crate::sys::control::Stream, u64)> = None;
     let mut term: Option<Terminal<CrosstermBackend<FrameWriter>>> = None;
     let mut latest_client_gen = 0;
+    // Read-only mobile subscribers (the Rover phone bridge). Separate from the
+    // owning client so a glance never takes over; board/briefing frames are
+    // pushed here on a throttled cadence and dead streams are pruned on write.
+    let mut subscribers: Vec<crate::sys::control::Stream> = Vec::new();
+    let mut last_mobile_push: Option<std::time::Instant> = None;
 
     loop {
         app.tick();
@@ -528,8 +576,34 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             Ok(SrvEvent::Rename(to)) => {
                 app.rename_session_to = Some(to);
             }
+            Ok(SrvEvent::Subscribe { stream }) => {
+                subscribers.push(stream);
+                // Greet the new subscriber immediately with a full snapshot.
+                push_mobile(&app, &mut subscribers);
+                last_mobile_push = Some(std::time::Instant::now());
+            }
+            Ok(SrvEvent::PaneInput { pane, data }) => {
+                // The phone answered a prompt — write it to that pane's terminal.
+                app.write_to_pane(pane, &data);
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Push the board/briefing to any phone glancing in, on a throttled
+        // cadence (the tick loop runs every poll_interval_ms — far too chatty
+        // for a LAN push). Inert when nobody's subscribed.
+        if !subscribers.is_empty() {
+            let due = last_mobile_push
+                .map(|t| {
+                    t.elapsed()
+                        >= Duration::from_millis(app.tuning.mobile_push_interval_ms.max(1))
+                })
+                .unwrap_or(true);
+            if due {
+                push_mobile(&app, &mut subscribers);
+                last_mobile_push = Some(std::time::Instant::now());
+            }
         }
 
         // Live rename (from the editor's RenameSession action or `mars rename`).
@@ -633,6 +707,41 @@ fn client_connection(
         Ok(ClientFrame::Open { path }) => {
             let _ = tx.send(SrvEvent::OpenFile(path.clone()));
             let _ = send_exit(&stream, &format!("opening '{path}'"));
+            return;
+        }
+        Ok(ClientFrame::Subscribe) => {
+            // Non-takeover read channel: register for board/briefing pushes
+            // WITHOUT sending an Attach, so the owning desktop client keeps the
+            // session. Modeled on the Status side-channel above.
+            let _ = stream.set_read_timeout(None);
+            let _ = reader.get_ref().set_read_timeout(None);
+            let Ok(push_stream) = stream.try_clone() else { return };
+            let _ = push_stream.set_write_timeout(Some(Duration::from_secs(2)));
+            if tx.send(SrvEvent::Subscribe { stream: push_stream }).is_err() {
+                return;
+            }
+            // Keep this connection alive so the server's push clone stays open;
+            // drain and ignore any inbound frames. Action handling (answer /
+            // summarize / jump / restart / run) is the serve.rs bridge's job —
+            // TODO(serve.rs): translate ClientAction frames to daemon ops here
+            // or in the bridge. Return on EOF; the server prunes the dead push
+            // stream on its next write.
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                // The one write a non-takeover subscriber may perform: pane-targeted
+                // input (the phone answering a prompt). Everything else is ignored.
+                if let Ok(ClientFrame::PaneInput { pane, data }) =
+                    serde_json::from_str::<ClientFrame>(line.trim())
+                {
+                    if tx.send(SrvEvent::PaneInput { pane, data }).is_err() {
+                        break;
+                    }
+                }
+            }
             return;
         }
         Ok(ClientFrame::BrokerRoute) => {
@@ -806,6 +915,8 @@ pub fn client_main(name: &str) -> Result<()> {
                         }
                         Ok(ServerFrame::Status { .. }) => {} // not expected mid-attach
                         Ok(ServerFrame::BrokerRoute { .. }) => {} // not expected mid-attach
+                        Ok(ServerFrame::Board { .. }) => {} // subscriber-only, never on an attach
+                        Ok(ServerFrame::Briefing { .. }) => {} // subscriber-only, never on an attach
                         Err(_) => {}
                     },
                 }

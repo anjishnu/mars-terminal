@@ -145,6 +145,10 @@ pub struct Tuning {
     pub auto_watch: u64,
     pub watch_min_active_secs: u64,
     pub goal_tracking: u64,
+    /// How often (milliseconds) the session daemon pushes the structured board +
+    /// briefing to a subscribed mobile client (the Rover phone bridge). The main
+    /// loop ticks far faster; this throttles the LAN push to a sane cadence.
+    pub mobile_push_interval_ms: u64,
     /// The resolved color palette (theme + per-token knob overrides). Read by the
     /// render layer; the `theme_*`/`selection_bg`/… knobs above are its override
     /// surface, not read directly by `ui.rs`.
@@ -217,6 +221,7 @@ impl Default for Tuning {
             auto_watch: 1,
             watch_min_active_secs: 10,
             goal_tracking: 1,
+            mobile_push_interval_ms: 1000,
             palette: Palette::mission_control(),
         }
     }
@@ -442,6 +447,11 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "1 = when you detach, the agent captures what you were working \
              toward, so the reattach briefing can report progress on it; \
              0 = off.")),
+        ("mobile_push_interval_ms", knob(json!(d.mobile_push_interval_ms),
+            "How often (ms) the session daemon pushes the workspace board + \
+             briefing to a subscribed phone (the Rover bridge). The tick loop \
+             runs far faster; this throttles the LAN push. Only active while a \
+             phone is subscribed.")),
     ]
 }
 
@@ -580,6 +590,8 @@ pub fn load() -> Tuning {
         t.auto_watch = get_u64(&map, "auto_watch", t.auto_watch);
         t.watch_min_active_secs = get_u64(&map, "watch_min_active_secs", t.watch_min_active_secs);
         t.goal_tracking = get_u64(&map, "goal_tracking", t.goal_tracking);
+        t.mobile_push_interval_ms =
+            get_u64(&map, "mobile_push_interval_ms", t.mobile_push_interval_ms).max(1);
         if let Some(list) = map.get("project_ignore").and_then(|e| e.value.as_array()) {
             let dirs: Vec<String> =
                 list.iter().filter_map(|v| v.as_str().map(String::from)).collect();

@@ -39,6 +39,11 @@ ssh = []
 # toolchain). Off ⇒ no highlighting anywhere, renders plain; syntax_stub.rs takes
 # over and the dep isn't compiled, so a highlight-free SKU pays zero cost.
 syntax = ["dep:syntect"]
+# `web` is the Rover bridge: `mars serve` (WebSocket ⇄ session-socket pump) + `mars qr`.
+# OFF by default so the base binary stays lean and pays zero cost — the WS/QR deps are
+# only compiled for a `cargo build --features web`. The bridge is a second client of the
+# existing session socket; the daemon protocol is unchanged.
+web = ["dep:tungstenite", "dep:qrcodegen"]
 
 [dependencies]
 # Pure-Rust syntax highlighting: `fancy-regex` avoids the Oniguruma C dependency so
@@ -56,6 +61,11 @@ vt100 = "0.15"
 arboard = "3"
 base64 = "0.22"
 termimad = "0.35"
+
+# Rover bridge (optional, gated by `web`): a synchronous WebSocket server matching the
+# codebase's thread-per-connection model, and a pure-Rust QR encoder for `mars qr`.
+tungstenite = { version = "0.24", optional = true }
+qrcodegen = { version = "1.8", optional = true }
 
 # Platform-specific: reached ONLY through `src/sys/` (the platform abstraction
 # layer). `libc` backs the Unix adapter; `getrandom` plus HMAC-SHA256 provide

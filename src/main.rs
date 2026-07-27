@@ -44,6 +44,10 @@ mod syntax;
 #[cfg(not(feature = "syntax"))]
 #[path = "syntax_stub.rs"]
 mod syntax;
+// The Rover bridge (`mars serve` / `mars qr`) is optional; without `web` it isn't
+// compiled at all (no stub needed — its CLI arms print a rebuild hint instead).
+#[cfg(feature = "web")]
+mod serve;
 mod worklog;
 mod tuning;
 mod ui;
@@ -376,6 +380,19 @@ fn main() -> Result<()> {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("usage: mars kill <name>   (see: mars ls)"))?;
             return session::kill_main(&name);
+        }
+        // The Rover bridge — a phone/web client over WebSocket. `qr` prints a pairing
+        // QR; `serve` runs the WS ⇄ session-socket pump. Built only with `--features web`.
+        #[cfg(feature = "web")]
+        Some("serve") => return serve::serve_main(args.next()),
+        #[cfg(feature = "web")]
+        Some("qr") => return serve::qr_main(args.next()),
+        #[cfg(not(feature = "web"))]
+        Some("serve") | Some("qr") => {
+            eprintln!(
+                "this build has no Rover bridge; rebuild with:  cargo build --features web"
+            );
+            std::process::exit(2);
         }
         // The reset button: end everything, sweep stale sockets, start nothing.
         Some("killall") | Some("--killall") => {
@@ -2230,6 +2247,8 @@ fn selfcheck() -> Result<()> {
                             }
                             Ok(session::ServerFrame::Status { .. }) => {}
                             Ok(session::ServerFrame::BrokerRoute { .. }) => {}
+                            Ok(session::ServerFrame::Board { .. }) => {}
+                            Ok(session::ServerFrame::Briefing { .. }) => {}
                             Err(_) => {}
                         },
                         Err(_) => {} // timeout tick — keep waiting until deadline
@@ -2413,6 +2432,129 @@ fn selfcheck() -> Result<()> {
         server.join().expect("server thread panicked")?;
         assert!(!rpath.exists(), "socket not removed after kill");
         println!("[selfcheck] session daemon ............ PASS");
+
+        // 27a2. Mobile bridge: a Subscribe side-channel receives the structured
+        //       board JSON WITHOUT taking over the attached desktop client (the
+        //       non-takeover glance), and verdicts map to the contract strings.
+        {
+            // Read the next Board frame's parsed JSON payload, within `secs`.
+            // The reader must carry a read timeout so read_line returns to check
+            // the deadline between pushes.
+            fn next_board(
+                reader: &mut BufReader<UnixStream>,
+                secs: u64,
+            ) -> Option<serde_json::Value> {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                while std::time::Instant::now() < deadline {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => return None,
+                        Ok(_) => {
+                            if let Ok(session::ServerFrame::Board { json }) =
+                                serde_json::from_str::<session::ServerFrame>(line.trim())
+                            {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                                    return Some(v);
+                                }
+                            }
+                        }
+                        Err(_) => {} // timeout tick — keep waiting
+                    }
+                }
+                None
+            }
+
+            let bname = format!("selfcheck-board-{}", std::process::id());
+            let bpath = session::socket_path(&bname)?;
+            let bname2 = bname.clone();
+            let bserver = std::thread::spawn(move || session::server_main(&bname2, None));
+            let mut up = false;
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                if crate::sys::control::connect(&bpath).is_ok() { up = true; break; }
+            }
+            assert!(up, "board-test server did not come up");
+
+            // The owning desktop client attaches and drives the session (scratch
+            // editor tab → one workspace row).
+            let mut owner = TestClient::connect(&bpath, session::SESSION_PROTOCOL_VERSION)?;
+            owner.text("ownermarker")?;
+            let (seen, _) = owner.read_until("ownermarker", 5)?;
+            assert!(seen, "owner client not driving the board session");
+
+            // A phone subscribes over the same socket — a read-only glance.
+            let sub = crate::sys::control::connect(&bpath)?;
+            let mut sub_w = sub.try_clone()?;
+            session::write_frame(&mut sub_w, &session::ClientFrame::Subscribe)?;
+            let read_half = sub.try_clone()?;
+            read_half.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
+            let mut sub_r = BufReader::new(read_half);
+
+            // Task 1: a structured board frame arrives, with the right shape and
+            // verdict strings.
+            let board = next_board(&mut sub_r, 5).expect("no board frame from subscription");
+            assert_eq!(
+                board["session"], serde_json::json!(bname),
+                "board session name mismatch: {board}"
+            );
+            let rows = board["rows"].as_array().expect("board rows not an array");
+            assert!(!rows.is_empty(), "board carried no workspace rows: {board}");
+            let allowed = ["failed", "blocked", "done", "running", "idle"];
+            for row in rows {
+                let v = row["verdict"].as_str().unwrap_or("");
+                assert!(allowed.contains(&v), "board verdict '{v}' is not a contract state");
+            }
+
+            // Task 2: the glance is NON-TAKEOVER — the owning client is still
+            // attached and still drives the session.
+            owner.text("stillhere")?;
+            let (still, ex) = owner.read_until("stillhere", 5)?;
+            assert!(still, "subscribe kicked the owning client (must be non-takeover): {ex:?}");
+            assert!(
+                session::list_sessions()?
+                    .iter()
+                    .any(|(n, alive, attached)| n == &bname && *alive && *attached),
+                "subscription must not clear the attached-client flag"
+            );
+
+            // Verdict mapping for a live, non-idle state: launch a shell command
+            // via the unified composer and confirm the pane surfaces on the board
+            // as verdict "running" — a `Verdict::Running → "running"` round trip
+            // over the wire. (A nonzero exit maps to "failed", but only after the
+            // pane's `watch_quiet_secs` window elapses — `pane_verdict` reports
+            // Running until the auto-watch goes quiet — so it's the slow path, not
+            // asserted here.)
+            owner.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL))?; // open bar
+            owner.key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))?;    // shell composer
+            owner.text("echo boardrun")?;
+            owner.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;        // run it
+            let mut saw_running = false;
+            let mut last_board = serde_json::Value::Null;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                if let Some(b) = next_board(&mut sub_r, 2) {
+                    if b["rows"]
+                        .as_array()
+                        .map(|rs| rs.iter().any(|r| r["verdict"] == "running"))
+                        .unwrap_or(false)
+                    {
+                        saw_running = true;
+                        break;
+                    }
+                    last_board = b;
+                }
+            }
+            assert!(
+                saw_running,
+                "a live shell pane never surfaced as verdict 'running'; last board: {last_board}"
+            );
+
+            drop(sub);
+            session::kill_main(&bname)?;
+            bserver.join().expect("board-test server panicked")?;
+            assert!(!bpath.exists(), "board-test socket not removed after kill");
+            println!("[selfcheck] mobile board subscribe ... PASS");
+        }
 
         // 27b. Session management: Status reports detached; `kill` ends a
         //      session cleanly from outside.
