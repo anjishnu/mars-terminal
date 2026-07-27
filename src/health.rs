@@ -127,11 +127,11 @@ impl Health {
     /// a value is genuinely alarming. Uptime and GPU stay cool: a pinned GPU is the point
     /// of an ML box, not a warning. Load thresholds scale with the core count.
     pub fn metrics(&self) -> Vec<HealthMetric> {
+        // Order is priority order: the narrow SPACES column drops from the END, so the
+        // usage trio the user cares about (load / mem / disk) leads; uptime & gpu fill in
+        // when there's room.
         let cores = std::thread::available_parallelism().map(|n| n.get() as f64).unwrap_or(8.0);
-        let mut v = vec![HealthMetric {
-            text: format!("up {}", fmt_uptime(self.start.elapsed().as_secs())),
-            level: HealthLevel::Ok,
-        }];
+        let mut v = Vec::new();
         if let Some(l) = self.load1 {
             let level = if l > cores * 1.5 { HealthLevel::Danger } else if l > cores { HealthLevel::Warn } else { HealthLevel::Ok };
             v.push(HealthMetric { text: format!("load {l:.2}"), level });
@@ -142,12 +142,19 @@ impl Health {
             v.push(HealthMetric { text: format!("mem {m}%"), level });
         }
         if let Some(d) = self.disk_free_pct {
+            // Show disk USAGE (like mem), and warm as free space runs low — shorter than
+            // "82% free" too, which matters in the narrow SPACES column.
+            let used = 100u8.saturating_sub(d);
             let level = if d < 7 { HealthLevel::Danger } else if d < 15 { HealthLevel::Warn } else { HealthLevel::Ok };
-            v.push(HealthMetric { text: format!("disk {d}% free"), level });
+            v.push(HealthMetric { text: format!("disk {used}%"), level });
         }
         if let Some(g) = self.gpu_pct {
             v.push(HealthMetric { text: format!("gpu {g}%"), level: HealthLevel::Ok });
         }
+        v.push(HealthMetric {
+            text: format!("up {}", fmt_uptime(self.start.elapsed().as_secs())),
+            level: HealthLevel::Ok,
+        });
         v
     }
 }

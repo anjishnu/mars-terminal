@@ -2040,20 +2040,34 @@ fn render_health_line(frame: &mut Frame, app: &App, area: Rect) {
         HealthLevel::Danger => p.danger, // red
     };
     let pad = 1usize;
-    let n = metrics.len();
-    let total: usize = metrics.iter().map(|m| m.text.chars().count()).sum();
-    let avail = (area.width as usize).saturating_sub(pad * 2);
-    let gap_budget = avail.saturating_sub(total);
-    // Distribute the slack evenly between metrics (justify); never less than one space.
+    let inner = (area.width as usize).saturating_sub(pad * 2);
+    // A narrow SPACES column can't hold all five metrics; keep the leading (most
+    // important) ones that fit with at least single-space separators rather than
+    // overflowing and clipping mid-word.
+    let mut fit: Vec<&crate::health::HealthMetric> = Vec::new();
+    let mut used = 0usize;
+    for m in &metrics {
+        let w = m.text.chars().count();
+        let next = if fit.is_empty() { w } else { used + 1 + w };
+        if !fit.is_empty() && next > inner {
+            break;
+        }
+        used = next;
+        fit.push(m);
+    }
+    let n = fit.len();
+    let total: usize = fit.iter().map(|m| m.text.chars().count()).sum();
+    let slack = inner.saturating_sub(total); // ≥ n-1 by construction, so gaps ≥ 1
+    // Distribute the slack evenly between metrics (justify).
     let gap = |i: usize| -> usize {
         if n <= 1 {
             0
         } else {
-            (gap_budget / (n - 1) + usize::from(i < gap_budget % (n - 1))).max(1)
+            (slack / (n - 1) + usize::from(i < slack % (n - 1))).max(1)
         }
     };
     let mut spans = vec![Span::raw(" ".repeat(pad))];
-    for (i, m) in metrics.iter().enumerate() {
+    for (i, m) in fit.iter().enumerate() {
         let mut style = Style::default().fg(colour(m.level));
         if m.level == HealthLevel::Danger {
             style = style.add_modifier(Modifier::BOLD);

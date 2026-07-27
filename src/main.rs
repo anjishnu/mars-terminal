@@ -5282,7 +5282,8 @@ fn selfcheck() -> Result<()> {
         let flat: Vec<char> = screen_text(&term).chars().collect();
         let rows: Vec<String> = flat.chunks(w).map(|c| c.iter().collect()).collect();
         let title_row = rows.iter().position(|r| r.contains("SPACES")).expect("SPACES title row");
-        let health_row = rows.iter().position(|r| r.contains("up ")).expect("health line row");
+        let is_metric = |r: &String| ["load ", "mem ", "disk ", "gpu ", "up "].iter().any(|m| r.contains(m));
+        let health_row = rows.iter().position(is_metric).expect("health line row");
         assert!(
             health_row > title_row + 2,
             "health line should sit at the BOTTOM of the SPACES panel, not the top (SPACES row {title_row}, health row {health_row})"
