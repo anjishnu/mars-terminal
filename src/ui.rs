@@ -1988,15 +1988,16 @@ fn render_workspaces_panel(frame: &mut Frame, app: &App, rect: Rect) {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    // The host-health line is pinned to the BOTTOM of the panel (rendered after the body,
-    // below the sky); reserve a row for it here so the board flows above.
+    // The host-health lines are pinned to the BOTTOM of the panel (rendered after the body,
+    // below the sky). Two rows when there's room, so ALL metrics show in the narrow column;
+    // reserve them here so the board flows above.
     let show_health = app.tuning.health_line == 1 && inner.height >= 2;
-    let foot = if show_health { 1u16 } else { 0 };
+    let health_rows: u16 = if !show_health { 0 } else if inner.height >= 5 { 2 } else { 1 };
     let body = Rect {
         x: inner.x,
         y: inner.y,
         width: inner.width,
-        height: inner.height.saturating_sub(foot),
+        height: inner.height.saturating_sub(health_rows),
     };
 
     let rows = app.bar_workspace_rows();
@@ -2019,17 +2020,34 @@ fn render_workspaces_panel(frame: &mut Frame, app: &App, rect: Rect) {
         );
     }
 
-    // Host-health line, pinned to the very bottom, colour-coded and justified.
-    if show_health {
-        render_health_line(frame, app, Rect { x: inner.x, y: inner.y + inner.height - 1, width: inner.width, height: 1 });
+    // Host-health, pinned to the very bottom — one or two colour-coded, justified rows.
+    if health_rows > 0 {
+        render_health(frame, app, Rect { x: inner.x, y: inner.y + inner.height - health_rows, width: inner.width, height: health_rows });
     }
 }
 
-/// The SPACES host-health line: each metric in a cool hue (teal), warming to amber then
-/// red only when it's alarming, spread across the width in a justified layout.
-fn render_health_line(frame: &mut Frame, app: &App, area: Rect) {
-    use crate::health::HealthLevel;
+/// The SPACES host-health block: all metrics spread over `area.height` rows (so a narrow
+/// column shows everything on two lines), each row justified.
+fn render_health(frame: &mut Frame, app: &App, area: Rect) {
     let metrics = app.health.metrics();
+    if metrics.is_empty() || area.height == 0 {
+        return;
+    }
+    let lines = area.height as usize;
+    let per = ((metrics.len() + lines - 1) / lines).max(1); // balance across the rows
+    for (li, chunk) in metrics.chunks(per).enumerate() {
+        if li as u16 >= area.height {
+            break;
+        }
+        render_health_row(frame, app, Rect { x: area.x, y: area.y + li as u16, width: area.width, height: 1 }, chunk);
+    }
+}
+
+/// One health row: each metric in a cool hue (teal), warming to amber then red only when
+/// it's alarming, spread across the width in a justified layout (dropping any that don't
+/// fit rather than overflowing).
+fn render_health_row(frame: &mut Frame, app: &App, area: Rect, metrics: &[crate::health::HealthMetric]) {
+    use crate::health::HealthLevel;
     if metrics.is_empty() || area.width < 4 {
         return;
     }
@@ -2046,7 +2064,7 @@ fn render_health_line(frame: &mut Frame, app: &App, area: Rect) {
     // overflowing and clipping mid-word.
     let mut fit: Vec<&crate::health::HealthMetric> = Vec::new();
     let mut used = 0usize;
-    for m in &metrics {
+    for m in metrics {
         let w = m.text.chars().count();
         let next = if fit.is_empty() { w } else { used + 1 + w };
         if !fit.is_empty() && next > inner {
