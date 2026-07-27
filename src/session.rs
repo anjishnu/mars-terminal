@@ -374,8 +374,9 @@ fn push_mobile(app: &mut App, subs: &mut Vec<crate::sys::control::Stream>) {
         return;
     }
     // Sample host health so the phone's ambient stats stay live even while the session
-    // is detached (the render loop that normally samples isn't running headless).
-    app.health.maybe_sample(std::path::Path::new("."), false);
+    // is detached (the render loop that normally samples isn't running headless). GPU is
+    // included — valuable during training; self-trims to nothing when nvidia-smi is absent.
+    app.health.maybe_sample(std::path::Path::new("."), true);
     let board = app.mobile_board_json();
     let briefing = app.mobile_briefing_json();
     subs.retain_mut(|s| {
