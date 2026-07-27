@@ -1623,7 +1623,7 @@ impl App {
 
     pub fn pane_screen_json(&self, pane_id: crate::pane::PaneId) -> Option<String> {
         let pane = self.panes.get(&pane_id)?;
-        let text = match &pane.content {
+        let json = match &pane.content {
             PaneContent::Terminal(tid) => {
                 let t = self.terms.get(tid)?;
                 let screen = t.screen();
@@ -1637,27 +1637,34 @@ impl App {
                     }
                     text.push_str(&String::from_utf8_lossy(&row));
                 }
-                text
+                serde_json::json!({ "pane": pane_id.to_string(), "kind": "terminal", "text": text })
             }
             PaneContent::Editor(bid) => {
-                // A read-only viewport of the buffer around the cursor, with a line-number
-                // gutter and a cursor marker — so editor panes render on the phone too.
+                // Editors are sent as STRUCTURED lines (not a fixed-width screenshot) so the
+                // phone can wrap and render them natively for mobile — a window of the file
+                // around the cursor, each with its 1-based line number.
                 let buf = self.buffers.get(bid)?;
                 let total = buf.line_count().max(1);
-                let height = 44usize;
+                let window = 160usize;
                 let cur = pane.cursor_row.min(total - 1);
-                let start = cur.saturating_sub(height / 2).min(total.saturating_sub(height));
-                let mut text = format!("\x1b[1m{}\x1b[0m{}\n\n", buf.name, if buf.modified { " \x1b[38;5;208m●\x1b[0m" } else { "" });
-                for i in start..(start + height).min(total) {
-                    let line = buf.rope.line(i).to_string();
-                    let line = line.trim_end_matches(['\n', '\r']);
-                    let marker = if i == cur { "\x1b[38;5;208m▸\x1b[0m" } else { " " };
-                    text.push_str(&format!("\x1b[2m{:>4}\x1b[0m {marker} {line}\n", i + 1));
-                }
-                text
+                let start = cur.saturating_sub(window / 2).min(total.saturating_sub(window));
+                let lines: Vec<serde_json::Value> = (start..(start + window).min(total))
+                    .map(|i| {
+                        let line = buf.rope.line(i).to_string();
+                        serde_json::json!({ "n": i + 1, "t": line.trim_end_matches(['\n', '\r']) })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "pane": pane_id.to_string(),
+                    "kind": "editor",
+                    "name": buf.name,
+                    "modified": buf.modified,
+                    "cursorRow": cur + 1,
+                    "lines": lines,
+                })
             }
         };
-        Some(serde_json::json!({ "pane": pane_id.to_string(), "text": text }).to_string())
+        Some(json.to_string())
     }
 
     pub fn paste_text(&mut self, s: &str) {
