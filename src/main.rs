@@ -1054,7 +1054,8 @@ fn selfcheck() -> Result<()> {
     );
     println!("[selfcheck] bar `!` → shell ............ PASS");
 
-    // 11b. Rover reflow: resizing a pane reflows its PTY (and thus its vt100 screen).
+    // 11b. Rover reflow + takeover: while Rover owns a pane, the render keeps it at the
+    // phone's size (a wide TUI reflows narrow); the desk reclaims it on interaction.
     let term_pane = *app
         .panes
         .iter()
@@ -1064,9 +1065,13 @@ fn selfcheck() -> Result<()> {
         })
         .map(|(id, _)| id)
         .expect("terminal pane id");
-    app.resize_pane_to(term_pane, 24, 48);
-    assert_eq!(app.terms[&tid].screen().size(), (24, 48), "reflow did not resize the pane's screen");
-    println!("[selfcheck] rover reflow (pane resize) . PASS");
+    app.mobile_reflow = Some((term_pane, 24, 48));
+    term.draw(|f| ui::render(f, &mut app))?;
+    assert_eq!(app.terms[&tid].screen().size(), (24, 48), "render did not honour Rover takeover");
+    app.mobile_reflow = None; // mars becomes active
+    term.draw(|f| ui::render(f, &mut app))?;
+    assert_ne!(app.terms[&tid].screen().size(), (24, 48), "mars did not reclaim the pane size");
+    println!("[selfcheck] rover takeover / reclaim .. PASS");
 
     // 12. Ctrl+Space works INSIDE the terminal, and closing returns to it.
     app.handle_key(kc(KeyCode::Char(' ')))?;

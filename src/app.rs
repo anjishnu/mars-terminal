@@ -401,6 +401,11 @@ pub struct App {
     pub tuning: Tuning,
     /// Host-health probes (uptime, load, memory, disk, GPU) for the SPACES line.
     pub health: crate::health::Health,
+    /// When Rover is the active viewer of a pane, it takes over that pane's size:
+    /// `(pane, rows, cols)`. The render keeps the pane at these dims instead of the
+    /// layout, so a wide TUI reflows to the phone. Cleared when the desk user interacts
+    /// (mars becomes active) or the phone stops watching — active app owns the pane.
+    pub mobile_reflow: Option<(crate::pane::PaneId, u16, u16)>,
     /// Show the MARS banner in the empty scratch until the first keypress.
     pub show_splash: bool,
     /// Directory new terminals open in — the parent of the first opened file.
@@ -602,6 +607,7 @@ impl App {
             pending_osc: None,
             tuning: tuning::load(),
             health: crate::health::Health::new(2),
+            mobile_reflow: None,
             show_splash: file.is_none(),
             startup_cwd: file
                 .as_ref()

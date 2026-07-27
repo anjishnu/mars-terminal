@@ -567,6 +567,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         }
                         ev => {
                             let visible = ev.forces_redraw();
+                            // Real desk interaction → mars is active again; drop Rover's
+                            // takeover so the next render sizes panes back to the layout.
+                            if visible {
+                                app.mobile_reflow = None;
+                            }
                             let _ = app.apply_input(ev);
                             if visible {
                                 app.needs_redraw = true;
@@ -607,13 +612,16 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             }
             Ok(SrvEvent::WatchPane { pane, cols, rows }) => {
                 watched_pane = pane;
-                // Reflow the watched pane to the phone's width — but ONLY while detached
-                // (no owning client rendering), so we never resize a pane out from under
-                // someone at the keyboard. A reattach re-sizes it to the layout anyway.
-                if term.is_none() {
-                    if let (Some(p), Some(c), Some(r)) = (pane, cols, rows) {
+                // Rover takes over the pane's size while watching: reflow it to the phone's
+                // width even with a desktop attached (the render honours `mobile_reflow`).
+                // Mars reclaims it the instant the desk user interacts (SrvEvent::Input).
+                match (pane, cols, rows) {
+                    (Some(p), Some(c), Some(r)) => {
+                        app.mobile_reflow = Some((p, r, c));
                         app.resize_pane_to(p, r, c);
+                        app.needs_redraw = true;
                     }
+                    _ => app.mobile_reflow = None,
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}

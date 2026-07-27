@@ -496,7 +496,9 @@ fn render_panes(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    // Keep terminal PTYs sized to their panes' inner area.
+    // Keep terminal PTYs sized to their panes' inner area — except a pane Rover has taken
+    // over (mobile_reflow), which stays at the phone's width so a wide TUI reflows narrow.
+    let mobile_reflow = app.mobile_reflow;
     for (pane_id, rect) in &rects {
         let tid = match app.panes.get(pane_id).map(|p| p.content.clone()) {
             Some(PaneContent::Terminal(id)) => Some(id),
@@ -506,7 +508,10 @@ fn render_panes(frame: &mut Frame, app: &mut App, area: Rect) {
             let iw = rect.width.saturating_sub(2);
             let ih = rect.height.saturating_sub(2);
             if let Some(t) = app.terms.get_mut(&tid) {
-                t.resize(ih, iw);
+                match mobile_reflow {
+                    Some((mp, mrows, mcols)) if mp == *pane_id => t.resize(mrows, mcols),
+                    _ => t.resize(ih, iw),
+                }
             }
         }
     }
