@@ -1054,6 +1054,20 @@ fn selfcheck() -> Result<()> {
     );
     println!("[selfcheck] bar `!` → shell ............ PASS");
 
+    // 11b. Rover reflow: resizing a pane reflows its PTY (and thus its vt100 screen).
+    let term_pane = *app
+        .panes
+        .iter()
+        .find(|(_, p)| match &p.content {
+            pane::PaneContent::Terminal(t) => *t == tid,
+            _ => false,
+        })
+        .map(|(id, _)| id)
+        .expect("terminal pane id");
+    app.resize_pane_to(term_pane, 24, 48);
+    assert_eq!(app.terms[&tid].screen().size(), (24, 48), "reflow did not resize the pane's screen");
+    println!("[selfcheck] rover reflow (pane resize) . PASS");
+
     // 12. Ctrl+Space works INSIDE the terminal, and closing returns to it.
     app.handle_key(kc(KeyCode::Char(' ')))?;
     assert!(app.mode == mode::Mode::Bar, "Ctrl+Space dead inside terminal");

@@ -72,8 +72,15 @@ pub enum ClientFrame {
     /// straight to that pane's terminal, WITHOUT taking over the session.
     PaneInput { pane: usize, data: String },
     /// Start (`Some`) or stop (`None`) streaming a pane's screen to this subscriber —
-    /// the phone watching a terminal (e.g. Claude Code) live.
-    WatchPane { pane: Option<usize> },
+    /// the phone watching a terminal (e.g. Claude Code) live. `cols`/`rows` are the
+    /// viewer's size: while the session is detached, the watched pane is reflowed to fit.
+    WatchPane {
+        pane: Option<usize>,
+        #[serde(default)]
+        cols: Option<u16>,
+        #[serde(default)]
+        rows: Option<u16>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -362,8 +369,8 @@ enum SrvEvent {
     Subscribe { stream: crate::sys::control::Stream },
     /// A subscriber wrote raw input to a pane (the phone answering a prompt).
     PaneInput { pane: usize, data: String },
-    /// A subscriber wants to watch (or stop watching) a pane's screen.
-    WatchPane { pane: Option<usize> },
+    /// A subscriber wants to watch (or stop watching) a pane's screen, at their size.
+    WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16> },
 }
 
 /// Push the current structured board (and briefing, when one exists) to every
@@ -598,8 +605,16 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // The phone answered a prompt — write it to that pane's terminal.
                 app.write_to_pane(pane, &data);
             }
-            Ok(SrvEvent::WatchPane { pane }) => {
+            Ok(SrvEvent::WatchPane { pane, cols, rows }) => {
                 watched_pane = pane;
+                // Reflow the watched pane to the phone's width — but ONLY while detached
+                // (no owning client rendering), so we never resize a pane out from under
+                // someone at the keyboard. A reattach re-sizes it to the layout anyway.
+                if term.is_none() {
+                    if let (Some(p), Some(c), Some(r)) = (pane, cols, rows) {
+                        app.resize_pane_to(p, r, c);
+                    }
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -763,8 +778,8 @@ fn client_connection(
                             break;
                         }
                     }
-                    Ok(ClientFrame::WatchPane { pane }) => {
-                        if tx.send(SrvEvent::WatchPane { pane }).is_err() {
+                    Ok(ClientFrame::WatchPane { pane, cols, rows }) => {
+                        if tx.send(SrvEvent::WatchPane { pane, cols, rows }).is_err() {
                             break;
                         }
                     }

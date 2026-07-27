@@ -1600,6 +1600,21 @@ impl App {
     /// The current screen of a pane's terminal as JSON (`{pane, text}`) — streamed to a
     /// Rover subscriber watching that pane (the phone reading, e.g., Claude Code). Pure;
     /// only built when a phone is actively watching.
+    /// Reflow a specific pane's terminal to a viewer's size (the phone's width). Editor
+    /// panes have no PTY to reflow, so they're a no-op. Idempotent — `Terminal::resize`
+    /// early-returns when the size is unchanged.
+    pub fn resize_pane_to(&mut self, pane_id: crate::pane::PaneId, rows: u16, cols: u16) {
+        let rows = rows.clamp(8, 120);
+        let cols = cols.clamp(20, 240);
+        let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
+            Some(PaneContent::Terminal(t)) => *t,
+            _ => return,
+        };
+        if let Some(t) = self.terms.get_mut(&tid) {
+            t.resize(rows, cols);
+        }
+    }
+
     pub fn pane_screen_json(&self, pane_id: crate::pane::PaneId) -> Option<String> {
         let pane = self.panes.get(&pane_id)?;
         let text = match &pane.content {

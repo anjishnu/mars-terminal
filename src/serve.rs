@@ -478,10 +478,12 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // Watch/stop-watching a pane's live screen (the phone reading a terminal).
         Some("watch") => {
             let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
-            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane });
+            let cols = v.get("cols").and_then(|x| x.as_u64()).map(|n| n as u16);
+            let rows = v.get("rows").and_then(|x| x.as_u64()).map(|n| n as u16);
+            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane, cols, rows });
         }
         Some("unwatch") => {
-            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None });
+            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None, cols: None, rows: None });
         }
         // Rename the session from the phone — reflected on the host. Carried on a FRESH
         // short-lived connection: the daemon closes the stream that sends Rename, so using
