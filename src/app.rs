@@ -1601,22 +1601,41 @@ impl App {
     /// Rover subscriber watching that pane (the phone reading, e.g., Claude Code). Pure;
     /// only built when a phone is actively watching.
     pub fn pane_screen_json(&self, pane_id: crate::pane::PaneId) -> Option<String> {
-        let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
-            Some(PaneContent::Terminal(t)) => *t,
-            _ => return None,
-        };
-        let t = self.terms.get(&tid)?;
-        let screen = t.screen();
-        let (_, cols) = screen.size();
-        // Per-row ANSI (SGR colours + attributes) so the phone renders colour, not just
-        // white text — rows_formatted re-emits each row's styling self-contained.
-        let mut text = String::new();
-        for (i, row) in screen.rows_formatted(0, cols).enumerate() {
-            if i > 0 {
-                text.push('\n');
+        let pane = self.panes.get(&pane_id)?;
+        let text = match &pane.content {
+            PaneContent::Terminal(tid) => {
+                let t = self.terms.get(tid)?;
+                let screen = t.screen();
+                let (_, cols) = screen.size();
+                // Per-row ANSI (SGR colours + attributes) so the phone renders colour, not
+                // just white text — rows_formatted re-emits each row's styling self-contained.
+                let mut text = String::new();
+                for (i, row) in screen.rows_formatted(0, cols).enumerate() {
+                    if i > 0 {
+                        text.push('\n');
+                    }
+                    text.push_str(&String::from_utf8_lossy(&row));
+                }
+                text
             }
-            text.push_str(&String::from_utf8_lossy(&row));
-        }
+            PaneContent::Editor(bid) => {
+                // A read-only viewport of the buffer around the cursor, with a line-number
+                // gutter and a cursor marker — so editor panes render on the phone too.
+                let buf = self.buffers.get(bid)?;
+                let total = buf.line_count().max(1);
+                let height = 44usize;
+                let cur = pane.cursor_row.min(total - 1);
+                let start = cur.saturating_sub(height / 2).min(total.saturating_sub(height));
+                let mut text = format!("\x1b[1m{}\x1b[0m{}\n\n", buf.name, if buf.modified { " \x1b[38;5;208m●\x1b[0m" } else { "" });
+                for i in start..(start + height).min(total) {
+                    let line = buf.rope.line(i).to_string();
+                    let line = line.trim_end_matches(['\n', '\r']);
+                    let marker = if i == cur { "\x1b[38;5;208m▸\x1b[0m" } else { " " };
+                    text.push_str(&format!("\x1b[2m{:>4}\x1b[0m {marker} {line}\n", i + 1));
+                }
+                text
+            }
+        };
         Some(serde_json::json!({ "pane": pane_id.to_string(), "text": text }).to_string())
     }
 
