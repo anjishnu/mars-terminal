@@ -368,21 +368,33 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
 
 /// The LLM proxy: run the agent on the HOST, with the key that's already in this
 /// process's environment (or reached via `mars keyd`). The phone sends only the question;
-/// the key never leaves the machine. Mirrors `ask_cli` — blocking, returns the answer.
-fn run_agent_ask(question: String) -> String {
+/// the key never leaves the machine. Mirrors `ask_cli` — blocking. Returns
+/// `(answer, provenance)` where provenance is e.g. `"groq · llama-3.3-70b-versatile"`.
+fn run_agent_ask(question: String) -> (String, String) {
     let cfg = crate::agent::AgentConfig::from_env();
     if !cfg.is_configured() {
-        return "No LLM key on the host — set MARS_LLM_KEY or run `mars keyd`.".to_string();
+        return ("No LLM key on the host — set MARS_LLM_KEY or run `mars keyd`.".to_string(), "none".to_string());
     }
+    let provenance = agent_provenance(&cfg);
     let (tx, rx) = mpsc::channel();
     crate::agent::ask(cfg, question, crate::palette::registry_context(), String::new(), Vec::new(), tx);
     loop {
         match rx.recv_timeout(Duration::from_secs(60)) {
-            Ok(crate::agent::AgentEvent::Answer { text, .. }) => return text,
+            Ok(crate::agent::AgentEvent::Answer { text, .. }) => return (text, provenance),
             Ok(_) => continue, // streaming/progress events — wait for the final answer
-            Err(_) => return "The agent didn't respond in time.".to_string(),
+            Err(_) => return ("The agent didn't respond in time.".to_string(), provenance),
         }
     }
+}
+
+/// A short "who answered" label for the phone: provider + the model's short name
+/// (`groq · llama-3.3-70b-versatile`). The broker path hides the model it picks.
+fn agent_provenance(cfg: &crate::agent::AgentConfig) -> String {
+    if cfg.provider == "broker" {
+        return "broker".to_string();
+    }
+    let model = cfg.model.rsplit('/').next().unwrap_or(cfg.model.as_str());
+    if model.is_empty() { cfg.provider.to_string() } else { format!("{} · {model}", cfg.provider) }
 }
 
 /// Handle an inbound Rover message. `ask`/`summarize` are proxied to the host LLM (async,
@@ -411,11 +423,12 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 json_str(&id)
             ));
             thread::spawn(move || {
-                let answer = run_agent_ask(q);
+                let (answer, provenance) = run_agent_ask(q);
                 let _ = tx2.send(format!(
-                    "{{\"t\":\"summary\",\"id\":{},\"summary\":{{\"text\":{},\"computedBy\":\"host\"}}}}",
+                    "{{\"t\":\"summary\",\"id\":{},\"summary\":{{\"text\":{},\"computedBy\":{}}}}}",
                     json_str(&id),
-                    json_str(&answer)
+                    json_str(&answer),
+                    json_str(&provenance)
                 ));
             });
         }
