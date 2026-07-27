@@ -228,6 +228,15 @@ pub fn detect_broker_sock() -> Option<String> {
             return Some(s);
         }
     }
+    // A locally auto-started broker (`mars keyd`, incl. the one `ensure_broker` spawns)
+    // binds ~/.mars/auth.sock — a plain (non-capability) socket. Discover it directly;
+    // find_live_auth_sock below only scans /tmp for ssh-forwarded sockets.
+    if let Some(home) = crate::sys::paths::home_dir() {
+        let p = home.join(".mars").join("auth.sock");
+        if matches!(crate::sys::control::probe(&p), crate::sys::control::Probe::Live) {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
     #[cfg(unix)]
     {
         find_live_auth_sock(std::path::Path::new("/tmp"))
@@ -236,6 +245,29 @@ pub fn detect_broker_sock() -> Option<String> {
     {
         None
     }
+}
+
+/// Auto-start the key broker (`mars keyd`) in the background when this machine has a
+/// direct LLM key but no broker is up yet — so EVERY session daemon (including ones
+/// already running that don't have the key in their own env) can reach the LLM via
+/// ~/.mars/auth.sock. No-op if a key is already brokered, none is configured, or one is
+/// listening. Called on each session launch; idempotent.
+pub fn ensure_broker() {
+    let cfg = AgentConfig::from_env();
+    if cfg.provider == "broker" || !cfg.is_configured() {
+        return; // already going through a broker, or no key to serve
+    }
+    if detect_broker_sock().is_some() {
+        return; // one is already listening
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("keyd");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::sys::daemon::detach(&mut cmd); // survive this TTY
+    let _ = cmd.spawn();
 }
 
 /// The forwarded socket's name carries the HOME machine's uid, which rarely

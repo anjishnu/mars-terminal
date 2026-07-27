@@ -20,6 +20,9 @@ pub fn set_session_broker(
 
 pub fn reset_session_broker() {}
 
+/// No broker without the ssh feature — auto-start is a no-op.
+pub fn ensure_broker() {}
+
 pub(crate) fn current_session_broker_route() -> Result<(Option<String>, Option<String>)> {
     Ok((None, None))
 }

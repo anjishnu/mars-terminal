@@ -1046,6 +1046,7 @@ fn state_dir() -> Option<PathBuf> {
 
 /// `mars --session <name>`: attach if alive, else spawn the daemon and attach.
 pub fn session_main(name: &str, file: Option<String>) -> Result<()> {
+    crate::broker::ensure_broker(); // auto-start the key broker so every session reaches the LLM
     let path = socket_path(name)?;
     match crate::sys::control::probe(&path) {
         crate::sys::control::Probe::Indeterminate => {
