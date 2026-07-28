@@ -81,6 +81,10 @@ pub enum ClientFrame {
         #[serde(default)]
         rows: Option<u16>,
     },
+    /// A Rover subscriber asks the daemon to open a NEW terminal tab in this session —
+    /// additive (never takes over the desktop client). It appears as a new workspace on the
+    /// board and is watchable like any other pane.
+    NewTerminal,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -371,6 +375,8 @@ enum SrvEvent {
     PaneInput { pane: usize, data: String },
     /// A subscriber wants to watch (or stop watching) a pane's screen, at their size.
     WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16> },
+    /// A subscriber asked to open a new terminal tab (the phone's "New terminal").
+    NewTerminal,
 }
 
 /// Push the current structured board (and briefing, when one exists) to every
@@ -499,6 +505,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     let mut watched_pane: Option<usize> = None;
 
     loop {
+        // Only spend LLM tokens on Rover's map/reduce while a phone is glancing in.
+        // (Dead streams are pruned on the next push; a one-tick lag is harmless.)
+        app.rover_active = !subscribers.is_empty();
         app.tick();
         // Draw only when visible state moved — the frames go to the client over
         // the socket (and thus over SSH), so an idle no-op draw is a wasted packet
@@ -623,6 +632,13 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     }
                     _ => app.mobile_reflow = None,
                 }
+            }
+            Ok(SrvEvent::NewTerminal) => {
+                // Phone tapped "New terminal": open a terminal in a new tab (additive — the
+                // desktop client's ownership is untouched). It surfaces on the next board push.
+                app.new_tab();
+                app.open_terminal();
+                app.needs_redraw = true;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -788,6 +804,11 @@ fn client_connection(
                     }
                     Ok(ClientFrame::WatchPane { pane, cols, rows }) => {
                         if tx.send(SrvEvent::WatchPane { pane, cols, rows }).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientFrame::NewTerminal) => {
+                        if tx.send(SrvEvent::NewTerminal).is_err() {
                             break;
                         }
                     }
@@ -1498,6 +1519,12 @@ pub fn killall_main(force: bool) -> Result<()> {
                 let _ = std::fs::remove_file(e.path());
             }
         }
+    }
+    // The deliberate off-switch for the Rover bridge: if a launchd agent is keeping
+    // `mars serve` alive, drop its enable flag so the agent stops it and does NOT relaunch.
+    // (A plain crash/close leaves the flag, so normal supervision still auto-restarts.)
+    if let Some(home) = crate::sys::paths::home_dir() {
+        let _ = std::fs::remove_file(home.join(".mars").join("serve.enabled"));
     }
     println!(
         "killall: {ended} session(s) ended gracefully; force-swept Mars processes, \
