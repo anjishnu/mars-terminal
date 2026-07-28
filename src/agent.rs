@@ -99,7 +99,26 @@ pub enum AgentEvent {
     ShiftDone,
     /// Goals captured at detach — what the user was working toward.
     Goals { goals: Vec<String> },
+    /// Rover MAP: one-line summary of one workspace's RAW tail, keyed by term id,
+    /// with provider provenance. Cached on the app and pushed in the board frame.
+    RoverSummary { term_id: usize, text: String, provider: String },
+    /// Rover REDUCE: the composed mission briefing over the cached per-workspace
+    /// summaries, pushed live to a subscribed phone via the Briefing frame.
+    RoverBrief { text: String },
     Error(String),
+}
+
+/// Human-readable provenance for a model result — the phone's honesty invariant
+/// ("via groq · llama-3.3-70b" / "via laptop"). The key never leaves home, so a
+/// broker call is honestly attributed to the trusted machine, not the phone.
+pub fn provenance(cfg: &AgentConfig) -> String {
+    if cfg.provider == "broker" {
+        "laptop".to_string()
+    } else if cfg.model.is_empty() {
+        cfg.provider.to_string()
+    } else {
+        format!("{} · {}", cfg.provider, cfg.model)
+    }
 }
 
 /// Kebab-case, ≤16 chars, alnum+dash — shared by tab/session auto-naming.
@@ -574,6 +593,68 @@ pub fn summarize_surface(cfg: AgentConfig, term_id: usize, tail: String, tx: mps
     });
 }
 
+/// Rover MAP: a background one-line summary of ONE workspace's raw tail, for the
+/// phone board. Cheap ("summarize") tier. Interpret-don't-recite / lead-with-the-
+/// action tenets live in the prompt. Quiet on failure — the board keeps its prior
+/// cached line (or the phone falls back), so a stale model can't wedge the board.
+pub fn rover_summarize(cfg: AgentConfig, term_id: usize, tail: String, tx: mpsc::Sender<AgentEvent>) {
+    std::thread::spawn(move || {
+        let summary_system = crate::prompts::resolve("rover_summary", crate::prompts::ROVER_SUMMARY);
+        let mut messages = vec![serde_json::json!({ "role": "system",
+            "content": summary_system.trim_end() })];
+        if let Some(p) = crate::persona::system_message() {
+            messages.push(p); // VOICE-ish: the line is read on a phone glance
+        }
+        messages.push(serde_json::json!({ "role": "user", "content": tail }));
+        if let Ok(text) = chat(&cfg, messages, "summarize") {
+            let line = text.trim().lines().next().unwrap_or("").trim().to_string();
+            if !line.is_empty() {
+                let _ = tx.send(AgentEvent::RoverSummary {
+                    term_id,
+                    text: line,
+                    provider: provenance(&cfg),
+                });
+            }
+        }
+        let _ = tx.send(AgentEvent::BgDone); // always release the gate
+    });
+}
+
+/// Rover REDUCE: compose the mission briefing as a synthesis over the N cached
+/// per-workspace summaries (+ their verdicts), the mission, and the PREVIOUS
+/// briefing for continuity — never re-deriving from raw panes. VOICE task (the
+/// persona applies; the reply is prose, never parsed). Reuses the `shift_brief`
+/// tier — it is the same kind of work. Quiet on failure: the last briefing stands.
+pub fn rover_brief(
+    cfg: AgentConfig,
+    summaries: String,
+    mission: String,
+    prev: String,
+    tx: mpsc::Sender<AgentEvent>,
+) {
+    std::thread::spawn(move || {
+        // Substitute the trusted placeholders first and the screen-derived
+        // summaries LAST, so injected pane text is never re-scanned for holders.
+        let system = crate::prompts::resolve("rover_brief", crate::prompts::ROVER_BRIEF)
+            .trim_end()
+            .replace("{mission}", if mission.is_empty() { "(none inferred)" } else { &mission })
+            .replace("{prev}", if prev.is_empty() { "(this is the first briefing)" } else { &prev })
+            .replace("{summaries}", &summaries);
+        let mut messages = vec![serde_json::json!({ "role": "system", "content": system })];
+        if let Some(p) = crate::persona::system_message() {
+            messages.push(p); // VOICE task: the witty mission-control voice applies
+        }
+        messages.push(serde_json::json!({ "role": "user", "content": "Report." }));
+        if let Ok(text) = chat(&cfg, messages, "shift_brief") {
+            let brief = text.trim().to_string();
+            if !brief.is_empty() {
+                let _ = tx.send(AgentEvent::RoverBrief { text: brief });
+            }
+        }
+        let _ = tx.send(AgentEvent::BgDone); // always release the gate
+    });
+}
+
 /// Watch is a VOICE task: the verdict is prose the user reads many times a
 /// day, so the persona rides along — bounded by WATCH_SYSTEM's one-line rule,
 /// which the persona preamble forbids overriding. Pure, for the selfcheck.
@@ -977,9 +1058,13 @@ fn chat_inner(
             Err(e) => {
                 // Only churn on recoverable failures. An auth error or a malformed
                 // request will fail identically on every model — surface it, don't
-                // hammer the whole ring.
+                // hammer the whole ring. A credit/quota exhaustion is not transient, but
+                // the right move is the SAME as a throttle: fall through to the next
+                // provider in the chain (a free Groq/Gemini tier) rather than dead-ending
+                // on a paid provider that's out of budget.
                 let recoverable = e.downcast_ref::<RateLimited>().is_some()
-                    || e.downcast_ref::<ModelUnavailable>().is_some();
+                    || e.downcast_ref::<ModelUnavailable>().is_some()
+                    || is_provider_exhausted(&e);
                 last = Some(e);
                 if !recoverable {
                     break;
@@ -988,6 +1073,24 @@ fn chat_inner(
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no model candidates for task '{task}'")))
+}
+
+/// A credit / quota / billing exhaustion (e.g. Anthropic "credit balance too low", OpenAI
+/// "insufficient_quota", a 402). The provider is configured and authenticating fine, it's just
+/// out of budget — so treat it like a throttle and rotate to the next provider in the chain
+/// (typically a free Groq/Gemini tier) instead of surfacing a dead end.
+fn is_provider_exhausted(e: &anyhow::Error) -> bool {
+    let m = e.to_string().to_ascii_lowercase();
+    [
+        "credit balance too low",
+        "insufficient",       // "insufficient_quota", "insufficient funds/credits"
+        "exceeded your current quota",
+        "billing",
+        "payment required",
+        " 402",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
 }
 
 /// One provider attempt: tier-resolve, call, log. Split from `chat_inner` so

@@ -26,3 +26,31 @@ pub const PERSONA_PREAMBLE: &str = include_str!("prompts/persona_preamble.md");
 pub const PERSONA_DEFAULT: &str = include_str!("prompts/persona_default.md");
 pub const SHIFT_BRIEF: &str = include_str!("prompts/shift_brief.md");
 pub const CAPTURE_GOALS: &str = include_str!("prompts/capture_goals.md");
+pub const ROVER_SUMMARY: &str = include_str!("prompts/rover_summary.md");
+pub const ROVER_BRIEF: &str = include_str!("prompts/rover_brief.md");
+
+/// Directory of runtime prompt overrides — `MARS_PROMPT_DIR` (e.g. the Rover dev repo's
+/// `prompts/`, so the phone-facing prompts iterate alongside Rover) or `~/.mars/prompts`.
+/// A `<name>.md` there replaces the compiled-in default. Mirrors the runtime seams for
+/// `tiers.json` and `~/.mars/syntaxes/`.
+fn override_dir() -> Option<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("MARS_PROMPT_DIR") {
+        if !d.trim().is_empty() {
+            return Some(std::path::PathBuf::from(d));
+        }
+    }
+    crate::sys::paths::home_dir().map(|h| h.join(".mars").join("prompts"))
+}
+
+/// The prompt `name`, hot-loaded from the override dir (`<dir>/<name>.md`) if present, else the
+/// compiled-in `embedded` default. Read PER CALL, so a dev iterates a prompt without a rebuild.
+pub fn resolve(name: &str, embedded: &str) -> String {
+    if let Some(dir) = override_dir() {
+        if let Ok(text) = std::fs::read_to_string(dir.join(format!("{name}.md"))) {
+            if !text.trim().is_empty() {
+                return text;
+            }
+        }
+    }
+    embedded.to_string()
+}
