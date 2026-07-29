@@ -28,6 +28,10 @@ struct StartupInput {
     last_probe: Option<Instant>,
 }
 
+/// How much raw PTY output each pane retains for phone scrollback. ~512 KB is thousands of
+/// lines of terminal output while staying trivial next to a session's other state.
+const RAW_HISTORY_BYTES: usize = 512 * 1024;
+
 pub struct Term {
     /// The shell has exited; the pane shows a notice until the user closes it.
     pub exited: bool,
@@ -52,6 +56,11 @@ pub struct Term {
     /// loop to drain and forward as `{t:"output"}` deltas. Off (and free) otherwise.
     raw_tap: Arc<Mutex<Vec<u8>>>,
     raw_tap_on: Arc<AtomicBool>,
+    /// A rolling window of raw PTY bytes, appended ALWAYS. vt100's scrollback cannot be the
+    /// source of history for the phone: reflowing the pane to the phone's grid resizes the
+    /// parser, which discards its scrollback — so watching destroyed the very history we were
+    /// trying to read. Bytes survive resizes because they are just bytes.
+    raw_history: Arc<Mutex<std::collections::VecDeque<u8>>>,
 }
 
 /// Bound on the raw-tap buffer so a firehose against an absent/slow drain can't grow
@@ -109,8 +118,10 @@ pub fn spawn(
     let reader_parser = parser.clone();
     let raw_tap = Arc::new(Mutex::new(Vec::<u8>::new()));
     let raw_tap_on = Arc::new(AtomicBool::new(false));
+    let raw_history = Arc::new(Mutex::new(std::collections::VecDeque::<u8>::new()));
     let reader_raw_tap = raw_tap.clone();
     let reader_raw_tap_on = raw_tap_on.clone();
+    let reader_raw_history = raw_history.clone();
     let output_tx = tx.clone();
     // Captured for the OSC-133 ledger: exact command records are keyed by session
     // (skipped in standalone mode, which has no session log). The surface label is
@@ -133,6 +144,13 @@ pub fn spawn(
                     }
                     // Raw streaming to a Rover xterm.js subscriber: forward the same bytes we
                     // just fed the parser (only while a phone is watching this pane in raw mode).
+                    // Always retain a rolling window, whether or not a phone is watching —
+                    // history has to exist BEFORE someone asks for it.
+                    if let Ok(mut h) = reader_raw_history.lock() {
+                        h.extend(buf[..n].iter().copied());
+                        let over = h.len().saturating_sub(RAW_HISTORY_BYTES);
+                        if over > 0 { h.drain(..over); }
+                    }
                     if reader_raw_tap_on.load(Ordering::Relaxed) {
                         if let Ok(mut tap) = reader_raw_tap.lock() {
                             if tap.len() + n > RAW_TAP_CAP {
@@ -223,6 +241,7 @@ pub fn spawn(
         scrollback_limit: scrollback,
         raw_tap,
         raw_tap_on,
+        raw_history,
     })
 }
 
@@ -408,33 +427,25 @@ impl Term {
     /// Returns `(bytes, rows_included, history_depth)`. `bytes` ends with the LIVE screen, so a
     /// client can rebuild its whole buffer from one payload (xterm.js has no way to prepend to
     /// its scrollback, so paging in older output means rewriting, not appending).
+    /// Raw PTY bytes for a phone paging upward: the tail of the retained window, ending with
+    /// whatever is on screen now. Returns `(bytes, rows_included, rows_available)`. Replaying
+    /// bytes keeps the original colour and, unlike vt100's scrollback, survives the reflow the
+    /// phone triggers when it watches.
     pub fn history_ansi(&self, lines: usize) -> (Vec<u8>, usize, usize) {
-        let Ok(mut p) = self.parser.lock() else { return (Vec::new(), 0, 0) };
-        let (rows, cols) = { let s = p.screen(); (s.size().0 as usize, s.size().1) };
-        let saved = self.view_offset;
-        // vt100 clamps to the REAL depth, so this both measures history and bounds the walk.
-        p.set_scrollback(self.scrollback_limit);
-        let depth = p.screen().scrollback();
-        let mut pages: Vec<Vec<Vec<u8>>> = Vec::new();
-        let (mut off, mut got) = (rows, 0usize); // start one screen back: skip the live screen
-        while got < lines && off <= depth + rows {
-            p.set_scrollback(off);
-            pages.push(p.screen().rows_formatted(0, cols).collect());
-            got += rows;
-            off += rows;
+        let Ok(h) = self.raw_history.lock() else { return (Vec::new(), 0, 0) };
+        let all: Vec<u8> = h.iter().copied().collect();
+        let total = all.iter().filter(|b| **b == b'\n').count();
+        // Walk back from the end until we have `lines` newlines, then cut on that boundary.
+        let mut seen = 0usize;
+        let mut start = all.len();
+        for (i, b) in all.iter().enumerate().rev() {
+            if *b == b'\n' {
+                seen += 1;
+                if seen > lines { start = i + 1; break; }
+            }
+            start = i;
         }
-        p.set_scrollback(saved); // restore the live view before releasing the lock
-        pages.reverse(); // oldest screenful first
-        let all: Vec<Vec<u8>> = pages.into_iter().flatten().collect();
-        let start = all.len().saturating_sub(lines);
-        let rows_included = all.len() - start;
-        let mut out = Vec::new();
-        for row in &all[start..] {
-            out.extend_from_slice(row);
-            out.extend_from_slice(b"\x1b[0m\r\n"); // reset attrs so a run can't bleed into the next row
-        }
-        out.extend_from_slice(&p.screen().contents_formatted()); // …then the live screen
-        (out, rows_included, depth)
+        (all[start..].to_vec(), seen.min(lines), total)
     }
 
     /// Snap back to the live screen (any keystroke does this).
