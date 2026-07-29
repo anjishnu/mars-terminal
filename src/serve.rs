@@ -456,6 +456,16 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                             break;
                         }
                     }
+                    // Raw PTY bytes of a specifically watched pane (the xterm.js renderer):
+                    // seed + deltas, tagged with the pane id so the phone routes them.
+                    ServerFrame::PaneOutput { pane, b64 } => {
+                        if tx
+                            .send(format!("{{\"t\":\"output\",\"paneId\":\"{pane}\",\"b64\":\"{b64}\"}}"))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     ServerFrame::Exit { message } => {
                         let _ = tx.send(format!("{{\"t\":\"bye\",\"message\":{}}}", json_str(&message)));
                         break;
@@ -652,10 +662,12 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
             let cols = v.get("cols").and_then(|x| x.as_u64()).map(|n| n as u16);
             let rows = v.get("rows").and_then(|x| x.as_u64()).map(|n| n as u16);
-            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane, cols, rows });
+            // The xterm.js renderer asks for raw byte streaming; the DOM renderer omits it.
+            let raw = v.get("raw").and_then(|x| x.as_bool()).unwrap_or(false);
+            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane, cols, rows, raw });
         }
         Some("unwatch") => {
-            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None, cols: None, rows: None });
+            let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None, cols: None, rows: None, raw: false });
         }
         // Open a new terminal tab in the session (additive; surfaces on the next board push).
         Some("new_terminal") => {

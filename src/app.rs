@@ -1667,6 +1667,34 @@ impl App {
         Some(json.to_string())
     }
 
+    fn pane_term(&self, pane_id: crate::pane::PaneId) -> Option<&Term> {
+        match self.panes.get(&pane_id).map(|p| &p.content) {
+            Some(PaneContent::Terminal(tid)) => self.terms.get(tid),
+            _ => None,
+        }
+    }
+
+    /// Rover xterm.js raw streaming (client-side emulation). Start/stop capturing a terminal
+    /// pane's raw PTY output, produce the SEED (the escape sequences that reconstruct the
+    /// current screen, so xterm.js starts in sync), and drain accumulated output deltas.
+    /// Editor panes have no PTY — every method is a no-op / `None`.
+    pub fn enable_pane_raw_tap(&self, pane_id: crate::pane::PaneId) {
+        if let Some(t) = self.pane_term(pane_id) {
+            t.enable_raw_tap();
+        }
+    }
+    pub fn disable_pane_raw_tap(&self, pane_id: crate::pane::PaneId) {
+        if let Some(t) = self.pane_term(pane_id) {
+            t.disable_raw_tap();
+        }
+    }
+    pub fn pane_raw_seed(&self, pane_id: crate::pane::PaneId) -> Option<Vec<u8>> {
+        Some(self.pane_term(pane_id)?.screen().contents_formatted())
+    }
+    pub fn take_pane_raw_delta(&self, pane_id: crate::pane::PaneId) -> Option<Vec<u8>> {
+        Some(self.pane_term(pane_id)?.take_raw_delta())
+    }
+
     pub fn paste_text(&mut self, s: &str) {
         match self.mode {
             Mode::Terminal => {

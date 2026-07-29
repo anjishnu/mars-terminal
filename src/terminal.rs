@@ -47,7 +47,16 @@ pub struct Term {
     /// How far back the view is scrolled (0 = live). Mirrors the vt100 state.
     view_offset: usize,
     scrollback_limit: usize,
+    /// Rover xterm.js raw streaming: when a phone watches this pane in raw mode, the reader
+    /// thread appends the newly-read PTY bytes here (gated by `raw_tap_on`) for the session
+    /// loop to drain and forward as `{t:"output"}` deltas. Off (and free) otherwise.
+    raw_tap: Arc<Mutex<Vec<u8>>>,
+    raw_tap_on: Arc<AtomicBool>,
 }
+
+/// Bound on the raw-tap buffer so a firehose against an absent/slow drain can't grow
+/// without limit; on overflow the buffer is dropped (xterm.js resyncs on the next reseed).
+const RAW_TAP_CAP: usize = 1 << 20;
 
 /// Spawn the platform shell on a PTY sized `rows` x `cols` with `scrollback` lines of
 /// history, streaming output into a `vt100::Parser`. One background thread
@@ -98,6 +107,10 @@ pub fn spawn(
 
     let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback)));
     let reader_parser = parser.clone();
+    let raw_tap = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let raw_tap_on = Arc::new(AtomicBool::new(false));
+    let reader_raw_tap = raw_tap.clone();
+    let reader_raw_tap_on = raw_tap_on.clone();
     let output_tx = tx.clone();
     // Captured for the OSC-133 ledger: exact command records are keyed by session
     // (skipped in standalone mode, which has no session log). The surface label is
@@ -117,6 +130,16 @@ pub fn spawn(
                 Ok(n) => {
                     if let Ok(mut p) = reader_parser.lock() {
                         p.process(&buf[..n]);
+                    }
+                    // Raw streaming to a Rover xterm.js subscriber: forward the same bytes we
+                    // just fed the parser (only while a phone is watching this pane in raw mode).
+                    if reader_raw_tap_on.load(Ordering::Relaxed) {
+                        if let Ok(mut tap) = reader_raw_tap.lock() {
+                            if tap.len() + n > RAW_TAP_CAP {
+                                tap.clear();
+                            }
+                            tap.extend_from_slice(&buf[..n]);
+                        }
                     }
                     if let Some(sess) = &ledger_session {
                         for ev in osc.feed(&buf[..n]) {
@@ -198,6 +221,8 @@ pub fn spawn(
         cols,
         view_offset: 0,
         scrollback_limit: scrollback,
+        raw_tap,
+        raw_tap_on,
     })
 }
 
@@ -311,6 +336,28 @@ impl Term {
     /// Clone of the latest screen for rendering.
     pub fn screen(&self) -> vt100::Screen {
         self.parser.lock().unwrap().screen().clone()
+    }
+
+    /// Rover xterm.js raw streaming: start/stop capturing this pane's raw PTY output, and
+    /// drain what's accumulated since the last call. Off by default — no capture cost when
+    /// no phone is watching the pane in raw mode.
+    pub fn enable_raw_tap(&self) {
+        if let Ok(mut tap) = self.raw_tap.lock() {
+            tap.clear();
+        }
+        self.raw_tap_on.store(true, Ordering::Relaxed);
+    }
+    pub fn disable_raw_tap(&self) {
+        self.raw_tap_on.store(false, Ordering::Relaxed);
+        if let Ok(mut tap) = self.raw_tap.lock() {
+            tap.clear();
+        }
+    }
+    pub fn take_raw_delta(&self) -> Vec<u8> {
+        self.raw_tap
+            .lock()
+            .map(|mut t| std::mem::take(&mut *t))
+            .unwrap_or_default()
     }
 
     /// Scroll the view within the scrollback: positive = further back in

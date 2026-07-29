@@ -80,6 +80,11 @@ pub enum ClientFrame {
         cols: Option<u16>,
         #[serde(default)]
         rows: Option<u16>,
+        /// Raw-byte streaming (the xterm.js renderer): instead of the ~1 Hz `PaneScreen`
+        /// snapshot, seed with the current screen and then stream raw PTY output deltas as
+        /// `PaneOutput` frames. Defaults false → the DOM/ANSI snapshot path is unchanged.
+        #[serde(default)]
+        raw: bool,
     },
     /// A Rover subscriber asks the daemon to open a NEW terminal tab in this session —
     /// additive (never takes over the desktop client). It appears as a new workspace on the
@@ -91,6 +96,10 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     /// One rendered frame's ANSI bytes (base64).
     Output { b64: String },
+    /// Raw PTY output of a specific watched pane (base64), for a Rover subscriber running the
+    /// xterm.js renderer — the seed frame and the subsequent byte deltas. Carries the pane id
+    /// so the phone routes it to the right terminal (unlike `Output`, which is the attach TTY).
+    PaneOutput { pane: usize, b64: String },
     /// Connection is over (detach, quit, takeover, refusal) — show `message`.
     Exit { message: String },
     /// Reply to `ClientFrame::Status`.
@@ -374,7 +383,8 @@ enum SrvEvent {
     /// A subscriber wrote raw input to a pane (the phone answering a prompt).
     PaneInput { pane: usize, data: String },
     /// A subscriber wants to watch (or stop watching) a pane's screen, at their size.
-    WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16> },
+    /// `raw` selects the xterm.js byte-stream path over the ANSI-snapshot path.
+    WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16>, raw: bool },
     /// A subscriber asked to open a new terminal tab (the phone's "New terminal").
     NewTerminal,
 }
@@ -503,11 +513,24 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     let mut subscribers: Vec<crate::sys::control::Stream> = Vec::new();
     let mut last_mobile_push: Option<std::time::Instant> = None;
     let mut watched_pane: Option<usize> = None;
+    // Whether the watched pane is streamed as raw PTY bytes (the xterm.js renderer) rather
+    // than ~1 Hz ANSI snapshots. Carries the pane's raw tap, so it's cleared when the last
+    // phone drops (below) to stop the reader thread from buffering output nobody reads.
+    let mut watch_raw = false;
 
     loop {
         // Only spend LLM tokens on Rover's map/reduce while a phone is glancing in.
         // (Dead streams are pruned on the next push; a one-tick lag is harmless.)
         app.rover_active = !subscribers.is_empty();
+        // The last phone dropped while raw-watching → stop capturing its pane's output.
+        if subscribers.is_empty() && watch_raw {
+            if let Some(p) = watched_pane {
+                app.disable_pane_raw_tap(p);
+            }
+            watch_raw = false;
+            watched_pane = None;
+            app.mobile_reflow = None;
+        }
         app.tick();
         // Draw only when visible state moved — the frames go to the client over
         // the socket (and thus over SSH), so an idle no-op draw is a wasted packet
@@ -619,8 +642,23 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // The phone answered a prompt — write it to that pane's terminal.
                 app.write_to_pane(pane, &data);
             }
-            Ok(SrvEvent::WatchPane { pane, cols, rows }) => {
+            Ok(SrvEvent::WatchPane { pane, cols, rows, raw }) => {
+                let raw = raw && pane.is_some();
+                // Switching panes or leaving raw mode → stop capturing the old pane's output.
+                if watch_raw {
+                    if let Some(prev) = watched_pane {
+                        if Some(prev) != pane || !raw {
+                            app.disable_pane_raw_tap(prev);
+                        }
+                    }
+                }
                 watched_pane = pane;
+                watch_raw = raw;
+                if watch_raw {
+                    if let Some(p) = pane {
+                        app.enable_pane_raw_tap(p);
+                    }
+                }
                 // Rover takes over the pane's size while watching: reflow it to the phone's
                 // width even with a desktop attached (the render honours `mobile_reflow`).
                 // Mars reclaims it the instant the desk user interacts (SrvEvent::Input).
@@ -631,6 +669,19 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         app.needs_redraw = true;
                     }
                     _ => app.mobile_reflow = None,
+                }
+                // Raw mode: SEED xterm.js with the current (reflowed) screen so it starts in
+                // sync; byte deltas then stream on each tick below. A re-watch after a resize
+                // reseeds — appropriate, since the grid just changed.
+                if watch_raw {
+                    if let Some(p) = pane {
+                        if let Some(seed) = app.pane_raw_seed(p) {
+                            let b64 = B64.encode(&seed);
+                            subscribers.retain_mut(|s| {
+                                write_frame(s, &ServerFrame::PaneOutput { pane: p, b64: b64.clone() }).is_ok()
+                            });
+                        }
+                    }
                 }
             }
             Ok(SrvEvent::NewTerminal) => {
@@ -648,6 +699,22 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
         // cadence (the tick loop runs every poll_interval_ms — far too chatty
         // for a LAN push). Inert when nobody's subscribed.
         if !subscribers.is_empty() {
+            // Raw byte streaming (the xterm.js renderer): flush the watched pane's output
+            // deltas every loop iteration for liveness — NOT gated by the 1 Hz snapshot
+            // cadence. xterm.js owns the grid client-side, so no server snapshot is sent.
+            if watch_raw {
+                if let Some(p) = watched_pane {
+                    match app.take_pane_raw_delta(p) {
+                        Some(bytes) if !bytes.is_empty() => {
+                            let b64 = B64.encode(&bytes);
+                            subscribers.retain_mut(|s| {
+                                write_frame(s, &ServerFrame::PaneOutput { pane: p, b64: b64.clone() }).is_ok()
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
             let due = last_mobile_push
                 .map(|t| {
                     t.elapsed()
@@ -656,12 +723,16 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 .unwrap_or(true);
             if due {
                 push_mobile(&mut app, &mut subscribers);
-                // Stream the watched pane's live screen (the phone reading a terminal).
-                if let Some(p) = watched_pane {
-                    if let Some(json) = app.pane_screen_json(p) {
-                        subscribers.retain_mut(|s| {
-                            write_frame(s, &ServerFrame::PaneScreen { json: json.clone() }).is_ok()
-                        });
+                // Stream the watched pane's live screen (the phone reading a terminal). Only
+                // the DOM/ANSI renderer needs this full-screen snapshot; the raw path streams
+                // bytes above instead.
+                if !watch_raw {
+                    if let Some(p) = watched_pane {
+                        if let Some(json) = app.pane_screen_json(p) {
+                            subscribers.retain_mut(|s| {
+                                write_frame(s, &ServerFrame::PaneScreen { json: json.clone() }).is_ok()
+                            });
+                        }
                     }
                 }
                 last_mobile_push = Some(std::time::Instant::now());
@@ -802,8 +873,8 @@ fn client_connection(
                             break;
                         }
                     }
-                    Ok(ClientFrame::WatchPane { pane, cols, rows }) => {
-                        if tx.send(SrvEvent::WatchPane { pane, cols, rows }).is_err() {
+                    Ok(ClientFrame::WatchPane { pane, cols, rows, raw }) => {
+                        if tx.send(SrvEvent::WatchPane { pane, cols, rows, raw }).is_err() {
                             break;
                         }
                     }
@@ -991,6 +1062,7 @@ pub fn client_main(name: &str) -> Result<()> {
                         Ok(ServerFrame::Board { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::Briefing { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::PaneScreen { .. }) => {} // subscriber-only, never on an attach
+                        Ok(ServerFrame::PaneOutput { .. }) => {} // subscriber-only, never on an attach
                         Err(_) => {}
                     },
                 }
