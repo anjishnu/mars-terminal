@@ -401,6 +401,42 @@ impl Term {
         all[start..].join("\n")
     }
 
+    /// The last `lines` of scrollback as ANSI rows (colour preserved), oldest-first, plus how
+    /// much history actually exists. This is what a phone renderer replays to page in earlier
+    /// output: `history_tail` returns plain text, which would make paged-in history render
+    /// colourless next to the live screen. Excludes the live screen — the caller already has it.
+    /// Returns `(bytes, rows_included, history_depth)`. `bytes` ends with the LIVE screen, so a
+    /// client can rebuild its whole buffer from one payload (xterm.js has no way to prepend to
+    /// its scrollback, so paging in older output means rewriting, not appending).
+    pub fn history_ansi(&self, lines: usize) -> (Vec<u8>, usize, usize) {
+        let Ok(mut p) = self.parser.lock() else { return (Vec::new(), 0, 0) };
+        let (rows, cols) = { let s = p.screen(); (s.size().0 as usize, s.size().1) };
+        let saved = self.view_offset;
+        // vt100 clamps to the REAL depth, so this both measures history and bounds the walk.
+        p.set_scrollback(self.scrollback_limit);
+        let depth = p.screen().scrollback();
+        let mut pages: Vec<Vec<Vec<u8>>> = Vec::new();
+        let (mut off, mut got) = (rows, 0usize); // start one screen back: skip the live screen
+        while got < lines && off <= depth + rows {
+            p.set_scrollback(off);
+            pages.push(p.screen().rows_formatted(0, cols).collect());
+            got += rows;
+            off += rows;
+        }
+        p.set_scrollback(saved); // restore the live view before releasing the lock
+        pages.reverse(); // oldest screenful first
+        let all: Vec<Vec<u8>> = pages.into_iter().flatten().collect();
+        let start = all.len().saturating_sub(lines);
+        let rows_included = all.len() - start;
+        let mut out = Vec::new();
+        for row in &all[start..] {
+            out.extend_from_slice(row);
+            out.extend_from_slice(b"\x1b[0m\r\n"); // reset attrs so a run can't bleed into the next row
+        }
+        out.extend_from_slice(&p.screen().contents_formatted()); // …then the live screen
+        (out, rows_included, depth)
+    }
+
     /// Snap back to the live screen (any keystroke does this).
     pub fn scroll_to_live(&mut self) {
         if self.view_offset != 0 {

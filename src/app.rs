@@ -1821,6 +1821,11 @@ impl App {
     pub fn pane_raw_seed(&self, pane_id: crate::pane::PaneId) -> Option<Vec<u8>> {
         Some(self.pane_term(pane_id)?.screen().contents_formatted())
     }
+    /// Scrollback for a raw watcher paging upward: `(bytes, rows_included, history_depth)`,
+    /// ending with the live screen so the client can rebuild its buffer from this alone.
+    pub fn pane_history(&self, pane_id: crate::pane::PaneId, lines: usize) -> Option<(Vec<u8>, usize, usize)> {
+        Some(self.pane_term(pane_id)?.history_ansi(lines))
+    }
     pub fn take_pane_raw_delta(&self, pane_id: crate::pane::PaneId) -> Option<Vec<u8>> {
         Some(self.pane_term(pane_id)?.take_raw_delta())
     }

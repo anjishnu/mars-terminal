@@ -86,6 +86,9 @@ pub enum ClientFrame {
         #[serde(default)]
         raw: bool,
     },
+    /// A raw watcher paging upward: send the last `lines` of that pane's scrollback
+    /// (ending with the live screen) so the phone can rebuild its buffer with history.
+    PaneHistory { pane: usize, lines: usize },
     /// A Rover subscriber asks the daemon to open a NEW terminal tab in this session —
     /// additive (never takes over the desktop client). It appears as a new workspace on the
     /// board and is watchable like any other pane.
@@ -100,6 +103,9 @@ pub enum ServerFrame {
     /// xterm.js renderer — the seed frame and the subsequent byte deltas. Carries the pane id
     /// so the phone routes it to the right terminal (unlike `Output`, which is the attach TTY).
     PaneOutput { pane: usize, b64: String },
+    /// Reply to `PaneHistory`: scrollback + live screen, with how many history rows are
+    /// included and how deep the pane's history actually goes (for a "X of Y" readout).
+    PaneHistory { pane: usize, b64: String, lines: usize, total: usize },
     /// Connection is over (detach, quit, takeover, refusal) — show `message`.
     Exit { message: String },
     /// Reply to `ClientFrame::Status`.
@@ -387,6 +393,8 @@ enum SrvEvent {
     WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16>, raw: bool },
     /// A subscriber asked to open a new terminal tab (the phone's "New terminal").
     NewTerminal,
+    /// A subscriber asked for a pane's scrollback (paging up in the xterm.js renderer).
+    PaneHistory { pane: usize, lines: usize },
 }
 
 /// Push the current structured board (and briefing, when one exists) to every
@@ -684,6 +692,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     }
                 }
             }
+            Ok(SrvEvent::PaneHistory { pane, lines }) => {
+                if let Some((bytes, rows, total)) = app.pane_history(pane, lines) {
+                    let b64 = B64.encode(&bytes);
+                    subscribers.retain_mut(|s| {
+                        write_frame(s, &ServerFrame::PaneHistory { pane, b64: b64.clone(), lines: rows, total }).is_ok()
+                    });
+                }
+            }
             Ok(SrvEvent::NewTerminal) => {
                 // Phone tapped "New terminal": open a terminal in a new tab (additive — the
                 // desktop client's ownership is untouched). It surfaces on the next board push.
@@ -883,6 +899,11 @@ fn client_connection(
                             break;
                         }
                     }
+                    Ok(ClientFrame::PaneHistory { pane, lines }) => {
+                        if tx.send(SrvEvent::PaneHistory { pane, lines }).is_err() {
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1063,6 +1084,7 @@ pub fn client_main(name: &str) -> Result<()> {
                         Ok(ServerFrame::Briefing { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::PaneScreen { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::PaneOutput { .. }) => {} // subscriber-only, never on an attach
+                        Ok(ServerFrame::PaneHistory { .. }) => {} // subscriber-only, never on an attach
                         Err(_) => {}
                     },
                 }

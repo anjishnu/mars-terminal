@@ -2282,6 +2282,7 @@ fn selfcheck() -> Result<()> {
                             Ok(session::ServerFrame::Briefing { .. }) => {}
                             Ok(session::ServerFrame::PaneScreen { .. }) => {}
                             Ok(session::ServerFrame::PaneOutput { .. }) => {}
+                            Ok(session::ServerFrame::PaneHistory { .. }) => {}
                             Err(_) => {}
                         },
                         Err(_) => {} // timeout tick — keep waiting until deadline

@@ -458,6 +458,16 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                     }
                     // Raw PTY bytes of a specifically watched pane (the xterm.js renderer):
                     // seed + deltas, tagged with the pane id so the phone routes them.
+                    ServerFrame::PaneHistory { pane, b64, lines, total } => {
+                        if tx
+                            .send(format!(
+                                "{{\"t\":\"history\",\"paneId\":\"{pane}\",\"b64\":\"{b64}\",\"lines\":{lines},\"total\":{total}}}"
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     ServerFrame::PaneOutput { pane, b64 } => {
                         if tx
                             .send(format!("{{\"t\":\"output\",\"paneId\":\"{pane}\",\"b64\":\"{b64}\"}}"))
@@ -668,6 +678,14 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         }
         Some("unwatch") => {
             let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None, cols: None, rows: None, raw: false });
+        }
+        // Page upward in a watched pane: ask for `lines` of scrollback (xterm.js renderer).
+        Some("history") => {
+            let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
+            let lines = v.get("lines").and_then(|x| x.as_u64()).unwrap_or(200) as usize;
+            if let Some(pane) = pane {
+                let _ = session::write_frame(writer, &ClientFrame::PaneHistory { pane, lines });
+            }
         }
         // Open a new terminal tab in the session (additive; surfaces on the next board push).
         Some("new_terminal") => {
