@@ -468,6 +468,20 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                             break;
                         }
                     }
+                    // A window of a pane's transcript, addressed by line id.
+                    ServerFrame::PaneLines { pane, from, first, total, rows } => {
+                        let rows: Vec<String> =
+                            rows.iter().map(|r| format!("\"{r}\"")).collect();
+                        if tx
+                            .send(format!(
+                                "{{\"t\":\"lines\",\"paneId\":\"{pane}\",\"from\":{from},\"first\":{first},\"total\":{total},\"rows\":[{}]}}",
+                                rows.join(",")
+                            ))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     ServerFrame::PaneOutput { pane, b64 } => {
                         if tx
                             .send(format!("{{\"t\":\"output\",\"paneId\":\"{pane}\",\"b64\":\"{b64}\"}}"))
@@ -694,6 +708,16 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let lines = v.get("lines").and_then(|x| x.as_u64()).unwrap_or(200) as usize;
             if let Some(pane) = pane {
                 let _ = session::write_frame(writer, &ClientFrame::PaneHistory { pane, lines });
+            }
+        }
+        // A window of a watched pane's transcript, half-open [from, to) in line ids. A request
+        // with an empty range is how a client asks "how much is there?" before it asks for any.
+        Some("lines") => {
+            let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
+            let from = v.get("from").and_then(|x| x.as_u64()).unwrap_or(0);
+            let to = v.get("to").and_then(|x| x.as_u64()).unwrap_or(0);
+            if let Some(pane) = pane {
+                let _ = session::write_frame(writer, &ClientFrame::PaneLines { pane, from, to });
             }
         }
         // Open a new terminal tab in the session (additive; surfaces on the next board push).

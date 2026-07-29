@@ -92,6 +92,10 @@ pub enum ClientFrame {
     /// A raw watcher paging upward: send the last `lines` of that pane's scrollback
     /// (ending with the live screen) so the phone can rebuild its buffer with history.
     PaneHistory { pane: usize, lines: usize },
+    /// A window of a pane's transcript, half-open `[from, to)` in line ids. Supersedes
+    /// `PaneHistory`: a numbered line means the same thing on both sides of the wire, where
+    /// "the last N rows of scrollback" meant something different after every reflow.
+    PaneLines { pane: usize, from: u64, to: u64 },
     /// A Rover subscriber asks the daemon to open a NEW terminal tab in this session —
     /// additive (never takes over the desktop client). It appears as a new workspace on the
     /// board and is watchable like any other pane.
@@ -109,6 +113,10 @@ pub enum ServerFrame {
     /// Reply to `PaneHistory`: scrollback + live screen, with how many history rows are
     /// included and how deep the pane's history actually goes (for a "X of Y" readout).
     PaneHistory { pane: usize, b64: String, lines: usize, total: usize },
+    /// Reply to `PaneLines`: one base64 blob per line starting at `from`, plus the retained
+    /// floor (`first`) and the id the next line will get (`total`) — enough for an honest
+    /// scrollbar and an unambiguous "this is the top".
+    PaneLines { pane: usize, from: u64, first: u64, total: u64, rows: Vec<String> },
     /// Connection is over (detach, quit, takeover, refusal) — show `message`.
     Exit { message: String },
     /// Reply to `ClientFrame::Status`.
@@ -398,6 +406,8 @@ enum SrvEvent {
     NewTerminal,
     /// A subscriber asked for a pane's scrollback (paging up in the xterm.js renderer).
     PaneHistory { pane: usize, lines: usize },
+    /// A subscriber asked for a window of a pane's transcript, by line id.
+    PaneLines { pane: usize, from: u64, to: u64 },
     /// The phone reported the greeting it opened with (briefing continuity).
     RoverGreeting(String),
 }
@@ -729,6 +739,18 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     });
                 }
             }
+            Ok(SrvEvent::PaneLines { pane, from, to }) => {
+                if let Some((from, first, total, rows)) = app.pane_lines(pane, from, to) {
+                    let rows: Vec<String> = rows.iter().map(|r| B64.encode(r)).collect();
+                    subscribers.retain_mut(|s| {
+                        write_frame(
+                            s,
+                            &ServerFrame::PaneLines { pane, from, first, total, rows: rows.clone() },
+                        )
+                        .is_ok()
+                    });
+                }
+            }
             Ok(SrvEvent::NewTerminal) => {
                 // Phone tapped "New terminal": open a terminal in a new tab (additive — the
                 // desktop client's ownership is untouched). It surfaces on the next board push.
@@ -944,6 +966,11 @@ fn client_connection(
                             break;
                         }
                     }
+                    Ok(ClientFrame::PaneLines { pane, from, to }) => {
+                        if tx.send(SrvEvent::PaneLines { pane, from, to }).is_err() {
+                            break;
+                        }
+                    }
                     Ok(ClientFrame::RoverGreeting { text }) => {
                         if tx.send(SrvEvent::RoverGreeting(text)).is_err() {
                             break;
@@ -1130,6 +1157,7 @@ pub fn client_main(name: &str) -> Result<()> {
                         Ok(ServerFrame::PaneScreen { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::PaneOutput { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::PaneHistory { .. }) => {} // subscriber-only, never on an attach
+                        Ok(ServerFrame::PaneLines { .. }) => {} // subscriber-only, never on an attach
                         Err(_) => {}
                     },
                 }

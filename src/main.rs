@@ -1143,7 +1143,7 @@ fn selfcheck() -> Result<()> {
     let startup_probe = std::time::Duration::from_millis(
         tuning::Tuning::default().terminal_startup_probe_ms,
     );
-    let mut sh = terminal::spawn(0, 24, 80, 1000, None, None, None, startup_probe, tx)?;
+    let mut sh = terminal::spawn(0, 24, 80, 1000, 1 << 20, None, None, None, startup_probe, tx)?;
     let screen_has_line = |sh: &terminal::Term, needle: &str| {
         sh.screen()
             .contents()
@@ -1192,6 +1192,106 @@ fn selfcheck() -> Result<()> {
         assert_eq!(text, "COPYME123", "terminal selection extraction wrong: {text:?}");
     }
     println!("[selfcheck] terminal mouse-copy ....... PASS");
+
+    // 15b. The pane transcript: every line that scrolls off is captured, numbered, exactly
+    //      once, in order. Numbered output makes each of the failures this replaced
+    //      unambiguous — a duplicate, a gap, or a reversed page all break the same assert.
+    {
+        // Formatted rows carry SGR bytes, so compare through a real ANSI interpreter rather
+        // than on the raw bytes (see AGENTS.md).
+        let plain = |row: &[u8]| -> String {
+            let mut p = vt100::Parser::new(1, 400, 0);
+            p.process(row);
+            p.screen().contents().trim().to_string()
+        };
+        if shell_is_powershell() {
+            sh.send_bytes(b"1..300 | % { 'LINELOG_{0:d3}' -f $_ }\r");
+        } else {
+            sh.send_bytes(b"seq 1 300 | awk '{printf \"LINELOG_%03d\\n\", $1}'\r");
+        }
+        assert!(
+            wait_until(|| screen_has_line(&sh, "LINELOG_300")),
+            "transcript fixture never ran: {:?}",
+            sh.screen().contents()
+        );
+        while rx.try_recv().is_ok() {}
+
+        let (from, first, total, rows) = sh.lines(0, u64::MAX);
+        assert_eq!(from, first, "full read should start at the retained floor");
+        assert_eq!(total - first, rows.len() as u64, "total disagrees with what was returned");
+        let seen: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| plain(r).strip_prefix("LINELOG_").and_then(|n| n.parse().ok()))
+            .collect();
+        assert!(seen.len() >= 250, "transcript captured only {} of 300 lines", seen.len());
+        assert!(
+            seen.windows(2).all(|w| w[1] == w[0] + 1),
+            "transcript duplicated, gapped or reordered: {:?}",
+            seen.windows(2).find(|w| w[1] != w[0] + 1)
+        );
+
+        // A window means the same slice a full read would have handed back at those ids.
+        let mid = first + (total - first) / 2;
+        let (wfrom, _, _, wrows) = sh.lines(mid, mid + 10);
+        assert_eq!(wfrom, mid, "window start not echoed");
+        assert_eq!(wrows.len(), 10, "window returned {} rows, wanted 10", wrows.len());
+        assert_eq!(
+            plain(&wrows[0]),
+            plain(&rows[(mid - first) as usize]),
+            "window {mid} disagrees with the full read at the same id"
+        );
+
+        // An empty range is how a client asks "how much is there?" before asking for any.
+        let (_, bf, bt, brows) = sh.lines(0, 0);
+        assert!(brows.is_empty(), "empty range returned rows");
+        assert_eq!((bf, bt), (first, total), "bounds probe disagrees with the full read");
+        // Past the end is empty and clamped, never a panic or a wrapped window.
+        let (ofrom, _, _, orows) = sh.lines(total + 500, total + 600);
+        assert!(orows.is_empty() && ofrom == total, "out-of-range window not clamped");
+    }
+    println!("[selfcheck] pane transcript ............ PASS");
+
+    // 15d. Overwriting in place is not history. A line redrawn over itself must reach the
+    //      transcript once, in its final form — this is what stopped a repainting program
+    //      from stacking near-identical copies of the same command.
+    {
+        let plain = |row: &[u8]| -> String {
+            let mut p = vt100::Parser::new(1, 400, 0);
+            p.process(row);
+            p.screen().contents().trim().to_string()
+        };
+        let before = sh.lines(0, 0).2;
+        if shell_is_powershell() {
+            sh.send_bytes(b"Write-Host \"ZAPMEE`rKEEPME\"\r");
+        } else {
+            sh.send_bytes(b"printf 'ZAPMEE\\rKEEPME\\n'\r");
+        }
+        assert!(wait_until(|| screen_has_line(&sh, "KEEPME")), "repaint fixture never ran");
+        // Push it off the screen so it has to travel through the transcript to be seen.
+        if shell_is_powershell() {
+            sh.send_bytes(b"1..40 | % { 'PUSH' }\r");
+        } else {
+            sh.send_bytes(b"seq 1 40 | awk '{print \"PUSH\"}'\r");
+        }
+        assert!(wait_until(|| sh.lines(0, 0).2 > before + 40), "transcript did not advance");
+        while rx.try_recv().is_ok() {}
+        let (_, _, _, rows) = sh.lines(before, u64::MAX);
+        let text: Vec<String> = rows.iter().map(|r| plain(r)).collect();
+        assert_eq!(
+            text.iter().filter(|l| l.as_str() == "KEEPME").count(),
+            1,
+            "overwritten line reached the transcript {} times",
+            text.iter().filter(|l| l.as_str() == "KEEPME").count()
+        );
+        // Trim-equality, not `contains`: the shell echoes the command line itself, and that
+        // line legitimately holds the literal `ZAPMEE` — a transcript records what was typed.
+        // What must not survive is a ROW that still reads as the overwritten text.
+        assert!(
+            !text.iter().any(|l| l == "ZAPMEE"),
+            "overwritten row survived into the transcript: {text:?}"
+        );
+    }
+    println!("[selfcheck] transcript repaint .......... PASS");
 
     // 15b. Nested open: `mars <file>` from inside a session routes here and opens
     //      the file in a NEW tab, switched-to (instead of nesting a second Mars).
@@ -1247,7 +1347,7 @@ fn selfcheck() -> Result<()> {
     assert_eq!(sh.view_offset(), 0, "history_tail left the view scrolled back");
     println!("[selfcheck] terminal scrollback ........ PASS");
 
-    // 15c. Dead-shell lifecycle: exit → Exited event → Enter recycles the pane.
+    // 15e. Dead-shell lifecycle: exit → Exited event → Enter recycles the pane.
     let mut app = App::new(None)?;
     app.handle_key(kc(KeyCode::Char(' ')))?;
     app.handle_key(k(KeyCode::Char('!')))?;
@@ -2298,6 +2398,7 @@ fn selfcheck() -> Result<()> {
                             Ok(session::ServerFrame::PaneScreen { .. }) => {}
                             Ok(session::ServerFrame::PaneOutput { .. }) => {}
                             Ok(session::ServerFrame::PaneHistory { .. }) => {}
+                            Ok(session::ServerFrame::PaneLines { .. }) => {}
                             Err(_) => {}
                         },
                         Err(_) => {} // timeout tick — keep waiting until deadline

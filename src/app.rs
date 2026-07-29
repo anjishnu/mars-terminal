@@ -1830,6 +1830,16 @@ impl App {
     pub fn pane_history(&self, pane_id: crate::pane::PaneId, lines: usize) -> Option<(Vec<u8>, usize, usize)> {
         Some(self.pane_term(pane_id)?.history_ansi(lines))
     }
+    /// A window of a pane's transcript for a phone scrolling upward: `(from, first, total, rows)`.
+    /// Addressed by line id, so a window means the same thing across reconnects and reflows.
+    pub fn pane_lines(
+        &self,
+        pane_id: crate::pane::PaneId,
+        from: u64,
+        to: u64,
+    ) -> Option<(u64, u64, u64, Vec<Vec<u8>>)> {
+        Some(self.pane_term(pane_id)?.lines(from, to))
+    }
     pub fn take_pane_raw_delta(&self, pane_id: crate::pane::PaneId) -> Option<Vec<u8>> {
         Some(self.pane_term(pane_id)?.take_raw_delta())
     }
@@ -4944,6 +4954,7 @@ impl App {
             rows,
             cols,
             scrollback,
+            self.tuning.terminal_line_log_bytes,
             cwd,
             self.session_name.as_deref(),
             self.session_instance_id.as_deref(),

@@ -125,6 +125,7 @@ pub struct Tuning {
     pub terminal_default_rows: u16,
     pub terminal_default_cols: u16,
     pub terminal_scrollback_lines: usize,
+    pub terminal_line_log_bytes: usize,
     pub terminal_startup_probe_ms: u64,
     pub autosave_secs: u64,
     pub project_index_max: usize,
@@ -212,6 +213,7 @@ impl Default for Tuning {
             terminal_default_rows: 24,
             terminal_default_cols: 80,
             terminal_scrollback_lines: 10_000,
+            terminal_line_log_bytes: 8 * 1024 * 1024,
             terminal_startup_probe_ms: 5000,
             autosave_secs: 30,
             project_index_max: 20_000,
@@ -464,6 +466,10 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "1 = when you detach, the agent captures what you were working \
              toward, so the reattach briefing can report progress on it; \
              0 = off.")),
+        ("terminal_line_log_bytes", knob(json!(d.terminal_line_log_bytes),
+            "Bytes of transcript each terminal pane keeps for the phone: every line that has \
+             scrolled off, numbered, as formatted ANSI. This is what the phone pages through, \
+             so it sets how far back scrollback reaches. Oldest lines are dropped past it.")),
         ("mobile_pane_interval_ms", knob(json!(d.mobile_pane_interval_ms),
             "How often the watched pane's live screen is pushed to the phone, in ms. Separate \
              from the board's cadence because this one is felt as typing latency. Identical \
@@ -623,6 +629,8 @@ pub fn load() -> Tuning {
             get_u64(&map, "mobile_push_interval_ms", t.mobile_push_interval_ms).max(1);
         t.mobile_pane_interval_ms =
             get_u64(&map, "mobile_pane_interval_ms", t.mobile_pane_interval_ms).max(1);
+        t.terminal_line_log_bytes =
+            get_u64(&map, "terminal_line_log_bytes", t.terminal_line_log_bytes as u64).max(64 * 1024) as usize;
         t.rover_map_min_secs = get_u64(&map, "rover_map_min_secs", t.rover_map_min_secs).max(1);
         t.rover_brief_min_secs = get_u64(&map, "rover_brief_min_secs", t.rover_brief_min_secs).max(1);
         if let Some(list) = map.get("project_ignore").and_then(|e| e.value.as_array()) {

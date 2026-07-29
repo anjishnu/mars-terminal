@@ -32,6 +32,94 @@ struct StartupInput {
 /// lines of terminal output while staying trivial next to a session's other state.
 const RAW_HISTORY_BYTES: usize = 512 * 1024;
 
+/// Feed the parser in slices this small so a single burst can never scroll more lines than
+/// the parser retains. One byte can be one line (`\n`), so a chunk of N bytes produces at
+/// most N lines — keep it well under `terminal_scrollback_lines` and nothing is ever lost
+/// between the moment it scrolls off and the moment we read it.
+const CAPTURE_CHUNK: usize = 512;
+
+/// A pane's transcript: every line that has scrolled off the top of its screen, laid out by
+/// the emulator at the pane's real geometry and kept as formatted ANSI.
+///
+/// The unit is a numbered LINE, not "a screenful at scrollback offset N". Screen-relative
+/// addressing is what made phone history duplicate and stall: an over-ask clamped into an
+/// overlapping page, and the live screen kept arriving twice. A line id is assigned once,
+/// never reused, and stays valid across reconnects, reflows and resizes.
+struct LineLog {
+    rows: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// Id of `rows[0]`; `first + rows.len()` is the id the next line will get.
+    first: u64,
+    cap: usize,
+}
+
+impl LineLog {
+    fn push(&mut self, row: Vec<u8>) {
+        self.bytes += row.len();
+        self.rows.push_back(row);
+        while self.bytes > self.cap && self.rows.len() > 1 {
+            if let Some(old) = self.rows.pop_front() {
+                self.bytes -= old.len();
+                self.first += 1;
+            }
+        }
+    }
+}
+
+/// Feed `bytes` to the pane's parser, appending whatever scrolls off the top to its transcript.
+///
+/// vt100 exposes the scrollback OFFSET but not its DEPTH, and the depth saturates at the
+/// configured limit, so "how much is stored now" can't be differenced to find what just
+/// scrolled. The offset can: while it is non-zero, vt100 bumps it once per scrolled line to
+/// keep a scrolled-back view pinned to the same content. Park it at 1 before processing and it
+/// comes back as `1 + lines scrolled off`.
+///
+/// This reads the LIVE parser rather than replaying a byte ring into a private one. The ring
+/// held screen UPDATES, not a transcript, so it had to be re-simulated at exactly the pane's
+/// geometry on every request — expensive, and wrong the moment the geometry was off by a row.
+/// Here the pane's own emulator does the layout once, as it happens, at the only geometry that
+/// was ever correct. Programs that repaint inside a scroll region never scroll the grid, so they
+/// never enter the transcript — which is what stopped commands appearing three times.
+fn capture(p: &mut vt100::Parser, bytes: &[u8], log: &Mutex<LineLog>) {
+    let saved = p.screen().scrollback(); // the desktop user's own scroll position
+    let mut total_scrolled = 0usize;
+    for chunk in bytes.chunks(CAPTURE_CHUNK) {
+        p.set_scrollback(1);
+        let armed = p.screen().scrollback(); // 0 until any history exists at all
+        p.process(chunk);
+        let scrolled = if armed > 0 {
+            p.screen().scrollback().saturating_sub(armed)
+        } else {
+            // Nothing was stored before this chunk, so the whole depth is new.
+            p.set_scrollback(usize::MAX);
+            p.screen().scrollback()
+        };
+        if scrolled == 0 {
+            continue;
+        }
+        total_scrolled += scrolled;
+        // At offset `back` the top `back` visible rows ARE the newest `back` history lines, so
+        // walking `back` down by a screenful at a time yields them oldest-first with no overlap.
+        let (rows, cols) = p.screen().size();
+        let mut back = scrolled;
+        let mut harvested: Vec<Vec<u8>> = Vec::with_capacity(scrolled);
+        while back > 0 {
+            p.set_scrollback(back);
+            let take = (rows as usize).min(back);
+            harvested.extend(p.screen().rows_formatted(0, cols).take(take));
+            back -= take;
+        }
+        if let Ok(mut l) = log.lock() {
+            for row in harvested {
+                l.push(row);
+            }
+        }
+    }
+    // Put the view back. A reader scrolled up stays on the same content — which is what vt100
+    // would have done by itself had we not parked the offset to count with it.
+    p.set_scrollback(if saved > 0 { saved + total_scrolled } else { 0 });
+}
+
 pub struct Term {
     /// The shell has exited; the pane shows a notice until the user closes it.
     pub exited: bool,
@@ -61,6 +149,9 @@ pub struct Term {
     /// parser, which discards its scrollback — so watching destroyed the very history we were
     /// trying to read. Bytes survive resizes because they are just bytes.
     raw_history: Arc<Mutex<std::collections::VecDeque<u8>>>,
+    /// This pane's transcript — every line that has scrolled off, numbered. Written by the
+    /// reader thread as it happens; read by `lines()` for a phone paging upward.
+    line_log: Arc<Mutex<LineLog>>,
 }
 
 /// Bound on the raw-tap buffer so a firehose against an absent/slow drain can't grow
@@ -75,6 +166,7 @@ pub fn spawn(
     rows: u16,
     cols: u16,
     scrollback: usize,
+    line_log_bytes: usize,
     cwd: Option<std::path::PathBuf>,
     session: Option<&str>,
     session_instance_id: Option<&str>,
@@ -119,9 +211,16 @@ pub fn spawn(
     let raw_tap = Arc::new(Mutex::new(Vec::<u8>::new()));
     let raw_tap_on = Arc::new(AtomicBool::new(false));
     let raw_history = Arc::new(Mutex::new(std::collections::VecDeque::<u8>::new()));
+    let line_log = Arc::new(Mutex::new(LineLog {
+        rows: std::collections::VecDeque::new(),
+        bytes: 0,
+        first: 0,
+        cap: line_log_bytes,
+    }));
     let reader_raw_tap = raw_tap.clone();
     let reader_raw_tap_on = raw_tap_on.clone();
     let reader_raw_history = raw_history.clone();
+    let reader_line_log = line_log.clone();
     let output_tx = tx.clone();
     // Captured for the OSC-133 ledger: exact command records are keyed by session
     // (skipped in standalone mode, which has no session log). The surface label is
@@ -140,7 +239,7 @@ pub fn spawn(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     if let Ok(mut p) = reader_parser.lock() {
-                        p.process(&buf[..n]);
+                        capture(&mut p, &buf[..n], &reader_line_log);
                     }
                     // Raw streaming to a Rover xterm.js subscriber: forward the same bytes we
                     // just fed the parser (only while a phone is watching this pane in raw mode).
@@ -242,6 +341,7 @@ pub fn spawn(
         raw_tap,
         raw_tap_on,
         raw_history,
+        line_log,
     })
 }
 
@@ -522,6 +622,25 @@ impl Term {
             out.extend_from_slice(b"\x1b[0m\r\n");
         }
         (out, keep.len(), depth.max(keep.len()))
+    }
+
+    /// A window of this pane's transcript, half-open `[from, to)`, clamped to what is retained.
+    /// Returns `(from, first, total, rows)`: `from` is the id of `rows[0]` after clamping,
+    /// `first` the oldest id still held, `total` the id the next line will get. Those two are
+    /// what lets a client draw an honest scrollbar and know when it has genuinely hit the top —
+    /// as opposed to inferring it from a short reply, which is how paging used to latch shut.
+    ///
+    /// An empty window is a legitimate request: `lines(0, 0)` answers "how much is there?"
+    /// without transferring anything.
+    pub fn lines(&self, from: u64, to: u64) -> (u64, u64, u64, Vec<Vec<u8>>) {
+        let Ok(l) = self.line_log.lock() else { return (0, 0, 0, Vec::new()) };
+        let total = l.first + l.rows.len() as u64;
+        let lo = from.clamp(l.first, total);
+        let hi = to.clamp(lo, total);
+        let rows = ((lo - l.first) as usize..(hi - l.first) as usize)
+            .filter_map(|i| l.rows.get(i).cloned())
+            .collect();
+        (lo, l.first, total, rows)
     }
 
     /// Snap back to the live screen (any keystroke does this).
