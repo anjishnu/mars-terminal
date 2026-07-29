@@ -440,14 +440,19 @@ impl Term {
     /// preserved because we emit formatted rows, not plain text.
     /// A readable transcript for a phone paging upward. Returns `(bytes, rows, total)`.
     ///
-    /// Replay the retained bytes into a PRIVATE parser made `lines` tall, then emit its FINAL
-    /// SCREEN. That is the whole trick: a repainting program (Claude Code, any Ink CLI) rewrites
-    /// the same cells, so on a tall grid its repaints overwrite in place and collapse to one
-    /// coherent screen — exactly what makes the daemon's live parser look clean. Reading the
-    /// replay's SCROLLBACK instead captured every intermediate frame, which is where the
-    /// duplication came from. Private, so unlike asking for a taller grid it never resizes the
-    /// real PTY (that is clamped to 120 rows precisely because it changes what the program
-    /// draws for everyone, including the desktop).
+    /// Replay the retained bytes into a PRIVATE parser sized EXACTLY like the real pane, then
+    /// page back through its scrollback. The geometry is the whole point. Those bytes are screen
+    /// updates carrying absolute cursor moves, scroll regions and clears that a program computed
+    /// for a `self.rows` x `self.cols` grid; replaying them into a grid of any other size sends
+    /// each repaint somewhere the program never meant, so repaints stop landing on top of each
+    /// other and pile up as near-identical copies instead. Both earlier attempts replayed into a
+    /// grid `lines` tall and both duplicated, for exactly that reason — reading the final screen
+    /// rather than the scrollback changed which copies survived, not whether they were made.
+    ///
+    /// At the true size the replay re-simulates the pane: repaints overwrite in place and only
+    /// genuinely scrolled-off lines enter scrollback, so what comes back is what the desktop
+    /// terminal's own scrollback holds. Private, so it never resizes the real PTY — and fed from
+    /// the byte ring rather than the live parser, whose scrollback the phone's reflow discards.
     pub fn history_ansi(&self, lines: usize) -> (Vec<u8>, usize, usize) {
         let Ok(h) = self.raw_history.lock() else { return (Vec::new(), 0, 0) };
         let raw: Vec<u8> = h.iter().copied().collect();
@@ -456,23 +461,64 @@ impl Term {
             return (Vec::new(), 0, 0);
         }
         let cols = self.cols.max(20);
-        let tall = lines.clamp(24, 4000) as u16;
-        let mut p = vt100::Parser::new(tall, cols, 0); // no scrollback: the screen IS the answer
+        let rows = self.rows.max(4);
+        let step = rows as usize;
+        let want = lines.clamp(24, 4000);
+        let mut p = vt100::Parser::new(rows, cols, want + step);
         p.process(&raw);
-        let rows: Vec<Vec<u8>> = p.screen().rows_formatted(0, cols).collect();
+
+        // Page back a screenful at a time, newest first. vt100 CLAMPS `set_scrollback` to the
+        // history that actually exists, so an over-ask silently returns a page overlapping the
+        // one before it — trim that overlap off the bottom or the shortfall reappears as
+        // duplication, which is the same bug wearing a different hat.
+        let mut pages: Vec<(Vec<Vec<u8>>, Vec<String>)> = Vec::new();
+        let mut off = 0usize;
+        let depth;
+        loop {
+            p.set_scrollback(off);
+            let actual = p.screen().scrollback();
+            let mut fmt: Vec<Vec<u8>> = p.screen().rows_formatted(0, cols).collect();
+            let mut txt: Vec<String> = p.screen().rows(0, cols).collect();
+            let overlap = off.saturating_sub(actual);
+            if overlap > 0 {
+                fmt.truncate(fmt.len().saturating_sub(overlap));
+                txt.truncate(txt.len().saturating_sub(overlap));
+            }
+            if !fmt.is_empty() {
+                pages.push((fmt, txt));
+            }
+            if overlap > 0 || pages.len() * step >= want {
+                depth = if overlap > 0 { actual } else { off + step };
+                break;
+            }
+            off += step;
+        }
+        pages.reverse(); // oldest screenful first
+
+        let mut fmt: Vec<Vec<u8>> = Vec::new();
+        let mut txt: Vec<String> = Vec::new();
+        for (f, t) in pages {
+            fmt.extend(f);
+            txt.extend(t);
+        }
+        // Drop the LIVE screen. The page at offset 0 is what's on screen right now, and the client
+        // already renders that itself — including it here is why the last screenful appeared twice.
+        // History is strictly what has scrolled OFF; the seam between the two is exactly here.
+        let live = step.min(fmt.len());
+        fmt.truncate(fmt.len() - live);
+        txt.truncate(txt.len() - live);
         // Blankness must be judged on the PLAIN text: a formatted row for an empty line still
-        // carries SGR bytes, so `is_empty()` is never true and a tall grid emitted ~2000 rows of
-        // black space. Use the text rows to find the real content window.
-        let text: Vec<String> = p.screen().rows(0, cols).collect();
-        let first = text.iter().position(|r| !r.trim().is_empty()).unwrap_or(text.len());
-        let last = text.iter().rposition(|r| !r.trim().is_empty()).map(|i| i + 1).unwrap_or(first);
-        let keep = &rows[first.min(rows.len())..last.min(rows.len())];
+        // carries SGR bytes, so `is_empty()` is never true and the emitted rows were all black
+        // space. Trim only the outer blank runs — interior blank lines are real output.
+        let first = txt.iter().position(|r| !r.trim().is_empty()).unwrap_or(txt.len());
+        let last = txt.iter().rposition(|r| !r.trim().is_empty()).map(|i| i + 1).unwrap_or(first);
+        let keep = &fmt[first.min(fmt.len())..last.min(fmt.len())];
         let mut out = Vec::new();
         for row in keep {
             out.extend_from_slice(row);
             out.extend_from_slice(b"\x1b[0m\r\n");
         }
-        (out, keep.len(), keep.len())
+        (out, keep.len(), depth.max(keep.len()))
     }
 
     /// Snap back to the live screen (any keystroke does this).
