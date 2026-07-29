@@ -35,8 +35,35 @@ pub fn log_dir() -> PathBuf {
         None => std::env::temp_dir().join("mars-llm"),
     }
 }
+/// One log file PER PROCESS. The daemon and `keyd` both write LLM records, and sharing one
+/// file tore lines badly enough that the log meant for diagnosing a failure could not itself be
+/// parsed. Readers glob `log_files()`; nothing else changes.
 pub fn log_path() -> PathBuf {
-    log_dir().join("calls.jsonl")
+    log_dir().join(format!("calls-{}.jsonl", std::process::id()))
+}
+
+/// Every call log in the directory, newest last — including `calls.jsonl` from before the
+/// per-process split, so history stays readable.
+pub fn log_files() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let legacy = log_dir().join("calls.jsonl");
+    if legacy.exists() {
+        out.push(legacy);
+    }
+    if let Ok(entries) = std::fs::read_dir(log_dir()) {
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("calls-") && n.ends_with(".jsonl"))
+            })
+            .collect();
+        found.sort();
+        out.extend(found);
+    }
+    out
 }
 /// Behavioral outcomes (accept/edit/reject of a suggestion) land here, keyed by
 /// `call_id`, to be joined against `calls.jsonl` offline. Separate file so the
@@ -69,8 +96,13 @@ fn append(path: &PathBuf, line: &serde_json::Value) {
         return;
     }
     let _ = std::fs::create_dir_all(log_dir());
+    // ONE write of ONE buffer. `writeln!` formats incrementally and can issue several
+    // syscalls, which is how half-records ended up in the log; an O_APPEND write of a single
+    // buffer lands whole or not at all.
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
+        let mut buf = line.to_string();
+        buf.push('\n');
+        let _ = f.write_all(buf.as_bytes());
     }
 }
 
@@ -91,6 +123,13 @@ pub fn event(kind: &str, mut fields: serde_json::Value) {
         obj.insert("session_id".into(), serde_json::json!(session_id()));
     }
     append(&log_path(), &fields);
+}
+
+/// A background task that did NOT run, and why. The absence of a call record was the only
+/// signal that auto-naming had stopped, and absence is not evidence anyone can act on — this
+/// makes "skipped, because already attempted" a line you can read.
+pub fn skipped(task: &str, reason: &str) {
+    event("skipped", serde_json::json!({ "task": task, "reason": reason }));
 }
 
 pub fn session_start() {
@@ -221,7 +260,14 @@ fn day_label(ts: u64) -> String {
 pub fn stats(raw: bool, json: bool, daily: bool, since_secs: Option<u64>) -> anyhow::Result<()> {
     let cutoff = since_secs.map(|w| now_secs().saturating_sub(w));
     let path = log_path();
-    let content = match std::fs::read_to_string(&path) {
+    // Read EVERY per-process log, not just this process's own — the daemon and `keyd` each
+    // keep their own now, and a report drawn from one of them is a report of half the calls.
+    let content: String = log_files()
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = match if content.trim().is_empty() { Err(()) } else { Ok(content) } {
         Ok(c) => c,
         Err(_) => {
             if json {

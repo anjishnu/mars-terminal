@@ -159,6 +159,15 @@ pub enum BrokerRequest {
         host: Option<String>,
         #[serde(default)]
         session: Option<String>,
+        /// What the CALLER was doing ("auto_name", "summarize", …) and the call id it minted.
+        /// Without these a brokered call lands in the home log as an anonymous "remote", so a
+        /// background feature failing at the broker is untraceable from the side that asked —
+        /// which is how auto-naming failed invisibly for three days. Optional: an older remote
+        /// omits them and is logged as before.
+        #[serde(default)]
+        task: Option<String>,
+        #[serde(default)]
+        origin_call_id: Option<u64>,
     },
 }
 
@@ -313,6 +322,11 @@ pub fn find_live_auth_sock(dir: &std::path::Path) -> Option<String> {
 /// socket, and answers `Chat` by running the real LLM call — the only process
 /// that ever constructs an `Authorization` header.
 pub fn keyd_main() -> Result<()> {
+    // The broker resolves its own credentials DIRECTLY. Without this, `AgentConfig::from_env()`
+    // inside the request handler discovers this very socket and hands the call back to us —
+    // latent before, but a live loop now that a brokered failure falls through to other
+    // candidates instead of returning.
+    std::env::set_var("MARS_NO_BROKER", "1");
     let cfg = AgentConfig::from_env();
     if !cfg.is_configured() {
         anyhow::bail!(
@@ -387,11 +401,13 @@ fn handle_conn(stream: crate::sys::control::Stream) -> Result<()> {
             temperature,
             host,
             session,
+            task,
+            origin_call_id,
         } = req;
         // Status push: a brokered call is proof the remote's agent is alive —
         // refresh the fleet so `mars ls` shows it as current, not stale.
         if let Some(h) = &host {
-            crate::fleet::fleet_status(h, session, "agent active");
+            crate::fleet::fleet_status(h, session.clone(), "agent active");
         }
         let resp = if version != BROKER_VERSION {
             BrokerResponse::Error {
@@ -408,7 +424,15 @@ fn handle_conn(stream: crate::sys::control::Stream) -> Result<()> {
             }
             c.max_tokens = max_tokens;
             c.temperature = temperature;
-            match agent::chat(&c, messages, "remote") {
+            // Log under the CALLER's task, not a blanket "remote", and record the link so a
+            // brokered call can be joined to the record on the side that asked for it.
+            let tag = task.clone().unwrap_or_else(|| "remote".to_string());
+            crate::llm_log::event(
+                "broker_call",
+                serde_json::json!({ "task": tag, "origin_call_id": origin_call_id,
+                                    "host": host.clone(), "session": session.clone() }),
+            );
+            match agent::chat(&c, messages, &tag) {
                 Ok(text) => BrokerResponse::Chat { text },
                 Err(e) => BrokerResponse::Error {
                     message: e.to_string(),
@@ -426,6 +450,8 @@ pub fn chat_via_broker(
     sock: &str,
     cfg: &AgentConfig,
     messages: Vec<serde_json::Value>,
+    task: &str,
+    origin_call_id: u64,
 ) -> Result<String> {
     let stream = crate::sys::control::connect(sock).map_err(|e| {
         anyhow::anyhow!("home broker unreachable ({e}); is `mars keyd` running + the tunnel up?")
@@ -455,6 +481,8 @@ pub fn chat_via_broker(
             temperature: cfg.temperature,
             host: crate::sys::proc::hostname(),
             session: std::env::var("MARS_SESSION").ok(),
+            task: Some(task.to_string()),
+            origin_call_id: Some(origin_call_id),
         },
     )?;
     let mut line = String::new();

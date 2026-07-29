@@ -354,6 +354,53 @@ pub struct AwayEvent {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AwayKind { NeedsYou, Done, Context }
 
+/// A background task that may be retried. Recorded on OUTCOME, never on dispatch.
+///
+/// The bug this exists to prevent: naming marked a tab "attempted" immediately before the LLM
+/// call, so any failure — a provider out of credit, a broker that could not resolve DNS —
+/// retired that tab permanently, and a transient blip became indistinguishable from a
+/// deliberate decision. Backoff makes a failure cost a delay instead of the feature.
+#[derive(Clone, Debug, Default)]
+pub struct Attempt {
+    /// How many times we have dispatched and lost.
+    pub failures: u32,
+    /// Frame tick before which we will not try again.
+    pub next_tick: u64,
+    /// Settled: named, manually renamed, or out of retries. Never tried again.
+    pub done: bool,
+}
+
+/// Backoff between naming retries. Short enough that a blip costs a minute, long enough that a
+/// genuinely dead provider is not hammered; after the last one the task goes dormant.
+const ATTEMPT_BACKOFF_SECS: [u64; 3] = [60, 300, 1800];
+
+impl Attempt {
+    /// May we dispatch on this tick?
+    pub fn ready(&self, tick: u64) -> bool {
+        !self.done && tick >= self.next_tick
+    }
+    /// Sent — hold off until the outcome lands, then let `succeeded`/`failed` decide. The hold
+    /// is what stops a slow call being dispatched again every tick.
+    pub fn dispatch(&mut self, tick: u64, poll_ms: u64) {
+        self.next_tick = tick + (30_000 / poll_ms.max(1)).max(1);
+    }
+    pub fn succeeded(&mut self) {
+        self.done = true;
+    }
+    /// Schedule the next try, or go dormant once the schedule is exhausted.
+    pub fn failed(&mut self, tick: u64, poll_ms: u64) {
+        let i = self.failures as usize;
+        self.failures += 1;
+        match ATTEMPT_BACKOFF_SECS.get(i) {
+            Some(secs) => self.next_tick = tick + (secs * 1000 / poll_ms.max(1)).max(1),
+            None => self.done = true,
+        }
+    }
+    pub fn settle(&mut self) {
+        self.done = true;
+    }
+}
+
 pub struct App {
     pub buffers: HashMap<BufferId, Buffer>,
     pub panes: HashMap<PaneId, Pane>,
@@ -534,7 +581,12 @@ pub struct App {
     /// The line the phone greeted the captain with this session — fed to the briefing so the
     /// narrative continues from it instead of repeating or contradicting it.
     pub rover_greeting: String,
-    auto_name_attempted: std::collections::HashSet<TabId>,
+    /// Naming attempts per tab. Recorded on OUTCOME, never on dispatch: the previous
+    /// `HashSet<TabId>` was inserted BEFORE the call, so one transient failure retired that
+    /// tab's naming for the life of the daemon — which is how auto-naming went silent for
+    /// three days after an out-of-credit provider. A key present with `done` means settled
+    /// (named, or manually renamed, or out of retries).
+    auto_name_attempts: std::collections::HashMap<TabId, Attempt>,
     /// Shell composer: the query is a ready-to-run command (translated or
     /// typed literally with no key) — the next Enter runs it.
     pub shell_ready: bool,
@@ -544,7 +596,7 @@ pub struct App {
     translate_call_id: Option<u64>,
     translate_request: Option<String>,
     /// Session auto-naming: fired once per still-numeric session.
-    session_name_attempted: bool,
+    session_name_attempt: Attempt,
     /// Undo coalescing: the kind of edit run currently in progress.
     edit_run: EditRun,
     /// One-shot bypass for the live-terminal close gate: set by the confirm
@@ -702,11 +754,11 @@ impl App {
             rover_prev_brief: String::new(),
             rover_active: false,
             rover_greeting: String::new(),
-            auto_name_attempted: std::collections::HashSet::new(),
+            auto_name_attempts: std::collections::HashMap::new(),
             shell_ready: false,
             translate_call_id: None,
             translate_request: None,
-            session_name_attempted: false,
+            session_name_attempt: Attempt::default(),
             close_confirmed: false,
             force_close_confirm: false,
             term_sel: None,
@@ -3266,7 +3318,7 @@ impl App {
                 let name = p.input.trim().to_string();
                 if !name.is_empty() {
                     let id = self.tab().id;
-                    self.auto_name_attempted.insert(id); // manual name opts out
+                    self.auto_name_attempts.entry(id).or_default().settle(); // manual name opts out
                     self.tab_mut().name = name;
                 }
             }
@@ -5299,8 +5351,17 @@ impl App {
                 AgentEvent::AnswerDelta { text } => {
                     self.agent_partial.get_or_insert_with(String::new).push_str(&text);
                 }
+                AgentEvent::NameFailed { tab_id } => {
+                    self.bg_busy = false;
+                    let (tick, poll) = (self.frame_tick, self.tuning.poll_interval_ms);
+                    match tab_id {
+                        Some(id) => self.auto_name_attempts.entry(id).or_default().failed(tick, poll),
+                        None => self.session_name_attempt.failed(tick, poll),
+                    }
+                }
                 AgentEvent::AutoName { tab_id, name } => {
                     self.bg_busy = false;
+                    self.auto_name_attempts.entry(tab_id).or_default().succeeded();
                     // Apply only if the tab still wears its default numeric
                     // name — a user rename always wins the race.
                     if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -5311,6 +5372,7 @@ impl App {
                 }
                 AgentEvent::SessionName { name } => {
                     self.bg_busy = false;
+                    self.session_name_attempt.succeeded();
                     // Rename only if still numeric (user/explicit names win).
                     let numeric = self
                         .session_name
@@ -6531,7 +6593,7 @@ impl App {
 
     /// One-shot AI naming of a still-numeric session (numbered → AI → explicit).
     fn maybe_auto_name_session(&mut self) {
-        if self.session_name_attempted || self.tuning.auto_name_secs == 0 {
+        if self.tuning.auto_name_secs == 0 || !self.session_name_attempt.ready(self.frame_tick) {
             return;
         }
         let numeric = self
@@ -6540,7 +6602,7 @@ impl App {
             .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
             .unwrap_or(false);
         if !numeric {
-            self.session_name_attempted = true; // explicitly named already
+            self.session_name_attempt.settle(); // explicitly named already
             return;
         }
         // Give it a little longer than tab-naming so there's real activity.
@@ -6550,9 +6612,11 @@ impl App {
         }
         let cfg = agent::AgentConfig::from_env();
         if !cfg.is_configured() {
+            crate::llm_log::skipped("name_session", "not_configured");
             return;
         }
-        self.session_name_attempted = true;
+        // Dispatched, not settled: the outcome decides whether this retries.
+        self.session_name_attempt.dispatch(self.frame_tick, self.tuning.poll_interval_ms);
         self.bg_busy = true;
         agent::name_session(cfg, self.screen_context(), self.agent_tx.clone());
     }
@@ -6571,7 +6635,10 @@ impl App {
         let tab = self.tab();
         let (tab_id, default_named) =
             (tab.id, tab.name.chars().all(|c| c.is_ascii_digit()));
-        if !default_named || self.auto_name_attempted.contains(&tab_id) {
+        if !default_named {
+            return;
+        }
+        if !self.auto_name_attempts.entry(tab_id).or_default().ready(self.frame_tick) {
             return;
         }
         // Only bother once there's something to name.
@@ -6589,9 +6656,14 @@ impl App {
         }
         let cfg = agent::AgentConfig::from_env();
         if !cfg.is_configured() {
+            crate::llm_log::skipped("auto_name", "not_configured");
             return;
         }
-        self.auto_name_attempted.insert(tab_id);
+        let poll = self.tuning.poll_interval_ms;
+        let tick = self.frame_tick;
+        if let Some(a) = self.auto_name_attempts.get_mut(&tab_id) {
+            a.dispatch(tick, poll);
+        }
         self.bg_busy = true;
         agent::auto_name(cfg, tab_id, self.screen_context(), self.agent_tx.clone());
     }

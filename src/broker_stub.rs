@@ -42,6 +42,8 @@ pub fn chat_via_broker(
     _sock: &str,
     _cfg: &AgentConfig,
     _messages: Vec<serde_json::Value>,
+    _task: &str,
+    _origin_call_id: u64,
 ) -> Result<String> {
     anyhow::bail!("{UNAVAILABLE}")
 }

@@ -79,6 +79,10 @@ pub enum AgentEvent {
     AutoName { tab_id: usize, name: String },
     /// Background session-naming reply (proposed name).
     SessionName { name: String },
+    /// A naming attempt lost. Carries the tab (or None for the session) so the caller can
+    /// schedule a retry instead of retiring the task — silence used to be the only signal a
+    /// name never arrived, and it was indistinguishable from "nothing to name".
+    NameFailed { tab_id: Option<usize> },
     /// W6: one-line verdict on a watched terminal (term id, verdict).
     WatchSummary { term_id: usize, verdict: String },
     /// On-demand summary (workspaces-panel `s`): one line for a surface, term id +
@@ -535,11 +539,16 @@ pub fn auto_name(cfg: AgentConfig, tab_id: usize, screen: String, tx: mpsc::Send
         let messages = format_task_messages(crate::prompts::AUTO_NAME_SYSTEM, &screen);
         // Task tag matches the ring's `auto_name` key (was "auto-name", which
         // silently skipped tier routing).
-        if let Ok(text) = chat(&cfg, messages, "auto_name") {
-            let name = kebab(&text);
-            if !name.is_empty() {
-                let _ = tx.send(AgentEvent::AutoName { tab_id, name });
+        match chat(&cfg, messages, "auto_name") {
+            Ok(text) => {
+                let name = kebab(&text);
+                if name.is_empty() {
+                    let _ = tx.send(AgentEvent::NameFailed { tab_id: Some(tab_id) });
+                } else {
+                    let _ = tx.send(AgentEvent::AutoName { tab_id, name });
+                }
             }
+            Err(_) => { let _ = tx.send(AgentEvent::NameFailed { tab_id: Some(tab_id) }); }
         }
         let _ = tx.send(AgentEvent::BgDone); // release the gate even on failure
     });
@@ -724,11 +733,16 @@ pub fn name_session(cfg: AgentConfig, screen: String, tx: mpsc::Sender<AgentEven
     std::thread::spawn(move || {
         let messages = format_task_messages(crate::prompts::NAME_SESSION_SYSTEM, &screen);
         // Tag matches the ring's `name_session` key (was "session-name").
-        if let Ok(text) = chat(&cfg, messages, "name_session") {
-            let name = kebab(&text);
-            if !name.is_empty() {
-                let _ = tx.send(AgentEvent::SessionName { name });
+        match chat(&cfg, messages, "name_session") {
+            Ok(text) => {
+                let name = kebab(&text);
+                if name.is_empty() {
+                    let _ = tx.send(AgentEvent::NameFailed { tab_id: None });
+                } else {
+                    let _ = tx.send(AgentEvent::SessionName { name });
+                }
             }
+            Err(_) => { let _ = tx.send(AgentEvent::NameFailed { tab_id: None }); }
         }
         let _ = tx.send(AgentEvent::BgDone); // release the gate even on failure
     });
@@ -1034,15 +1048,65 @@ fn chat_inner(
     retrieval: &str,
     mut sink: DeltaSink,
 ) -> anyhow::Result<(String, u64)> {
-    // Remote box: proxy the whole call home over the forwarded socket. No key,
-    // no Authorization header, ever constructed here. (Logged home-side.)
-    // Frame-at-a-time protocol — the remote path does not stream.
+    // The broker is a TRANSPORT, not a provider — it is a way to deliver a call, not a choice
+    // of credential. It used to early-return here, above the rotation loop, so every retry and
+    // every failure classification was unreachable from a brokered call: `ask` (direct) rotated
+    // and `auto_name` (brokered, because a session auto-starts `keyd`) did not. That layering
+    // error silently disabled auto-naming for three days.
+    //
+    // Now it is simply the first candidate. If it fails recoverably — the broker is down, or
+    // cannot resolve DNS, which says nothing about any credential — the loop falls through to
+    // the direct candidates below. The key never leaks by doing so: a genuinely remote box has
+    // no local keys, so `provider_chain()` is empty there and there is nothing to fall back to.
     if cfg.provider == "broker" {
-        let sock = cfg
-            .broker_sock
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("broker mode with no socket"))?;
-        return crate::broker::chat_via_broker(sock, cfg, messages).map(|t| (t, 0));
+        let sock = cfg.broker_sock.clone();
+        // Mint the id HERE so both sides log against the same one: the home broker records it
+        // as `origin_call_id`, which is what makes a brokered background call traceable from
+        // the side that asked for it instead of surfacing as an anonymous "remote".
+        let call_id = crate::llm_log::next_call_id();
+        let via_broker = || -> anyhow::Result<(String, u64)> {
+            let sock = sock
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("broker mode with no socket"))?;
+            crate::broker::chat_via_broker(sock, cfg, messages.clone(), task, call_id)
+                .map(|t| (t, call_id))
+        };
+        match via_broker() {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                let class = classify(&e);
+                crate::llm_log::event(
+                    "transport_failed",
+                    serde_json::json!({ "task": task, "call_id": call_id, "transport": "broker",
+                                        "class": class.name(), "error": e.to_string() }),
+                );
+                if !class.recoverable() {
+                    return Err(e);
+                }
+                // Fall through to the direct candidates, built from this process's own keys.
+                let direct = rotation_candidates("broker");
+                if direct.is_empty() {
+                    return Err(e);
+                }
+                let mut last = e;
+                for alt in direct {
+                    for model in crate::tiers::models_for(alt.provider, task, &alt.model) {
+                        let c = AgentConfig { model, ..alt.clone() };
+                        match attempt(&c, &messages, task, retrieval, reborrow(&mut sink)) {
+                            Ok(ok) => return Ok(ok),
+                            Err(e2) => {
+                                let recoverable = classify(&e2).recoverable();
+                                last = e2;
+                                if !recoverable {
+                                    return Err(last);
+                                }
+                            }
+                        }
+                    }
+                }
+                return Err(last);
+            }
+        }
     }
 
     // Ordered candidates: every model in this task's tier on the primary provider
@@ -1071,9 +1135,7 @@ fn chat_inner(
                 // the right move is the SAME as a throttle: fall through to the next
                 // provider in the chain (a free Groq/Gemini tier) rather than dead-ending
                 // on a paid provider that's out of budget.
-                let recoverable = e.downcast_ref::<RateLimited>().is_some()
-                    || e.downcast_ref::<ModelUnavailable>().is_some()
-                    || is_provider_exhausted(&e);
+                let recoverable = classify(&e).recoverable();
                 last = Some(e);
                 if !recoverable {
                     break;
@@ -1084,6 +1146,85 @@ fn chat_inner(
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no model candidates for task '{task}'")))
 }
 
+/// How a failed LLM call should be treated. Naming the classes matters more than it looks:
+/// the previous code carried a bare `recoverable` boolean computed at one call site, so the
+/// brokered path — which never reached it — could not share the policy. A named classification
+/// is something both transports can ask for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Failure {
+    /// The credential is wrong. Every model on it will fail the same way.
+    Auth,
+    /// Configured and authenticating, but out of budget or quota. Not transient, but the right
+    /// move is the same as a throttle: take the next provider (typically a free tier).
+    Exhausted,
+    /// Throttled, or a model retired underneath us. Try the next candidate now.
+    Throttled,
+    /// This PROCESS could not reach the network — DNS, connect, TLS, timeout. Says nothing
+    /// about any credential, so it must not demote one; it demotes the transport.
+    Unreachable,
+    /// A bug in the request. Rotating would hide it.
+    Fatal,
+}
+
+impl Failure {
+    pub fn name(self) -> &'static str {
+        match self {
+            Failure::Auth => "auth",
+            Failure::Exhausted => "exhausted",
+            Failure::Throttled => "throttled",
+            Failure::Unreachable => "unreachable",
+            Failure::Fatal => "fatal",
+        }
+    }
+    /// Whether to try the next candidate. Auth is NOT recoverable by rotation on the same
+    /// credential, but the caller's candidate list already moves across providers, so an auth
+    /// failure on one key should still let another be tried.
+    pub fn recoverable(self) -> bool {
+        !matches!(self, Failure::Fatal)
+    }
+}
+
+/// Classify a failed call. Transport errors are checked FIRST: a DNS failure reaching
+/// api.groq.com is not a Groq problem, and reading it as one burns a healthy credential and
+/// hides the real fault (which is exactly how a broker that could not resolve DNS presented
+/// itself as every provider being broken).
+pub fn classify(e: &anyhow::Error) -> Failure {
+    if e.downcast_ref::<RateLimited>().is_some() || e.downcast_ref::<ModelUnavailable>().is_some()
+    {
+        return Failure::Throttled;
+    }
+    let m = e.to_string().to_ascii_lowercase();
+    let unreachable = [
+        "dns failed",
+        "failed to lookup address",
+        "nodename nor servname",
+        "connection refused",
+        "connection reset",
+        "timed out",
+        "timeout",
+        "network is unreachable",
+        "no route to host",
+        "broken pipe",
+        "tls",
+        "certificate",
+    ];
+    if unreachable.iter().any(|p| m.contains(p)) {
+        return Failure::Unreachable;
+    }
+    if is_provider_exhausted(e) {
+        return Failure::Exhausted;
+    }
+    if m.contains("401") || m.contains("403") || m.contains("unauthorized")
+        || m.contains("invalid api key") || m.contains("authentication")
+    {
+        return Failure::Auth;
+    }
+    if m.contains(" 500") || m.contains(" 502") || m.contains(" 503") || m.contains(" 529") {
+        return Failure::Throttled;
+    }
+    Failure::Fatal
+}
+
 /// A credit / quota / billing exhaustion (e.g. Anthropic "credit balance too low", OpenAI
 /// "insufficient_quota", a 402). The provider is configured and authenticating fine, it's just
 /// out of budget — so treat it like a throttle and rotate to the next provider in the chain
@@ -1091,7 +1232,10 @@ fn chat_inner(
 fn is_provider_exhausted(e: &anyhow::Error) -> bool {
     let m = e.to_string().to_ascii_lowercase();
     [
-        "credit balance too low",
+        // Anthropic's actual wording is "Your credit balance is too low to access the API" —
+        // the old pattern spelled it "credit balance too low" and so never matched the string
+        // it was written for, leaving a real exhaustion classified as fatal (no rotation).
+        "credit balance",
         "insufficient",       // "insufficient_quota", "insufficient funds/credits"
         "exceeded your current quota",
         "billing",

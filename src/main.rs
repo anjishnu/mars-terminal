@@ -572,6 +572,7 @@ fn ask_cli(question: String) -> Result<()> {
     );
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(60))? {
+            agent::AgentEvent::NameFailed { .. } => {}
             agent::AgentEvent::Answer { text, directive } => {
                 println!("{}", text);
                 match directive {
@@ -3040,6 +3041,85 @@ fn selfcheck() -> Result<()> {
     }
     println!("[selfcheck] provider detection ........ PASS");
 
+    // 29a. Failure taxonomy + retry backoff. None of the rotation logic had coverage, which is
+    //      how a layering error (the broker returning above the retry loop) silently disabled
+    //      auto-naming for three days. Pure classification — no network.
+    {
+        use agent::Failure;
+        let c = |m: &str| agent::classify(&anyhow::anyhow!("{m}"));
+        // A DNS failure reaching a provider is NOT that provider's fault. Reading it as one
+        // burns a healthy credential and hides that this process cannot reach the network.
+        assert_eq!(
+            c("https://api.groq.com/v1/chat: Dns Failed: resolve dns name 'api.groq.com:443'"),
+            Failure::Unreachable,
+            "a DNS failure must be classified as unreachable, not as a provider fault"
+        );
+        assert_eq!(c("connection refused"), Failure::Unreachable);
+        assert_eq!(c("operation timed out"), Failure::Unreachable);
+        assert_eq!(c("Your credit balance is too low to access the Anthropic API"), Failure::Exhausted);
+        assert_eq!(c("insufficient_quota"), Failure::Exhausted);
+        assert_eq!(c("401 unauthorized"), Failure::Auth);
+        assert_eq!(c("model 'nope' does not exist"), Failure::Fatal);
+        // Everything except an outright bug is worth trying the next candidate for.
+        assert!(Failure::Unreachable.recoverable() && Failure::Exhausted.recoverable());
+        assert!(!Failure::Fatal.recoverable(), "a malformed request must not churn the ring");
+
+        // Backoff: a failure costs a delay, never the feature. The old one-shot flag was set
+        // BEFORE the call, so one blip retired naming for the life of the daemon.
+        let poll = 50u64;
+        let mut a = app::Attempt::default();
+        assert!(a.ready(0), "a fresh attempt should be ready");
+        a.dispatch(0, poll);
+        assert!(!a.ready(1), "an in-flight attempt must not be dispatched again");
+        a.failed(0, poll);
+        assert!(!a.done, "one failure must not retire the task");
+        assert!(!a.ready(10) && a.ready(60 * 1000 / poll), "first retry should wait ~60s");
+        // Three backoff slots => three scheduled retries; the FOURTH loss goes dormant.
+        let mut b = app::Attempt::default();
+        for i in 0..3 {
+            b.failed(0, poll);
+            assert!(!b.done, "retired after only {} failures", i + 1);
+        }
+        b.failed(0, poll);
+        assert!(b.done, "should go dormant once the backoff schedule is exhausted");
+        let mut ok = app::Attempt::default();
+        ok.succeeded();
+        assert!(ok.done && !ok.ready(u64::MAX), "a success must settle the task");
+    }
+    println!("[selfcheck] llm failure taxonomy ...... PASS");
+
+    // 29a2. The log must survive concurrent writers and record DECISIONS, not just calls.
+    {
+        assert!(
+            llm_log::log_path().to_string_lossy().contains(&std::process::id().to_string()),
+            "call log is not per-process; the daemon and keyd sharing one file tore records"
+        );
+        // Logging is off by default and this block runs before the suite turns it on — point
+        // it at an isolated dir first, so a test never appends to the user's real capture.
+        let early = cfg_dir.join("llm-early");
+        std::env::set_var("MARS_LLM_LOG_DIR", &early);
+        std::env::set_var("MARS_LLM_DEBUG", "1");
+        llm_log::skipped("auto_name", "already_attempted");
+        let joined: String = llm_log::log_files()
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("\"reason\":\"already_attempted\""),
+            "a skipped background task left no trace — absence is not evidence"
+        );
+        for line in joined.lines().filter(|l| l.starts_with('{')) {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "torn log line: {}",
+                &line[..line.len().min(80)]
+            );
+        }
+        std::env::remove_var("MARS_LLM_DEBUG"); // back off; the later block enables its own
+    }
+    println!("[selfcheck] llm log integrity ......... PASS");
+
     // 29b. Cascade: one-tier-up escalation + same-tier rotation targets (pure
     //      logic, no network — the HTTP paths are exercised by the live eval).
     {
@@ -3765,7 +3845,7 @@ fn selfcheck() -> Result<()> {
         };
         assert_eq!(
             broker::chat_via_broker(
-                cfg.broker_sock.as_deref().unwrap(), &cfg, Vec::new()
+                cfg.broker_sock.as_deref().unwrap(), &cfg, Vec::new(), "selfcheck", 0
             )?,
             "capability-ok"
         );
