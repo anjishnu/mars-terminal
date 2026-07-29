@@ -1765,7 +1765,14 @@ impl App {
                 // (`\x1b[<n>C`); the phone's lightweight parser renders SGR only, so those gaps
                 // would collapse and columns misalign. Emitting real spaces keeps alignment exact.
                 let text = terminal_screen_to_ansi(&screen);
-                serde_json::json!({ "pane": pane_id.to_string(), "kind": "terminal", "text": text })
+                // The transcript's bounds ride along with every screen. Without them a client
+                // scrolled up has no way to learn that lines have left the screen since its last
+                // fetch, and a gap opens between the history it holds and the live screen.
+                let (_, first, total, _) = t.lines(0, 0);
+                serde_json::json!({
+                    "pane": pane_id.to_string(), "kind": "terminal", "text": text,
+                    "first": first, "total": total,
+                })
             }
             PaneContent::Editor(bid) => {
                 // Editors are sent as STRUCTURED lines (not a fixed-width screenshot) so the

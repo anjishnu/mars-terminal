@@ -2699,6 +2699,75 @@ fn selfcheck() -> Result<()> {
                 "a live shell pane never surfaced as verdict 'running'; last board: {last_board}"
             );
 
+            // Task 3: the transcript over the WIRE. `Term::lines` is covered above; this is the
+            // frame path the phone actually uses — ClientFrame::PaneLines → SrvEvent →
+            // ServerFrame::PaneLines — including that a window comes back at the ids asked for.
+            {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                owner.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL))?;
+                owner.key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))?;
+                if shell_is_powershell() {
+                    owner.text("1..200 | % { 'WIRE_{0:d3}' -f $_ }")?;
+                } else {
+                    owner.text("seq 1 200 | awk '{printf \"WIRE_%03d\\n\", $1}'")?;
+                }
+                owner.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+
+                // A full transcript is a ~30 KB frame, and the 200 ms read timeout above tears
+                // it mid-line — so accumulate across timeouts and only parse a COMPLETE line.
+                // Board pushes keep arriving on the same stream, so this cannot assume the next
+                // line is the reply.
+                let _ = sub.try_clone()?.set_read_timeout(Some(std::time::Duration::from_millis(400)));
+                let mut got: Option<(u64, u64, u64, Vec<String>)> = None;
+                let mut buf = String::new();
+                let mut next_ask = std::time::Instant::now();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+                while std::time::Instant::now() < deadline && got.is_none() {
+                    if std::time::Instant::now() >= next_ask {
+                        // Pane ids are not dense from 1 — sweep a small range and take whichever
+                        // one answers with a transcript.
+                        for pane in 0..=8usize {
+                            session::write_frame(
+                                &mut sub_w,
+                                &session::ClientFrame::PaneLines { pane, from: 0, to: u64::MAX },
+                            )?;
+                        }
+                        next_ask = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    }
+                    let _ = sub_r.read_line(&mut buf);
+                    while let Some(nl) = buf.find('\n') {
+                        let line: String = buf.drain(..=nl).collect();
+                        if let Ok(session::ServerFrame::PaneLines { pane: _, from, first, total, rows }) =
+                            serde_json::from_str::<session::ServerFrame>(line.trim())
+                        {
+                            if rows.len() >= 150 {
+                                got = Some((from, first, total, rows));
+                                break;
+                            }
+                        }
+                    }
+                }
+                let (from, first, total, rows) = got.expect("no PaneLines frame carried a transcript");
+                assert_eq!(from, first, "a full read must start at the retained floor");
+                assert_eq!(total - first, rows.len() as u64, "total disagrees with the rows sent");
+                let seen: Vec<usize> = rows
+                    .iter()
+                    .filter_map(|r| {
+                        let bytes = B64.decode(r).ok()?;
+                        let mut p = vt100::Parser::new(1, 400, 0);
+                        p.process(&bytes);
+                        let t = p.screen().contents();
+                        t.trim().strip_prefix("WIRE_")?.parse().ok()
+                    })
+                    .collect();
+                assert!(seen.len() >= 150, "wire transcript carried only {} lines", seen.len());
+                assert!(
+                    seen.windows(2).all(|w| w[1] == w[0] + 1),
+                    "wire transcript duplicated, gapped or reordered: {:?}",
+                    seen.windows(2).find(|w| w[1] != w[0] + 1)
+                );
+            }
+
             drop(sub);
             session::kill_main(&bname)?;
             bserver.join().expect("board-test server panicked")?;
