@@ -530,12 +530,17 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // than ~1 Hz ANSI snapshots. Carries the pane's raw tap, so it's cleared when the last
     // phone drops (below) to stop the reader thread from buffering output nobody reads.
     let mut watch_raw = false;
+    // Which pane the raw subscriber has already been seeded with (None = needs a seed).
+    let mut seeded_pane: Option<usize> = None;
 
     loop {
         // Only spend LLM tokens on Rover's map/reduce while a phone is glancing in.
         // (Dead streams are pruned on the next push; a one-tick lag is harmless.)
         app.rover_active = !subscribers.is_empty();
         // The last phone dropped while raw-watching → stop capturing its pane's output.
+        if subscribers.is_empty() {
+            seeded_pane = None;
+        }
         if subscribers.is_empty() && watch_raw {
             if let Some(p) = watched_pane {
                 app.disable_pane_raw_tap(p);
@@ -683,10 +688,19 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     }
                     _ => app.mobile_reflow = None,
                 }
-                // Raw mode: SEED xterm.js with the current (reflowed) screen so it starts in
-                // sync; byte deltas then stream on each tick below. A re-watch after a resize
-                // reseeds — appropriate, since the grid just changed.
-                if watch_raw {
+                // Raw mode: SEED xterm.js with the current screen so it starts in sync; byte
+                // deltas then stream on each tick below. Seed ONLY when the watched pane
+                // changes — a phone re-watches on every grid nudge (keyboard, command bar,
+                // rotation, font load) and reseeding each time wipes the client's accumulated
+                // scrollback, which is why history kept vanishing mid-session.
+                let seed_now = watch_raw && seeded_pane != pane;
+                if seed_now {
+                    seeded_pane = pane;
+                }
+                if !watch_raw {
+                    seeded_pane = None;
+                }
+                if seed_now {
                     if let Some(p) = pane {
                         if let Some(seed) = app.pane_raw_seed(p) {
                             let b64 = B64.encode(&seed);
