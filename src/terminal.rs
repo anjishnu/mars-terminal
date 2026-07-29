@@ -487,7 +487,10 @@ impl Term {
             if !fmt.is_empty() {
                 pages.push((fmt, txt));
             }
-            if overlap > 0 || pages.len() * step >= want {
+            // `want + step`: one of these pages is the live screen, which is dropped below.
+            // Stopping at `want` returned a screenful FEWER rows than the caller asked for, every
+            // single time — which a client reasonably reads as "that's all there is".
+            if overlap > 0 || pages.len() * step >= want + step {
                 depth = if overlap > 0 { actual } else { off + step };
                 break;
             }
