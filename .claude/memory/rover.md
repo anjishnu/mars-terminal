@@ -139,12 +139,23 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   the daemon has nothing to serve. Symptom: "everything above this is gone" on a Claude Code
   pane, with a tug affordance that can never produce anything. The transcript works fine for
   normal shell panes; this is not a wiring bug, it is structural.
-- Fix is client-side (`RawScreen.tsx` `shiftOf`): diff consecutive screen pushes, find the
-  largest `n` where `prev[n+i] === next[i]`, append the displaced top `n` rows to a local
-  buffer (512 KB ≈ 5,000 lines at phone width). No need to classify a frame as scroll vs
-  repaint — a redraw yields 0 on its own. Exact alignment first (requires ≥3 non-blank rows so
-  a blank-padded screen doesn't align at every offset), then a fuzzy pass for rows that changed
-  while on screen (streaming text, spinners, the input box).
+- Fix is client-side (`RawScreen.tsx` `shiftOf`). Derive it from the one equation that defines
+  a scroll: `next[i] === prev[i+n]` for every row not rewritten. You don't know which rows were
+  rewritten, so VOTE — each non-blank row of `next` that also occurs in `prev` at index `j`
+  votes for shift `j-i`; most votes wins (ties → smaller shift, so ambiguity under-captures).
+  O(H) via a row→indices Map; ~9µs at 125 rows.
+- DO NOT normalise the vote. Dividing matches by rows-compared turns a rewritten row (spinner,
+  token counter, streaming text, input box) from an abstention into evidence AGAINST the right
+  answer, and then needs a similarity threshold that can only be fitted to one fixture. A 0.6
+  constant survived 8 rows of chrome at ratio 0.62 and died at 14. Counting needs no threshold
+  because we only need the BEST shift, never an absolute quality.
+- A pinned header needs no special case: a static row is only explained by shift 0, so it adds
+  a few votes there and none elsewhere. It wins only when more of the screen is pinned than
+  moving, where "nothing scrolled" is the better reading anyway.
+- THE SUBTLE BUG: a shift does not say WHICH rows left. `prev.slice(0, n)` is wrong whenever
+  anything is pinned — with a 2-row header it captured header+blank+ONE output line, which
+  looks like recovery working while dropping two thirds. Slice from the top of the MOVING
+  block: the lowest row index voting for the winning shift (`{ n, from }`).
 - Recovered rows splice at the daemon line id where capture BEGAN (`local.anchor`), not after
   all daemon rows — a pane that runs a TUI and returns to the shell has daemon history on both
   sides. An early gate of "use the daemon transcript if it is non-empty, else local" is WRONG
@@ -152,5 +163,11 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
 - Only lossy for frames never pushed (>1 screenful between 40ms pushes). That shape of output
   (`cat` a big file) runs on the NORMAL screen, where the daemon records it by id — the two
   mechanisms cover each other.
-- Fixture: type `alt` in the mock pane (`mockDaemon.ts`) — scrolls 3 rows/120ms with `total`
-  frozen. `tools/transcript-probe.mjs` asserts the recovered run is contiguous from line 1.
+- Fixture: type `alt` in the mock pane (`mockDaemon.ts`) — a 120-row pane (phone-sized: visible
+  + BASE_SCROLLBACK, NOT a 24-row tty) with a pinned header and 14 rows of volatile chrome,
+  scrolling 3 rows/120ms with `total` frozen. Size matters: at 24 rows a React-coalesced frame
+  is an unrecoverable loss; at 120 it is just a larger shift the vote handles.
+- WORKFLOW that finally cracked it: stop iterating in the browser. Copy `shiftOf` into a
+  standalone `.mjs`, generate the frames, print the shift per frame. That immediately showed
+  the estimator was returning a clean 3 every frame and the loss was downstream — three
+  speculative "fixes" had been aimed at the wrong function.
