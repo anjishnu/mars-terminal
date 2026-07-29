@@ -2278,6 +2278,7 @@ fn selfcheck() -> Result<()> {
                             Ok(session::ServerFrame::Board { .. }) => {}
                             Ok(session::ServerFrame::Briefing { .. }) => {}
                             Ok(session::ServerFrame::PaneScreen { .. }) => {}
+                            Ok(session::ServerFrame::PaneOutput { .. }) => {}
                             Err(_) => {}
                         },
                         Err(_) => {} // timeout tick — keep waiting until deadline
@@ -5277,7 +5278,7 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] health probes ({line}) ... PASS");
     }
 
-    // 44k. The SYSTEM HEALTH box RENDERS as its own panel stacked BELOW the SPACES box
+    // 44k. The VITALS box RENDERS as its own panel stacked BELOW the SPACES box
     //      once the fleet shows (≥2 tabs). Reads the rendered cell grid (not the ANSI
     //      stream) for the box title and its UPTIME row.
     {
@@ -5294,13 +5295,13 @@ fn selfcheck() -> Result<()> {
         let flat: Vec<char> = screen_text(&term).chars().collect();
         let rows: Vec<String> = flat.chunks(w).map(|c| c.iter().collect()).collect();
         let spaces_row = rows.iter().position(|r| r.contains("SPACES")).expect("SPACES title row");
-        let health_row = rows.iter().position(|r| r.contains("SYSTEM HEALTH")).expect("SYSTEM HEALTH title row");
+        let health_row = rows.iter().position(|r| r.contains("VITALS")).expect("VITALS title row");
         let uptime_row = rows.iter().position(|r| r.contains("UPTIME")).expect("UPTIME row");
         assert!(
             health_row > spaces_row && uptime_row > health_row,
-            "SYSTEM HEALTH box must sit BELOW the SPACES box (SPACES {spaces_row}, HEALTH {health_row}, UPTIME {uptime_row})"
+            "VITALS box must sit BELOW the SPACES box (SPACES {spaces_row}, HEALTH {health_row}, UPTIME {uptime_row})"
         );
-        println!("[selfcheck] SYSTEM HEALTH box renders below SPACES ... PASS");
+        println!("[selfcheck] VITALS box renders below SPACES ... PASS");
     }
 
     // 44b. Mouse selection in an EDITOR pane — key_design §7 rules "Selection =
