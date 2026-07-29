@@ -1592,15 +1592,17 @@ pub fn killall_main(force: bool) -> Result<()> {
             }
         }
     }
-    // The deliberate off-switch for the Rover bridge: if a launchd agent is keeping
-    // `mars serve` alive, drop its enable flag so the agent stops it and does NOT relaunch.
-    // (A plain crash/close leaves the flag, so normal supervision still auto-restarts.)
+    // The deliberate off-switch for the Rover bridge. Order matters: drop the enable flag
+    // FIRST so the launchd agent won't relaunch, THEN stop the running bridge — the reverse
+    // races supervision back up. Dropping the flag alone only stops *relaunching*; nothing
+    // signals the live process, which is why a bridge could outlive repeated killalls.
     if let Some(home) = crate::sys::paths::home_dir() {
         let _ = std::fs::remove_file(home.join(".mars").join("serve.enabled"));
     }
+    crate::sys::proc::kill_matching("mars serve");
     println!(
         "killall: {ended} session(s) ended gracefully; force-swept Mars processes, \
-         ssh masters, and stale sockets. Memory files untouched."
+         the Rover bridge, ssh masters, and stale sockets. Memory files untouched."
     );
     Ok(())
 }

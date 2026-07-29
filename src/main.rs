@@ -91,10 +91,11 @@ SESSIONS  (work survives closed windows and disconnects)
   mars rename <old> <new>        rename a running session
   mars kill <name>               end + delete a session (autosaves first)
   mars killall                   the reset button: end every session (autosaved)
-                                 and mars process, shut down ssh tunnel state + the
-                                 key broker, sweep stale sockets. Memory files
-                                 are kept; no new session is started.
-                                 (alias: --killall)
+                                 and mars process, stop the Rover bridge, shut down
+                                 ssh tunnel state + the key broker, sweep stale
+                                 sockets. Memory files are kept; no new session is
+                                 started.
+                                 (aliases: cleanup, --killall, --cleanup)
 
   Inside a session:  quitting (C-x C-c) just DETACHES — the session lives on;
                      \"Kill session\" in the menu (or mars kill) ends it for good
@@ -401,12 +402,14 @@ fn main() -> Result<()> {
             );
             std::process::exit(2);
         }
-        // The reset button: end everything, sweep stale sockets, start nothing.
-        Some("killall") | Some("--killall") => {
+        // The reset button: end everything, sweep stale sockets, start nothing. `cleanup` is
+        // the same sweep under a name that reads as maintenance rather than violence.
+        Some(verb @ ("killall" | "--killall" | "cleanup" | "--cleanup")) => {
             if let Ok(session) = std::env::var("MARS_SESSION") {
+                let verb = verb.trim_start_matches('-');
                 anyhow::bail!(
-                    "you're inside Mars session '{session}' — killall would cut its own branch.\n  \
-                     Detach first (C-x C-c), then run: mars --killall"
+                    "you're inside Mars session '{session}' — {verb} would cut its own branch.\n  \
+                     Detach first (C-x C-c), then run: mars {verb}"
                 );
             }
             return session::killall_main(true);
