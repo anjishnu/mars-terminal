@@ -431,21 +431,50 @@ impl Term {
     /// whatever is on screen now. Returns `(bytes, rows_included, rows_available)`. Replaying
     /// bytes keeps the original colour and, unlike vt100's scrollback, survives the reflow the
     /// phone triggers when it watches.
+    /// A readable transcript for a phone paging upward. Returns `(bytes, rows, total)`.
+    ///
+    /// The retained bytes are screen UPDATES, not a transcript — a repainting program emits
+    /// cursor jumps and clears, so replaying them raw makes the terminal overwrite itself into
+    /// nonsense. Replay them into a PRIVATE parser instead (one nothing else resizes, which is
+    /// what made vt100's own scrollback useless here), then emit its laid-out rows. Colour is
+    /// preserved because we emit formatted rows, not plain text.
     pub fn history_ansi(&self, lines: usize) -> (Vec<u8>, usize, usize) {
         let Ok(h) = self.raw_history.lock() else { return (Vec::new(), 0, 0) };
-        let all: Vec<u8> = h.iter().copied().collect();
-        let total = all.iter().filter(|b| **b == b'\n').count();
-        // Walk back from the end until we have `lines` newlines, then cut on that boundary.
-        let mut seen = 0usize;
-        let mut start = all.len();
-        for (i, b) in all.iter().enumerate().rev() {
-            if *b == b'\n' {
-                seen += 1;
-                if seen > lines { start = i + 1; break; }
-            }
-            start = i;
+        let raw: Vec<u8> = h.iter().copied().collect();
+        drop(h);
+        if raw.is_empty() {
+            return (Vec::new(), 0, 0);
         }
-        (all[start..].to_vec(), seen.min(lines), total)
+        let cols = self.cols.max(20);
+        let view = self.rows.max(8);
+        // Give the private parser deep scrollback so the whole window lays out linearly.
+        let mut p = vt100::Parser::new(view, cols, lines.max(200) + 200);
+        p.process(&raw);
+        let depth = { p.set_scrollback(usize::MAX >> 1); p.screen().scrollback() };
+        let rows_per = view as usize;
+        let mut pages: Vec<Vec<Vec<u8>>> = Vec::new();
+        let (mut off, mut got) = (0usize, 0usize);
+        loop {
+            p.set_scrollback(off);
+            pages.push(p.screen().rows_formatted(0, cols).collect());
+            got += rows_per;
+            if got >= lines || off >= depth {
+                break;
+            }
+            off += rows_per;
+        }
+        pages.reverse(); // oldest first
+        let all: Vec<Vec<u8>> = pages.into_iter().flatten().collect();
+        // Trim leading blank rows so a mostly-empty buffer doesn't read as dead space.
+        let first = all.iter().position(|r| !r.is_empty()).unwrap_or(0);
+        let keep = &all[first..];
+        let start = keep.len().saturating_sub(lines);
+        let mut out = Vec::new();
+        for row in &keep[start..] {
+            out.extend_from_slice(row);
+            out.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        (out, keep.len() - start, depth + rows_per)
     }
 
     /// Snap back to the live screen (any keystroke does this).
