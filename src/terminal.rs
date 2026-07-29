@@ -438,6 +438,16 @@ impl Term {
     /// nonsense. Replay them into a PRIVATE parser instead (one nothing else resizes, which is
     /// what made vt100's own scrollback useless here), then emit its laid-out rows. Colour is
     /// preserved because we emit formatted rows, not plain text.
+    /// A readable transcript for a phone paging upward. Returns `(bytes, rows, total)`.
+    ///
+    /// Replay the retained bytes into a PRIVATE parser made `lines` tall, then emit its FINAL
+    /// SCREEN. That is the whole trick: a repainting program (Claude Code, any Ink CLI) rewrites
+    /// the same cells, so on a tall grid its repaints overwrite in place and collapse to one
+    /// coherent screen — exactly what makes the daemon's live parser look clean. Reading the
+    /// replay's SCROLLBACK instead captured every intermediate frame, which is where the
+    /// duplication came from. Private, so unlike asking for a taller grid it never resizes the
+    /// real PTY (that is clamped to 120 rows precisely because it changes what the program
+    /// draws for everyone, including the desktop).
     pub fn history_ansi(&self, lines: usize) -> (Vec<u8>, usize, usize) {
         let Ok(h) = self.raw_history.lock() else { return (Vec::new(), 0, 0) };
         let raw: Vec<u8> = h.iter().copied().collect();
@@ -446,35 +456,19 @@ impl Term {
             return (Vec::new(), 0, 0);
         }
         let cols = self.cols.max(20);
-        let view = self.rows.max(8);
-        // Give the private parser deep scrollback so the whole window lays out linearly.
-        let mut p = vt100::Parser::new(view, cols, lines.max(200) + 200);
+        let tall = lines.clamp(24, 4000) as u16;
+        let mut p = vt100::Parser::new(tall, cols, 0); // no scrollback: the screen IS the answer
         p.process(&raw);
-        let depth = { p.set_scrollback(usize::MAX >> 1); p.screen().scrollback() };
-        let rows_per = view as usize;
-        let mut pages: Vec<Vec<Vec<u8>>> = Vec::new();
-        let (mut off, mut got) = (0usize, 0usize);
-        loop {
-            p.set_scrollback(off);
-            pages.push(p.screen().rows_formatted(0, cols).collect());
-            got += rows_per;
-            if got >= lines || off >= depth {
-                break;
-            }
-            off += rows_per;
-        }
-        pages.reverse(); // oldest first
-        let all: Vec<Vec<u8>> = pages.into_iter().flatten().collect();
-        // Trim leading blank rows so a mostly-empty buffer doesn't read as dead space.
-        let first = all.iter().position(|r| !r.is_empty()).unwrap_or(0);
-        let keep = &all[first..];
-        let start = keep.len().saturating_sub(lines);
+        let rows: Vec<Vec<u8>> = p.screen().rows_formatted(0, cols).collect();
+        // A tall grid leaves the content sitting at the bottom — drop the empty run above it.
+        let first = rows.iter().position(|r| !r.is_empty()).unwrap_or(rows.len());
+        let keep = &rows[first..];
         let mut out = Vec::new();
-        for row in &keep[start..] {
+        for row in keep {
             out.extend_from_slice(row);
             out.extend_from_slice(b"\x1b[0m\r\n");
         }
-        (out, keep.len() - start, depth + rows_per)
+        (out, keep.len(), keep.len())
     }
 
     /// Snap back to the live screen (any keystroke does this).
