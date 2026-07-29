@@ -682,6 +682,21 @@ fn selfcheck() -> Result<()> {
     std::fs::create_dir_all(&cfg_dir)?;
     std::env::set_var("XDG_CONFIG_HOME", &cfg_dir);
     std::env::set_var(session::RUNTIME_DIR_ENV, cfg_dir.join("runtime"));
+    // Isolate agent auth the same way. A test suite must not read the developer's real keys:
+    // the broker's socket sits at a FIXED path no isolation covers (with `mars keyd` running —
+    // which a session now auto-starts — it won over every provider), and provider keys arrive
+    // from the ambient environment. Both made the suite's behaviour depend on the machine:
+    // every test that runs a command through the `!` bar took the translate branch instead.
+    // Tests that want an agent set their own key after this point.
+    std::env::set_var("MARS_NO_BROKER", "1");
+    for v in ["MARS_LLM_KEY", "MARS_LLM_URL", "MARS_LLM_MODEL",
+              "ARES_LLM_KEY", "ARES_LLM_URL", "ARES_LLM_MODEL", "MARS_AUTH_SOCK",
+              "GROQ_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY",
+              "GOOGLE_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "AZURE_OPENAI_API_KEY",
+              "AZURE_OPENAI_ENDPOINT", "MARS_BEDROCK_REGION", "AWS_REGION",
+              "AWS_DEFAULT_REGION", "MARS_AZURE_DEPLOYMENT", "MARS_AZURE_API_VERSION"] {
+        std::env::remove_var(v);
+    }
 
     let mut app = App::new(None)?;
     let mut term = Terminal::new(TestBackend::new(120, 40))?;
@@ -3506,7 +3521,10 @@ fn selfcheck() -> Result<()> {
             }
         });
 
-        // Detection: a live forwarded socket ⇒ provider "broker", configured.
+        // Detection: a live forwarded socket ⇒ provider "broker", configured. This block IS
+        // the broker test, so the suite-wide opt-out comes off around it — pointed at the
+        // socket built above, never at the developer's own.
+        std::env::remove_var("MARS_NO_BROKER");
         std::env::set_var("MARS_AUTH_SOCK", &sock_s);
         let c = agent::AgentConfig::from_env();
         assert_eq!(c.provider, "broker", "MARS_AUTH_SOCK not detected as broker");
@@ -3532,6 +3550,7 @@ fn selfcheck() -> Result<()> {
         assert_eq!(out, "broker-ok", "broker proxy did not return the reply: {out:?}");
 
         std::env::remove_var("MARS_AUTH_SOCK");
+        std::env::set_var("MARS_NO_BROKER", "1");
         let _ = std::fs::remove_file(&sock);
         println!("[selfcheck] ssh broker (proxy/detect) . PASS");
     }

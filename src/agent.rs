@@ -381,8 +381,15 @@ impl AgentConfig {
         // Highest precedence: a forwarded auth socket (we're on a remote box).
         // Proxy the call home — the key never lands here. An explicit MARS_LLM_KEY
         // still wins over this, so a box you deliberately keyed keeps working.
+        //
+        // MARS_NO_BROKER opts out entirely. Broker discovery ends at a FIXED path
+        // (~/.mars/auth.sock), which no config/runtime isolation covers, so `--selfcheck`
+        // reached the developer's own key daemon and behaved differently depending on whether
+        // `mars keyd` happened to be running. Same role as MARS_NO_SYSTEM_CLIPBOARD: never
+        // reach the user's real state from a test.
         if std::env::var("MARS_LLM_KEY").is_err()
             && std::env::var("ARES_LLM_KEY").is_err()
+            && !std::env::var("MARS_NO_BROKER").is_ok_and(|v| v == "1")
         {
             if let Some(sock) = crate::broker::detect_broker_sock() {
                 return AgentConfig {
