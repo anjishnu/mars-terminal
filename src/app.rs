@@ -531,6 +531,9 @@ pub struct App {
     rover_prev_brief: String,
     /// A phone is subscribed → spend tokens on the map/reduce; idle otherwise.
     pub rover_active: bool,
+    /// The line the phone greeted the captain with this session — fed to the briefing so the
+    /// narrative continues from it instead of repeating or contradicting it.
+    pub rover_greeting: String,
     auto_name_attempted: std::collections::HashSet<TabId>,
     /// Shell composer: the query is a ready-to-run command (translated or
     /// typed literally with no key) — the next Enter runs it.
@@ -698,6 +701,7 @@ impl App {
             rover_brief_sig: 0,
             rover_prev_brief: String::new(),
             rover_active: false,
+            rover_greeting: String::new(),
             auto_name_attempted: std::collections::HashSet::new(),
             shell_ready: false,
             translate_call_id: None,
@@ -6298,31 +6302,46 @@ impl App {
             return;
         }
         let keyed = cfg.is_configured();
+        // PASS 1 (free, always): every stale pane gets the deterministic tier-0 line NOW, so the
+        // phone's board is fully populated the moment it renders instead of filling in one
+        // model call at a time. Costs no tokens; the model's wording replaces it in pass 2.
         for id in self.rover_terminal_surfaces() {
             let tail = self.terminal_tail(id, self.tuning.agent_scrollback_context);
             if tail.trim().is_empty() {
                 continue;
             }
             let hash = hash_str(&tail);
-            let fresh = self.rover_summaries.get(&id).map(|s| s.tail_hash == hash).unwrap_or(false);
-            if fresh {
+            if self.rover_summaries.get(&id).map(|s| s.tail_hash == hash).unwrap_or(false) {
+                continue; // already summarised for this exact tail (tier-0 or model)
+            }
+            let exited = self.terms.get(&id).map(|t| t.exited).unwrap_or(false);
+            let exit = self.terms.get(&id).and_then(|t| t.exit_code());
+            let tri = crate::briefing::triage(&tail, exit, !exited);
+            self.rover_summaries.insert(id, RoverSummary {
+                text: tri.text,
+                tail_hash: hash,
+                provider: "tier-0".into(),
+            });
+        }
+        if !keyed {
+            return; // keyless host: tier-0 IS the answer
+        }
+        // PASS 2 (keyed): upgrade ONE tier-0 line to the model's, then stop — `bg_busy`
+        // serializes the rest across subsequent ticks.
+        for id in self.rover_terminal_surfaces() {
+            let stale = self
+                .rover_summaries
+                .get(&id)
+                .map(|s| s.provider == "tier-0")
+                .unwrap_or(false);
+            if !stale {
                 continue;
             }
-            if !keyed {
-                // Keyless: deterministic tier-0 line stands in for the model. Free,
-                // so fill every stale pane in one pass.
-                let exited = self.terms.get(&id).map(|t| t.exited).unwrap_or(false);
-                let exit = self.terms.get(&id).and_then(|t| t.exit_code());
-                let tri = crate::briefing::triage(&tail, exit, !exited);
-                self.rover_summaries.insert(id, RoverSummary {
-                    text: tri.text,
-                    tail_hash: hash,
-                    provider: "tier-0".into(),
-                });
+            let tail = self.terminal_tail(id, self.tuning.agent_scrollback_context);
+            if tail.trim().is_empty() {
                 continue;
             }
-            // Keyed: one model call, then stop (the gate serializes the rest).
-            self.rover_map_inflight = Some((id, hash));
+            self.rover_map_inflight = Some((id, hash_str(&tail)));
             self.bg_busy = true;
             agent::rover_summarize(cfg, id, tail, self.agent_tx.clone());
             return;
@@ -6367,7 +6386,7 @@ impl App {
             return;
         }
         self.bg_busy = true;
-        agent::rover_brief(cfg, summaries, mission, self.rover_prev_brief.clone(), self.agent_tx.clone());
+        agent::rover_brief(cfg, summaries, mission, self.rover_prev_brief.clone(), self.rover_greeting.clone(), self.agent_tx.clone());
     }
 
     /// The reduce input: one line per workspace — name, verdict, and its cached

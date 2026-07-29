@@ -3,6 +3,61 @@
 Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
 `rover-delight.md`, `mobile-pwa-mvp.md`). Two repos, one seam.
 
+## Deploy topology (two GitHub remotes — don't confuse them)
+- **Webapp** `mars-rover` → remote `github.com/Crossvalidated-Ventures/mars-terminal.git`,
+  branch **`main`**, **Lovable-connected** (push to main → Lovable rebuilds
+  `mars-terminal.lovable.app/rover`). Bidirectional sync — never rewrite pushed history.
+- **Rust daemon** `mars-terminal` → remote `github.com/anjishnu/mars.git`. The `mars serve`
+  bridge + pane-streaming work lives on branch **`rover-dev`**.
+- Reinstall the binary with `cargo install --path . --features web --force` (validly signed;
+  no codesign needed, unlike a cp'd binary). Then start a FRESH `mars serve` session — old
+  sessions run the pre-reinstall binary and don't speak the new frames.
+
+## Field-test learnings (2026-07)
+- **LLM features split by process**: `ask`/`summarize`/mission-briefing run in the **bridge**
+  (`mars serve`, reads its own env) — the phone's briefing embeds the board in the question so
+  the keyless-context bridge can still summarize. **Auto-naming + the daemon's own model
+  briefing run in the SESSION daemon** (`maybe_auto_name`, `shift_brief`), which reads the key
+  from ITS env. If the session started without a key, they silently fall back to
+  `deterministic_narrative()` (filler) and skip naming. Fix without restart: **`mars keyd`**
+  (broker; `from_env` detects the socket and proxies). No broker was running in testing.
+- **Dive input is compose-then-send**, not live keystrokes (laggy over a network + IME fights
+  it). KeyBar reduced to esc/C-c/enter. Nav in the dive is a breadcrumb + bottom back button,
+  NOT swipe (swipe-back was too twitchy).
+- **Editor panes**: `pane_screen_json` now renders `PaneContent::Editor` (buffer-rope viewport
+  with a line gutter), not just terminals — else diving into an editor showed a blank screen.
+- **Reflow-to-fit IS done — active-app takeover** (per user, non-takeover glance was dropped
+  here on purpose): `WatchPane` carries the phone's cols/rows. While the phone watches, it
+  OWNS the pane size via `App::mobile_reflow: Option<(PaneId, rows, cols)>`; the render
+  (`ui.rs` ~500) keeps that pane at the phone's width instead of the layout, so a wide TUI
+  reflows narrow even with a desktop attached. `App::resize_pane_to` does the actual
+  `Terminal::resize` (→ SIGWINCH). Mars reclaims the moment the desk user interacts — the
+  `SrvEvent::Input` `ev` branch clears `mobile_reflow` on any redraw-forcing input, and the
+  next render sizes back to the layout. Selfcheck "rover takeover / reclaim" covers both
+  directions (render honours takeover; reclaim on clear).
+
+## Current state (2026-07, post redesign)
+- Route is **`/rover`** (`src/routes/rover.tsx` → `src/rover/*`), NOT `/c`. Dev/build/typecheck:
+  `npx vite dev --port 8080 --strictPort`, `npx vite build`, `npx tsc --noEmit`. `bun` IS now
+  installed (~/.bun) but `npx vite` works fine — the Lovable build uses the committed lockfile.
+- **Dive** (formerly "peek") = the live-pane view (`ui/RawScreen.tsx`). Renders the daemon's
+  screen in **colour**: the daemon serialises with vt100 **`rows_formatted`** (per-row ANSI SGR,
+  not `contents()`), and the phone parses SGR into styled spans in **`src/rover/ansi.ts`** —
+  **no xterm** (it broke the Lovable build via a zod v3/v4 clash; we only display, never emulate).
+- **Live typing**: the dive has a hidden `<textarea>` sink — non-printable keys mapped in
+  `nonPrintable()` (onKeyDown), printable/IME via onInput — each keystroke → `{t:"key",paneId,data}`.
+- **Session rename**: phone sends `{t:"rename",name}`; the bridge carries `ClientFrame::Rename` on a
+  FRESH connection (the subscribe writer would get closed) → daemon fs-renames → next board snapshot
+  returns the new name. Registry mirror via `renameSession(daemonId,name)`.
+- **Ambient health**: board json carries a `health` string (`app.health.line()`); `push_mobile` is
+  now `&mut` and samples health each push (detached sessions don't run the render-loop sampler).
+- **Themes** mirror the terminal: Mission Control, **Eclipse** (was Night), **Terracotta Sol**
+  (was Day), **Hacker** (was Phosphor), Amber. Old ids migrated on load (`THEME_ALIASES`).
+- **PWA**: `public/rover.webmanifest` (scope `/rover`) + terracotta-circle-on-black icons
+  (`rover-icon-{192,512,maskable}.png`, `apple-touch-icon.png`), linked in `routes/__root.tsx`.
+- **Routing**: 1 paired session → its briefing is home (fleet is a menu item); 0 or many → fleet hub.
+  A QR scan always routes through the loading screen (RoverProvider keyed on daemonId → remount).
+
 ## Web app (separate repo)
 - Lives at `/Users/anjishnukumar/Mars-Mission/mars-rover` — TanStack Start + React 19 +
   Tailwind v4 + shadcn, Lovable-connected (don't rewrite pushed history; keep branch working).

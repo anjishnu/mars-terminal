@@ -490,7 +490,10 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     // before we stream anything, and a rotated token (`mars serve --reset`) is picked up within a
     // second and drops the socket. No token file at all → open (backward-compatible).
     let valid = read_token();
-    let mut authed = valid.is_none();
+    // NEVER fail open. `serve_main` mints a token before listening, so a missing file means the
+    // file was deleted or unreadable — refuse rather than serve an unauthenticated socket, which
+    // now fronts arbitrary-path filesystem READ AND WRITE over a public tunnel.
+    let mut authed = false;
     let auth_deadline = Instant::now() + Duration::from_secs(5);
     let mut last_token_check = Instant::now();
 
@@ -678,6 +681,12 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         }
         Some("unwatch") => {
             let _ = session::write_frame(writer, &ClientFrame::WatchPane { pane: None, cols: None, rows: None, raw: false });
+        }
+        // The phone tells us how it greeted the captain, so the briefing can continue from it.
+        Some("greeting") => {
+            if let Some(text) = v.get("text").and_then(|x| x.as_str()) {
+                let _ = session::write_frame(writer, &ClientFrame::RoverGreeting { text: text.to_string() });
+            }
         }
         // Page upward in a watched pane: ask for `lines` of scrollback (xterm.js renderer).
         Some("history") => {

@@ -86,6 +86,9 @@ pub enum ClientFrame {
         #[serde(default)]
         raw: bool,
     },
+    /// The opening line the phone greeted the captain with. The daemon folds it into the next
+    /// briefing prompt so the narrative doesn't repeat or contradict it.
+    RoverGreeting { text: String },
     /// A raw watcher paging upward: send the last `lines` of that pane's scrollback
     /// (ending with the live screen) so the phone can rebuild its buffer with history.
     PaneHistory { pane: usize, lines: usize },
@@ -395,6 +398,8 @@ enum SrvEvent {
     NewTerminal,
     /// A subscriber asked for a pane's scrollback (paging up in the xterm.js renderer).
     PaneHistory { pane: usize, lines: usize },
+    /// The phone reported the greeting it opened with (briefing continuity).
+    RoverGreeting(String),
 }
 
 /// Push the current structured board (and briefing, when one exists) to every
@@ -692,6 +697,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     }
                 }
             }
+            Ok(SrvEvent::RoverGreeting(text)) => {
+                app.rover_greeting = text;
+            }
             Ok(SrvEvent::PaneHistory { pane, lines }) => {
                 if let Some((bytes, rows, total)) = app.pane_history(pane, lines) {
                     let b64 = B64.encode(&bytes);
@@ -901,6 +909,11 @@ fn client_connection(
                     }
                     Ok(ClientFrame::PaneHistory { pane, lines }) => {
                         if tx.send(SrvEvent::PaneHistory { pane, lines }).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientFrame::RoverGreeting { text }) => {
+                        if tx.send(SrvEvent::RoverGreeting(text)).is_err() {
                             break;
                         }
                     }

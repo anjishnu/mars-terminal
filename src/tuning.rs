@@ -231,7 +231,7 @@ impl Default for Tuning {
             watch_min_active_secs: 10,
             goal_tracking: 1,
             mobile_push_interval_ms: 1000,
-            rover_map_min_secs: 4,
+            rover_map_min_secs: 1,
             rover_brief_min_secs: 12,
             palette: Palette::mission_control(),
         }

@@ -630,6 +630,7 @@ pub fn rover_brief(
     summaries: String,
     mission: String,
     prev: String,
+    greeting: String,
     tx: mpsc::Sender<AgentEvent>,
 ) {
     std::thread::spawn(move || {
@@ -639,6 +640,7 @@ pub fn rover_brief(
             .trim_end()
             .replace("{mission}", if mission.is_empty() { "(none inferred)" } else { &mission })
             .replace("{prev}", if prev.is_empty() { "(this is the first briefing)" } else { &prev })
+            .replace("{greeting}", if greeting.is_empty() { "(none)" } else { &greeting })
             .replace("{summaries}", &summaries);
         let mut messages = vec![serde_json::json!({ "role": "system", "content": system })];
         if let Some(p) = crate::persona::system_message() {

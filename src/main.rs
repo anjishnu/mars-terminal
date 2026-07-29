@@ -3076,7 +3076,7 @@ fn selfcheck() -> Result<()> {
             ("shift_brief", prompts::SHIFT_BRIEF, vec!["{away}", "{mission}", "{prev}", "{evidence}"]),
             ("capture_goals", prompts::CAPTURE_GOALS, vec!["{evidence}"]),
             ("rover_summary", prompts::ROVER_SUMMARY, vec![]),
-            ("rover_brief", prompts::ROVER_BRIEF, vec!["{mission}", "{prev}", "{summaries}"]),
+            ("rover_brief", prompts::ROVER_BRIEF, vec!["{mission}", "{prev}", "{greeting}", "{summaries}"]),
         ] {
             assert!(!p.trim().is_empty(), "prompt template {name}.md is empty");
             for h in holders {
