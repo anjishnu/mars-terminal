@@ -132,3 +132,25 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   probe traps, both cost time: a `<pre>`'s textContent runs the row `<div>`s together with NO
   newline (query `pre > div`), and `document.querySelector("pre")` can return a LOWER app
   level still mounted behind the slide — pick the pre whose text matches your fixture.
+
+## Alt-screen panes get NO transcript — recover on the client (2026-07-29)
+- vt100 builds the alternate grid as `Grid::new(size, 0)` — scrollback length ZERO. A
+  full-screen TUI repaints in its viewport, nothing scrolls off, so `LineLog` stays empty and
+  the daemon has nothing to serve. Symptom: "everything above this is gone" on a Claude Code
+  pane, with a tug affordance that can never produce anything. The transcript works fine for
+  normal shell panes; this is not a wiring bug, it is structural.
+- Fix is client-side (`RawScreen.tsx` `shiftOf`): diff consecutive screen pushes, find the
+  largest `n` where `prev[n+i] === next[i]`, append the displaced top `n` rows to a local
+  buffer (512 KB ≈ 5,000 lines at phone width). No need to classify a frame as scroll vs
+  repaint — a redraw yields 0 on its own. Exact alignment first (requires ≥3 non-blank rows so
+  a blank-padded screen doesn't align at every offset), then a fuzzy pass for rows that changed
+  while on screen (streaming text, spinners, the input box).
+- Recovered rows splice at the daemon line id where capture BEGAN (`local.anchor`), not after
+  all daemon rows — a pane that runs a TUI and returns to the shell has daemon history on both
+  sides. An early gate of "use the daemon transcript if it is non-empty, else local" is WRONG
+  and silently disables recovery, because a shell prompt always precedes the TUI.
+- Only lossy for frames never pushed (>1 screenful between 40ms pushes). That shape of output
+  (`cat` a big file) runs on the NORMAL screen, where the daemon records it by id — the two
+  mechanisms cover each other.
+- Fixture: type `alt` in the mock pane (`mockDaemon.ts`) — scrolls 3 rows/120ms with `total`
+  frozen. `tools/transcript-probe.mjs` asserts the recovered run is contiguous from line 1.
