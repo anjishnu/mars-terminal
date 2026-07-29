@@ -149,6 +149,11 @@ pub struct Tuning {
     /// briefing to a subscribed mobile client (the Rover phone bridge). The main
     /// loop ticks far faster; this throttles the LAN push to a sane cadence.
     pub mobile_push_interval_ms: u64,
+    /// How often the WATCHED PANE's screen is pushed to the phone, separately from the board.
+    /// The board is a status summary and a second is fine; the pane is what you type into, and
+    /// at the board's cadence a keystroke can take a full second to appear. Identical screens
+    /// are never sent, so a tight interval costs nothing while the pane is idle.
+    pub mobile_pane_interval_ms: u64,
     /// Minimum seconds between Rover MAP calls (the per-workspace summary). One
     /// changed pane is (re)summarized per interval, so a busy board fans out over
     /// several intervals instead of hammering the model. Only active while a phone
@@ -231,6 +236,7 @@ impl Default for Tuning {
             watch_min_active_secs: 10,
             goal_tracking: 1,
             mobile_push_interval_ms: 1000,
+            mobile_pane_interval_ms: 40,
             rover_map_min_secs: 1,
             rover_brief_min_secs: 12,
             palette: Palette::mission_control(),
@@ -458,6 +464,10 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "1 = when you detach, the agent captures what you were working \
              toward, so the reattach briefing can report progress on it; \
              0 = off.")),
+        ("mobile_pane_interval_ms", knob(json!(d.mobile_pane_interval_ms),
+            "How often the watched pane's live screen is pushed to the phone, in ms. Separate \
+             from the board's cadence because this one is felt as typing latency. Identical \
+             screens are suppressed, so a tight value is free while the pane is idle.")),
         ("mobile_push_interval_ms", knob(json!(d.mobile_push_interval_ms),
             "How often (ms) the session daemon pushes the workspace board + \
              briefing to a subscribed phone (the Rover bridge). The tick loop \
@@ -611,6 +621,8 @@ pub fn load() -> Tuning {
         t.goal_tracking = get_u64(&map, "goal_tracking", t.goal_tracking);
         t.mobile_push_interval_ms =
             get_u64(&map, "mobile_push_interval_ms", t.mobile_push_interval_ms).max(1);
+        t.mobile_pane_interval_ms =
+            get_u64(&map, "mobile_pane_interval_ms", t.mobile_pane_interval_ms).max(1);
         t.rover_map_min_secs = get_u64(&map, "rover_map_min_secs", t.rover_map_min_secs).max(1);
         t.rover_brief_min_secs = get_u64(&map, "rover_brief_min_secs", t.rover_brief_min_secs).max(1);
         if let Some(list) = map.get("project_ignore").and_then(|e| e.value.as_array()) {

@@ -525,6 +525,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // pushed here on a throttled cadence and dead streams are pruned on write.
     let mut subscribers: Vec<crate::sys::control::Stream> = Vec::new();
     let mut last_mobile_push: Option<std::time::Instant> = None;
+    // The watched pane pushes on its OWN, much tighter clock, and only when the screen actually
+    // changed. Coupling it to the board's ~1 Hz status cadence meant a keystroke could take a
+    // full second to come back — the renderer was never the latency, the schedule was.
+    let mut last_pane_push: Option<std::time::Instant> = None;
+    let mut last_pane_json: Option<String> = None;
     let mut watched_pane: Option<usize> = None;
     // Whether the watched pane is streamed as raw PTY bytes (the xterm.js renderer) rather
     // than ~1 Hz ANSI snapshots. Carries the pane's raw tap, so it's cleared when the last
@@ -547,6 +552,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             }
             watch_raw = false;
             watched_pane = None;
+            last_pane_json = None; // next watch must seed, never be suppressed as 'unchanged'
             app.mobile_reflow = None;
         }
         app.tick();
@@ -671,6 +677,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     }
                 }
                 watched_pane = pane;
+                last_pane_json = None; // a new pane (or a reflow) must seed, not be deduped away
                 watch_raw = raw;
                 if watch_raw {
                     if let Some(p) = pane {
@@ -761,19 +768,30 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 .unwrap_or(true);
             if due {
                 push_mobile(&mut app, &mut subscribers);
-                // Stream the watched pane's live screen (the phone reading a terminal). Only
-                // the DOM/ANSI renderer needs this full-screen snapshot; the raw path streams
-                // bytes above instead.
-                if !watch_raw {
-                    if let Some(p) = watched_pane {
-                        if let Some(json) = app.pane_screen_json(p) {
+                last_mobile_push = Some(std::time::Instant::now());
+            }
+            // The watched pane's live screen, on its own clock. Only the DOM/ANSI renderer needs
+            // this snapshot; the raw path streams bytes above instead. An unchanged screen is
+            // never resent, so an idle pane costs one string compare per tick rather than a
+            // frame on the wire and a full re-render on the phone.
+            let pane_due = last_pane_push
+                .map(|t| {
+                    t.elapsed()
+                        >= Duration::from_millis(app.tuning.mobile_pane_interval_ms.max(1))
+                })
+                .unwrap_or(true);
+            if pane_due && !watch_raw {
+                if let Some(p) = watched_pane {
+                    if let Some(json) = app.pane_screen_json(p) {
+                        if last_pane_json.as_deref() != Some(json.as_str()) {
+                            last_pane_json = Some(json.clone());
                             subscribers.retain_mut(|s| {
                                 write_frame(s, &ServerFrame::PaneScreen { json: json.clone() }).is_ok()
                             });
                         }
                     }
                 }
-                last_mobile_push = Some(std::time::Instant::now());
+                last_pane_push = Some(std::time::Instant::now());
             }
         }
 
