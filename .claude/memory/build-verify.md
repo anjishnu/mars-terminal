@@ -24,6 +24,19 @@ failure smells like encoding rather than logic.
   did not accept the attached client's broker route").
 - Both now cleared in selfcheck's hermetic block. If a selfcheck failure looks environmental,
   check what Mars itself exported into the shell before suspecting the code.
+- SEQUEL (2026-07-29): the same class bit again from a different direction. Broker discovery
+  ends at a FIXED `~/.mars/auth.sock`, which the isolated XDG_CONFIG_HOME/MARS_RUNTIME_DIR do
+  NOT cover, and provider keys come from the ambient env. So with `mars keyd` running (a
+  session auto-starts it since e86bc64) the agent read as CONFIGURED, and every `!`-bar test
+  took the translate branch instead of running the command — "shell command did not attach
+  terminal" at what looks like a PTY failure but is an auth one. Provider detection likewise
+  saw "broker" where it had set GEMINI_API_KEY. Fix: `MARS_NO_BROKER=1` + an ambient-key scrub
+  at the top of `selfcheck()`; the two blocks that TEST those mechanisms clear it around
+  themselves. Symptom to recognise: selfcheck green in CI, red on a machine that uses Mars.
+- `--selfcheck` IS runtime-isolated (`MARS_RUNTIME_DIR` → a per-PID temp dir) and safe to run
+  while the user has a live session — verified by checking the live `mars --server` PID before
+  and after. Earlier notes that it "kills all live sessions" are wrong; `mars killall` is the
+  thing that does that, and it is still never ours to run.
 
 ## GOTCHA: stale cargo fingerprint masked rebuilds (2026-07)
 - After `cargo publish --dry-run` (Jul 3), `cargo build` reported "Finished 0.2s" with NO

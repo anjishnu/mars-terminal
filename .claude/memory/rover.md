@@ -105,3 +105,30 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   http prototype → Cloudflare tunnel → Tailscale later behind a 3-method `Transport` seam +
   endpoint-list. TLS-to-edge now, Noise E2EE later. Hero surfaces: board · blocked-answer ·
   briefing · summaries (plans next). Single-daemon UI, registry built for many.
+
+
+## Pane scrollback is a numbered document, not "the last N rows" (2026-07-29)
+- The daemon captures every line that scrolls off a pane into a per-pane transcript
+  (`terminal.rs`: `LineLog`, `capture()`, `Term::lines`), numbered, byte-bounded by
+  `tuning.terminal_line_log_bytes` (8 MB). Wire: `{t:"lines",paneId,from,to}` →
+  `{t:"lines",paneId,from,first,total,rows[]}`, half-open `[from,to)` in LINE IDS.
+  `first` = oldest retained id, `total` = id the next line gets. `history_ansi` + the 512 KB
+  raw byte ring still exist for older clients; retire once nothing asks for `history`.
+- HOW capture works, because it is non-obvious: vt100 exposes the scrollback OFFSET but not
+  its DEPTH, and the depth SATURATES at the limit, so you cannot difference it to learn what
+  just scrolled. The offset CAN be differenced — vt100 bumps it once per scrolled line to keep
+  a scrolled-back view pinned (grid.rs `scroll_up`). Park it at 1 before `process()`, read it
+  back as `1 + scrolled`. Feed bytes in 512-byte slices so a burst can never scroll more lines
+  than the parser retains. `set_size` does NOT clear scrollback (contrary to an old comment).
+- Programs repainting inside a scroll region never scroll the grid, so they never enter the
+  transcript — that is why commands stopped appearing three times.
+- The live screen push carries `first`/`total`. Without them a client scrolled up cannot learn
+  that lines left the screen since its last fetch, and a GAP opens at the seam. The client
+  asks for `[highest_held + 1, total)`.
+- Client keeps rows in a `Map<id, text>` (`RawScreen.tsx`), renders the contiguous run ending
+  at `total` — which is exactly where the live screen starts, so the seam needs no arithmetic.
+  A duplicate reply merges onto the same keys instead of appending a second copy.
+- Verify with `tools/transcript-probe.mjs` (dev server on :8080, real app + mock daemon). Two
+  probe traps, both cost time: a `<pre>`'s textContent runs the row `<div>`s together with NO
+  newline (query `pre > div`), and `document.querySelector("pre")` can return a LOWER app
+  level still mounted behind the slide — pick the pre whose text matches your fixture.
