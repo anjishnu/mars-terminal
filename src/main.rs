@@ -384,7 +384,14 @@ fn main() -> Result<()> {
         // The Rover bridge — a phone/web client over WebSocket. `qr` prints a pairing
         // QR; `serve` runs the WS ⇄ session-socket pump. Built only with `--features web`.
         #[cfg(feature = "web")]
-        Some("serve") => return serve::serve_main(args.next()),
+        Some("serve") => {
+            // `mars serve [session]` runs the bridge (or reprints the QR if one's already up);
+            // `mars serve --reset [session]` rotates the pairing QR and disconnects phones.
+            let rest: Vec<String> = args.collect();
+            let reset = rest.iter().any(|a| a == "--reset" || a == "reset");
+            let session = rest.into_iter().find(|a| !a.starts_with('-') && a != "reset");
+            return if reset { serve::reset_main(session) } else { serve::serve_main(session) };
+        }
         #[cfg(feature = "web")]
         Some("qr") => return serve::qr_main(args.next()),
         #[cfg(not(feature = "web"))]
@@ -587,6 +594,8 @@ fn ask_cli(question: String) -> Result<()> {
             | agent::AgentEvent::ShiftDelta { .. }
             | agent::AgentEvent::ShiftDone
             | agent::AgentEvent::Goals { .. }
+            | agent::AgentEvent::RoverSummary { .. }
+            | agent::AgentEvent::RoverBrief { .. }
             | agent::AgentEvent::ShellTranslation { .. } => return Ok(()),
             agent::AgentEvent::Error(e) => anyhow::bail!("agent error: {}", e),
         }
@@ -3061,6 +3070,8 @@ fn selfcheck() -> Result<()> {
             ("persona_default", prompts::PERSONA_DEFAULT, vec![]),
             ("shift_brief", prompts::SHIFT_BRIEF, vec!["{away}", "{mission}", "{prev}", "{evidence}"]),
             ("capture_goals", prompts::CAPTURE_GOALS, vec!["{evidence}"]),
+            ("rover_summary", prompts::ROVER_SUMMARY, vec![]),
+            ("rover_brief", prompts::ROVER_BRIEF, vec!["{mission}", "{prev}", "{summaries}"]),
         ] {
             assert!(!p.trim().is_empty(), "prompt template {name}.md is empty");
             for h in holders {
@@ -5266,8 +5277,9 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] health probes ({line}) ... PASS");
     }
 
-    // 44k. The host-health line actually RENDERS in the SPACES panel once it shows
-    //      (≥2 tabs). Reads the rendered cell grid (not the ANSI stream) for "up ".
+    // 44k. The SYSTEM HEALTH box RENDERS as its own panel stacked BELOW the SPACES box
+    //      once the fleet shows (≥2 tabs). Reads the rendered cell grid (not the ANSI
+    //      stream) for the box title and its UPTIME row.
     {
         let mut term = Terminal::new(TestBackend::new(120, 30))?;
         let mut app = App::new(None)?;
@@ -5277,18 +5289,18 @@ fn selfcheck() -> Result<()> {
         assert_eq!(app.mode, mode::Mode::Bar, "Ctrl+Space did not open mission control");
         app.tick(); // populate probes (uptime is present regardless)
         term.draw(|f| ui::render(f, &mut app))?;
-        // Chunk the flat cell grid into rows to check WHERE the health line lands.
+        // Chunk the flat cell grid into rows to check WHERE the health box lands.
         let w = term.backend().buffer().area.width as usize;
         let flat: Vec<char> = screen_text(&term).chars().collect();
         let rows: Vec<String> = flat.chunks(w).map(|c| c.iter().collect()).collect();
-        let title_row = rows.iter().position(|r| r.contains("SPACES")).expect("SPACES title row");
-        let is_metric = |r: &String| ["load ", "mem ", "disk ", "gpu ", "up "].iter().any(|m| r.contains(m));
-        let health_row = rows.iter().position(is_metric).expect("health line row");
+        let spaces_row = rows.iter().position(|r| r.contains("SPACES")).expect("SPACES title row");
+        let health_row = rows.iter().position(|r| r.contains("SYSTEM HEALTH")).expect("SYSTEM HEALTH title row");
+        let uptime_row = rows.iter().position(|r| r.contains("UPTIME")).expect("UPTIME row");
         assert!(
-            health_row > title_row + 2,
-            "health line should sit at the BOTTOM of the SPACES panel, not the top (SPACES row {title_row}, health row {health_row})"
+            health_row > spaces_row && uptime_row > health_row,
+            "SYSTEM HEALTH box must sit BELOW the SPACES box (SPACES {spaces_row}, HEALTH {health_row}, UPTIME {uptime_row})"
         );
-        println!("[selfcheck] health line renders at SPACES bottom ... PASS");
+        println!("[selfcheck] SYSTEM HEALTH box renders below SPACES ... PASS");
     }
 
     // 44b. Mouse selection in an EDITOR pane — key_design §7 rules "Selection =

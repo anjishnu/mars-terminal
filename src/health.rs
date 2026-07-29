@@ -1,5 +1,6 @@
-//! The SPACES health line: session uptime + host load / disk / memory, plus an
-//! optional GPU-memory reading on machines that have `nvidia-smi`.
+//! Host health: session uptime + host load / disk / memory, plus an optional
+//! GPU-memory reading on machines that have `nvidia-smi`. Feeds the SYSTEM HEALTH
+//! box (`panel()`) and the phone console's one-line summary (`line()`).
 //!
 //! Cheap probes (load, disk, memory — via the `sys::health` PAL) are sampled inline
 //! on an interval; host memory is smoothed with an exponential moving average so it
@@ -37,10 +38,45 @@ pub enum HealthLevel {
     Danger,
 }
 
-/// One metric, ready to render: its text (`"load 1.40"`) and how alarming it is.
-pub struct HealthMetric {
-    pub text: String,
+impl HealthLevel {
+    /// The louder of two levels — used to roll the per-metric levels up into one
+    /// verdict for the SYSTEM HEALTH box outline.
+    fn max(self, other: HealthLevel) -> HealthLevel {
+        use HealthLevel::*;
+        match (self, other) {
+            (Danger, _) | (_, Danger) => Danger,
+            (Warn, _) | (_, Warn) => Warn,
+            _ => Ok,
+        }
+    }
+}
+
+/// One SYSTEM HEALTH cell: the pre-formatted value (`" 63%"`, `"1.40"`) and how
+/// alarming it is. The KEY label is supplied by the renderer, not stored here.
+pub struct PanelMetric {
+    pub value: String,
     pub level: HealthLevel,
+}
+
+/// The SYSTEM HEALTH box's contents: uptime plus each optional metric. A `None`
+/// metric means "not probed on this box" (e.g. no GPU) and the renderer omits it.
+pub struct HealthPanel {
+    pub uptime: String,
+    pub load: Option<PanelMetric>,
+    pub cpu_mem: Option<PanelMetric>,
+    pub disk: Option<PanelMetric>,
+    pub gpu_mem: Option<PanelMetric>,
+}
+
+impl HealthPanel {
+    /// The worst severity across the present metrics (Ok when nothing is elevated) —
+    /// drives the box outline and title colour so the frame itself reads as a gauge.
+    pub fn worst(&self) -> HealthLevel {
+        [&self.load, &self.cpu_mem, &self.disk, &self.gpu_mem]
+            .iter()
+            .filter_map(|m| m.as_ref())
+            .fold(HealthLevel::Ok, |acc, m| acc.max(m.level))
+    }
 }
 
 impl Health {
@@ -122,40 +158,39 @@ impl Health {
         parts.join(" · ")
     }
 
-    /// The same probes as `line()`, but structured with a severity level so the SPACES
-    /// panel can render each metric in a cool hue — warming to amber, then red, only when
-    /// a value is genuinely alarming. Uptime and GPU stay cool: a pinned GPU is the point
-    /// of an ML box, not a warning. Load thresholds scale with the core count.
-    pub fn metrics(&self) -> Vec<HealthMetric> {
-        // Order is priority order: the narrow SPACES column drops from the END, so the
-        // usage trio the user cares about (load / mem / disk) leads; uptime & gpu fill in
-        // when there's room.
+    /// The same probes as `line()`, structured for the SYSTEM HEALTH box: uptime plus a
+    /// severity-tagged, fixed-width cell per metric. Percents render 4-wide (`"{n:>3}%"`)
+    /// so `6%`/`63%`/`100%` share a column; load is a bare ratio. Load thresholds scale
+    /// with the core count; GPU-memory now escalates too, since near-full VRAM is a real
+    /// OOM risk (the old inline line kept it cool).
+    pub fn panel(&self) -> HealthPanel {
         let cores = std::thread::available_parallelism().map(|n| n.get() as f64).unwrap_or(8.0);
-        let mut v = Vec::new();
-        if let Some(l) = self.load1 {
+        let load = self.load1.map(|l| {
             let level = if l > cores * 1.5 { HealthLevel::Danger } else if l > cores { HealthLevel::Warn } else { HealthLevel::Ok };
-            v.push(HealthMetric { text: format!("load {l:.2}"), level });
-        }
-        if let Some(m) = self.mem_ema {
+            PanelMetric { value: format!("{l:.2}"), level }
+        });
+        let cpu_mem = self.mem_ema.map(|m| {
             let m = m.round() as u8;
             let level = if m >= 92 { HealthLevel::Danger } else if m >= 80 { HealthLevel::Warn } else { HealthLevel::Ok };
-            v.push(HealthMetric { text: format!("mem {m}%"), level });
-        }
-        if let Some(d) = self.disk_free_pct {
-            // Show disk USAGE (like mem), and warm as free space runs low — shorter than
-            // "82% free" too, which matters in the narrow SPACES column.
+            PanelMetric { value: format!("{m:>3}%"), level }
+        });
+        let disk = self.disk_free_pct.map(|d| {
+            // Show disk USAGE (like mem), and warm as free space runs low.
             let used = 100u8.saturating_sub(d);
             let level = if d < 7 { HealthLevel::Danger } else if d < 15 { HealthLevel::Warn } else { HealthLevel::Ok };
-            v.push(HealthMetric { text: format!("disk {used}%"), level });
-        }
-        if let Some(g) = self.gpu_pct {
-            v.push(HealthMetric { text: format!("gpu {g}%"), level: HealthLevel::Ok });
-        }
-        v.push(HealthMetric {
-            text: format!("up {}", fmt_uptime(self.start.elapsed().as_secs())),
-            level: HealthLevel::Ok,
+            PanelMetric { value: format!("{used:>3}%"), level }
         });
-        v
+        let gpu_mem = self.gpu_pct.map(|g| {
+            let level = if g >= 95 { HealthLevel::Danger } else if g >= 85 { HealthLevel::Warn } else { HealthLevel::Ok };
+            PanelMetric { value: format!("{g:>3}%"), level }
+        });
+        HealthPanel {
+            uptime: fmt_uptime(self.start.elapsed().as_secs()),
+            load,
+            cpu_mem,
+            disk,
+            gpu_mem,
+        }
     }
 }
 

@@ -1981,24 +1981,17 @@ fn render_workspaces_panel(frame: &mut Frame, app: &App, rect: Rect) {
     let teal = app.tuning.palette.info;
     let mut bstyle = Style::default().fg(teal);
     if active { bstyle = bstyle.add_modifier(Modifier::BOLD); }
+    // No bottom border — drop the dividing line to VITALS below for a little breathing room.
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(bstyle)
         .title(Span::styled(" SPACES ", Style::default().fg(teal).add_modifier(Modifier::BOLD)));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    // The host-health lines are pinned to the BOTTOM of the panel (rendered after the body,
-    // below the sky). Two rows when there's room, so ALL metrics show in the narrow column;
-    // reserve them here so the board flows above.
-    let show_health = app.tuning.health_line == 1 && inner.height >= 2;
-    let health_rows: u16 = if !show_health { 0 } else if inner.height >= 5 { 2 } else { 1 };
-    let body = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: inner.height.saturating_sub(health_rows),
-    };
+    // Just workspaces + starfield now — host health lives in its own SYSTEM HEALTH box
+    // stacked below this one (see render_bar_dropdown / render_system_health).
+    let body = inner;
 
     let rows = app.bar_workspace_rows();
     let ih = body.height as usize;
@@ -2019,83 +2012,86 @@ fn render_workspaces_panel(frame: &mut Frame, app: &App, rect: Rect) {
             Rect { x: body.x, y: body.y + used as u16, width: body.width, height: (ih - used) as u16 },
         );
     }
-
-    // Host-health, pinned to the very bottom — one or two colour-coded, justified rows.
-    if health_rows > 0 {
-        render_health(frame, app, Rect { x: inner.x, y: inner.y + inner.height - health_rows, width: inner.width, height: health_rows });
-    }
 }
 
-/// The SPACES host-health block: all metrics spread over `area.height` rows (so a narrow
-/// column shows everything on two lines), each row justified.
-fn render_health(frame: &mut Frame, app: &App, area: Rect) {
-    let metrics = app.health.metrics();
-    if metrics.is_empty() || area.height == 0 {
-        return;
-    }
-    let lines = area.height as usize;
-    let per = ((metrics.len() + lines - 1) / lines).max(1); // balance across the rows
-    for (li, chunk) in metrics.chunks(per).enumerate() {
-        if li as u16 >= area.height {
-            break;
-        }
-        render_health_row(frame, app, Rect { x: area.x, y: area.y + li as u16, width: area.width, height: 1 }, chunk);
-    }
-}
-
-/// One health row: each metric in a cool hue (teal), warming to amber then red only when
-/// it's alarming, spread across the width in a justified layout (dropping any that don't
-/// fit rather than overflowing).
-fn render_health_row(frame: &mut Frame, app: &App, area: Rect, metrics: &[crate::health::HealthMetric]) {
+/// The VITALS box: a bordered, titled panel stacked below SPACES. Three two-column
+/// rows (UPTIME / LOAD·CPU-MEM / DISK·GPU-MEM), keys in bold white and numbers in a
+/// level-coloured green→clay→rust ramp (healthy numbers match the status-bar green).
+/// The box outline + title take the worst severity across present metrics, so the frame
+/// itself reads as a gauge — the same colour as the most alarming indicator.
+fn render_system_health(frame: &mut Frame, app: &App, rect: Rect) {
     use crate::health::HealthLevel;
-    if metrics.is_empty() || area.width < 4 {
+    // Local palette: the clay/rust warn/danger ramp is specific to this gauge, not a theme
+    // token. Healthy numbers use the status-bar green so a nominal box reads as one colour.
+    const CLAY: Color = Color::Rgb(206, 123, 74);  // Warn number / outline
+    const RUST: Color = Color::Rgb(170, 64, 38);   // Danger number / outline
+    const KEY: Color = Color::Rgb(238, 238, 238);   // bold white key label
+    let green = app.tuning.palette.success;
+
+    let panel = app.health.panel();
+    let frame_colour = match panel.worst() {
+        HealthLevel::Ok => green,
+        HealthLevel::Warn => CLAY,
+        HealthLevel::Danger => RUST,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(frame_colour))
+        .title(Span::styled(" VITALS ", Style::default().fg(frame_colour).add_modifier(Modifier::BOLD)));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height == 0 {
         return;
     }
-    let p = &app.tuning.palette;
-    let colour = |lvl: HealthLevel| match lvl {
-        HealthLevel::Ok => p.info,       // cool teal
-        HealthLevel::Warn => p.warning,  // amber
-        HealthLevel::Danger => p.danger, // red
+
+    // Fixed geometry so col2 always starts at the same x: a 7-wide key + space, a
+    // right-justified value field, then a 2-space gutter before col2.
+    const KEY_W: usize = 7;
+    const VAL_W: usize = 5; // fits "1.40" and " 63%"
+    const GUTTER: &str = "  ";
+    let num_colour = |lvl: HealthLevel| match lvl {
+        HealthLevel::Ok => green,
+        HealthLevel::Warn => CLAY,
+        HealthLevel::Danger => RUST,
     };
-    let pad = 1usize;
-    let inner = (area.width as usize).saturating_sub(pad * 2);
-    // A narrow SPACES column can't hold all five metrics; keep the leading (most
-    // important) ones that fit with at least single-space separators rather than
-    // overflowing and clipping mid-word.
-    let mut fit: Vec<&crate::health::HealthMetric> = Vec::new();
-    let mut used = 0usize;
-    for m in metrics {
-        let w = m.text.chars().count();
-        let next = if fit.is_empty() { w } else { used + 1 + w };
-        if !fit.is_empty() && next > inner {
-            break;
+    // A KEY + right-justified value pair; a missing metric shows a dim em-dash.
+    let cell = |key: &str, m: &Option<crate::health::PanelMetric>| -> Vec<Span<'static>> {
+        let mut spans = vec![Span::styled(
+            format!("{key:<KEY_W$} "),
+            Style::default().fg(KEY).add_modifier(Modifier::BOLD),
+        )];
+        match m {
+            Some(pm) => spans.push(Span::styled(
+                format!("{:>VAL_W$}", pm.value),
+                Style::default().fg(num_colour(pm.level)),
+            )),
+            None => spans.push(Span::styled(
+                format!("{:>VAL_W$}", "—"),
+                Style::default().fg(app.tuning.palette.text_faint),
+            )),
         }
-        used = next;
-        fit.push(m);
-    }
-    let n = fit.len();
-    let total: usize = fit.iter().map(|m| m.text.chars().count()).sum();
-    let slack = inner.saturating_sub(total); // ≥ n-1 by construction, so gaps ≥ 1
-    // Distribute the slack evenly between metrics (justify).
-    let gap = |i: usize| -> usize {
-        if n <= 1 {
-            0
-        } else {
-            (slack / (n - 1) + usize::from(i < slack % (n - 1))).max(1)
-        }
+        spans
     };
-    let mut spans = vec![Span::raw(" ".repeat(pad))];
-    for (i, m) in fit.iter().enumerate() {
-        let mut style = Style::default().fg(colour(m.level));
-        if m.level == HealthLevel::Danger {
-            style = style.add_modifier(Modifier::BOLD);
-        }
-        spans.push(Span::styled(m.text.clone(), style));
-        if i < n - 1 {
-            spans.push(Span::raw(" ".repeat(gap(i))));
-        }
+
+    // Row 1: UPTIME alone (spans the width). Rows 2–3: two aligned columns.
+    let uptime_metric = Some(crate::health::PanelMetric { value: panel.uptime.clone(), level: HealthLevel::Ok });
+    let mut r1 = cell("UPTIME", &uptime_metric);
+    // Uptime is a duration, not a percent — it's always nominal, so colour it green too.
+    if let Some(s) = r1.get_mut(1) { s.style = Style::default().fg(green); }
+
+    let mut r2 = cell("LOAD", &panel.load);
+    r2.push(Span::raw(GUTTER));
+    r2.extend(cell("CPU-MEM", &panel.cpu_mem));
+
+    let mut r3 = cell("DISK", &panel.disk);
+    // Omit the whole GPU cell on a non-GPU box rather than showing a dim placeholder.
+    if panel.gpu_mem.is_some() {
+        r3.push(Span::raw(GUTTER));
+        r3.extend(cell("GPU-MEM", &panel.gpu_mem));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    let text = Text::from(vec![Line::from(r1), Line::from(r2), Line::from(r3)]);
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
 /// The Commands launcher — the classic single-column dropdown, in its own bordered
@@ -2154,16 +2150,32 @@ fn render_bar_dropdown(
     // focuses the panel, → the launcher.
     let ws_h = max_height.max(4);
     let ws_w = app.tuning.tree_width.clamp(20, bar_area.width.saturating_sub(30).max(20));
-    let ws_rect = Rect { x: bar_area.x, y: bar_area.y.saturating_sub(ws_h), width: ws_w, height: ws_h };
+    let col_rect = Rect { x: bar_area.x, y: bar_area.y.saturating_sub(ws_h), width: ws_w, height: ws_h };
     let cmd_rect = Rect {
         x: bar_area.x + ws_w,
         y: bar_area.y.saturating_sub(cmd_h),
         width: bar_area.width.saturating_sub(ws_w),
         height: cmd_h,
     };
-    clear_panel(frame, app, ws_rect);
+    // The left column splits vertically: SYSTEM HEALTH takes a fixed slab (title + 3
+    // rows + borders) anchored at the BOTTOM, SPACES fills the rest above it. Both
+    // bottom-anchored and adjacent. Gated on the same toggle that fed the old inline line.
+    const HEALTH_H: u16 = 5;
+    let show_health = app.tuning.health_line == 1 && col_rect.height > HEALTH_H + 2;
+    let (ws_rect, health_rect) = if show_health {
+        (
+            Rect { height: col_rect.height - HEALTH_H, ..col_rect },
+            Some(Rect { y: col_rect.y + col_rect.height - HEALTH_H, height: HEALTH_H, ..col_rect }),
+        )
+    } else {
+        (col_rect, None)
+    };
+    clear_panel(frame, app, col_rect);
     clear_panel(frame, app, cmd_rect);
     render_workspaces_panel(frame, app, ws_rect);
+    if let Some(hr) = health_rect {
+        render_system_health(frame, app, hr);
+    }
     render_command_panel(frame, app, cmd_rect, true, palette.column == crate::palette::BarColumn::Commands);
     Some(Rect {
         x: bar_area.x,

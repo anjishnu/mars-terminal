@@ -180,6 +180,26 @@ pub struct WatchState {
 #[derive(Clone, Copy)]
 pub enum WatchReason { Exit, Quiet }
 
+/// One cached Rover MAP result: the phone-facing one-line summary of a
+/// workspace, plus the hash of the RAW tail it was computed from (the
+/// incremental key — a pane is only re-summarized when its tail hash changes)
+/// and the provider provenance shown on the phone.
+#[derive(Clone)]
+pub struct RoverSummary {
+    pub text: String,
+    pub tail_hash: u64,
+    pub provider: String,
+}
+
+/// Stable hash of a string — the incremental key for the Rover map/reduce (only
+/// re-summarize a pane whose tail changed; only re-brief when a summary changed).
+fn hash_str(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// A request to highlight a buffer, handed to the background syntax worker. Carries a
 /// content snapshot so the worker never touches live app state on its thread.
 // Without the `syntax` feature the stub worker ignores the payload — don't warn.
@@ -486,6 +506,31 @@ pub struct App {
     pub ask_scroll: usize,
     /// Auto-naming state: one request in flight; tabs already tried.
     pub bg_busy: bool,
+    /// Rover Mission Control (map → reduce), daemon-owned. Only runs while a phone
+    /// is subscribed (`rover_active`); results are pushed in the board/briefing
+    /// frames and the phone purely renders them.
+    ///
+    /// MAP cache: one cached one-line summary per workspace terminal, keyed by
+    /// TermId. Incremental — a pane is re-summarized only when its raw-tail hash
+    /// changes, so idle workspaces are never re-summarized.
+    pub rover_summaries: HashMap<TermId, RoverSummary>,
+    /// The (TermId, tail_hash) currently out to the model, so the landing result
+    /// is stored against the tail it was actually computed from.
+    rover_map_inflight: Option<(TermId, u64)>,
+    /// REDUCE result: the composed live mission briefing pushed to the phone.
+    pub rover_brief: Option<String>,
+    /// Whether the current `rover_brief` is the deterministic placeholder (host
+    /// had no key / the reduce couldn't run) rather than a model-composed
+    /// narrative. Flagged on the pushed briefing frame so the phone escalates it
+    /// to the Lovable fallback instead of treating it as the real briefing.
+    rover_brief_fallback: bool,
+    /// Signature (summaries + verdicts + mission) the current `rover_brief` was
+    /// composed from — the reduce only re-runs when this changes.
+    rover_brief_sig: u64,
+    /// The previous briefing text, for the reduce's `{prev}` continuity block.
+    rover_prev_brief: String,
+    /// A phone is subscribed → spend tokens on the map/reduce; idle otherwise.
+    pub rover_active: bool,
     auto_name_attempted: std::collections::HashSet<TabId>,
     /// Shell composer: the query is a ready-to-run command (translated or
     /// typed literally with no key) — the next Enter runs it.
@@ -646,6 +691,13 @@ impl App {
             agent_history: Vec::new(),
             ask_scroll: 0,
             bg_busy: false,
+            rover_summaries: HashMap::new(),
+            rover_map_inflight: None,
+            rover_brief: None,
+            rover_brief_fallback: false,
+            rover_brief_sig: 0,
+            rover_prev_brief: String::new(),
+            rover_active: false,
             auto_name_attempted: std::collections::HashSet::new(),
             shell_ready: false,
             translate_call_id: None,
@@ -895,10 +947,15 @@ impl App {
                 let ItemKind::Surface(s) = kind else { return None };
                 let blocked = s.verdict == Verdict::Blocked;
                 let prompt = description.clone();
+                let kind = match self.panes.get(&s.pane_id).map(|p| &p.content) {
+                    Some(PaneContent::Editor(_)) => "editor",
+                    _ => "terminal",
+                };
                 let mut row = serde_json::json!({
                     "id": s.tab_index.to_string(),
                     "name": label,
                     "verdict": s.verdict.label(), // failed|blocked|done|running|idle
+                    "kind": kind,                 // editor → the phone renders it as a document
                     "why": description,
                     "ageSecs": s.age_secs,
                     "paneId": s.pane_id.to_string(), // so the phone can type into this pane
@@ -908,6 +965,31 @@ impl App {
                         "prompt": prompt,
                         "paneId": s.pane_id.to_string(),
                     });
+                }
+                // The daemon-owned MAP summary (WorkspaceRow.summary) — the phone
+                // renders it directly, no per-row round-trip. Present only for a
+                // terminal that's been mapped; a doc keeps its gist in `why`.
+                if let Some(PaneContent::Terminal(t)) = self.panes.get(&s.pane_id).map(|p| &p.content) {
+                    if let Some(sum) = self.rover_summaries.get(t) {
+                        // The keyless MAP fills the cache with a deterministic
+                        // tier-0 line (provider sentinel "tier-0"). Flag it so the
+                        // phone shows it instantly AND escalates to Lovable; a
+                        // model-produced line carries its real provenance and no flag.
+                        row["summary"] = if sum.provider == "tier-0" {
+                            serde_json::json!({
+                                "text": sum.text,
+                                "computedBy": "",
+                                "fallback": true,
+                                "ts": ts,
+                            })
+                        } else {
+                            serde_json::json!({
+                                "text": sum.text,
+                                "computedBy": sum.provider,
+                                "ts": ts,
+                            })
+                        };
+                    }
                 }
                 Some(row)
             })
@@ -921,33 +1003,58 @@ impl App {
         .to_string()
     }
 
-    /// The reattach briefing as JSON — the seam's `Briefing` — when a shift
-    /// report exists, else `None` (the phone keeps its last board).
+    /// The mission briefing as JSON — the seam's `Briefing`. Two sources, one
+    /// shape: the reattach shift report (the desktop return ritual) when it
+    /// exists, else the live REDUCE briefing composed from the cached
+    /// per-workspace summaries (`rover_brief`) — so a normally-running session
+    /// pushes a populated `narrative` the phone renders directly. `None` when
+    /// neither exists yet (the phone keeps its last board).
     pub fn mobile_briefing_json(&self) -> Option<String> {
-        let report = self.shift_report.as_ref()?;
-        let rows: Vec<serde_json::Value> = report
-            .rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "verdict": r.verdict.label(),
-                    "tab": r.tab,
-                    "text": r.text,
-                    "agoSecs": r.ago_secs,
+        if let Some(report) = self.shift_report.as_ref() {
+            let rows: Vec<serde_json::Value> = report
+                .rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "verdict": r.verdict.label(),
+                        "tab": r.tab,
+                        "text": r.text,
+                        "agoSecs": r.ago_secs,
+                    })
                 })
-            })
-            .collect();
-        Some(
-            serde_json::json!({
-                "awaySecs": report.away_secs,
-                "mission": report.mission,
-                "narrative": report.narrative,
-                "rows": rows,
-                "suggestion": report.suggestion,
-                "ts": crate::worklog::now_secs(),
-            })
-            .to_string(),
-        )
+                .collect();
+            return Some(
+                serde_json::json!({
+                    "awaySecs": report.away_secs,
+                    "mission": report.mission,
+                    "narrative": report.narrative,
+                    "rows": rows,
+                    "suggestion": report.suggestion,
+                    "ts": crate::worklog::now_secs(),
+                })
+                .to_string(),
+            );
+        }
+        // Live map-reduce briefing: no manifest rows (the phone's console renders
+        // the board), no away window (the captain isn't away). The narrative is
+        // the star; the phone prefers it over its own thinner ask.
+        let narrative = self.rover_brief.as_ref()?;
+        let mission = crate::worklog::load_mission(&self.session_label()).map(|(m, _)| m);
+        let mut frame = serde_json::json!({
+            "awaySecs": 0,
+            "mission": mission,
+            "narrative": narrative,
+            "rows": [],
+            "suggestion": serde_json::Value::Null,
+            "ts": crate::worklog::now_secs(),
+        });
+        // A deterministic placeholder narrative (host had no key) is flagged so the
+        // phone escalates it to Lovable over the board labels; a model-composed one
+        // omits the flag and renders as the real briefing.
+        if self.rover_brief_fallback {
+            frame["fallback"] = serde_json::json!(true);
+        }
+        Some(frame.to_string())
     }
 
     /// Name / why-snippet / age for one surface, from its pane + terminal + watch.
@@ -957,6 +1064,28 @@ impl App {
             _ => None,
         };
         let name = crate::ui::pane_name(self, pid);
+        // A document workspace has no run status — so instead of a bare "idle", give its
+        // substance: the first non-blank line of the buffer as an at-a-glance gist.
+        if let Some(PaneContent::Editor(bid)) = self.panes.get(&pid).map(|p| &p.content) {
+            let gist = self
+                .buffers
+                .get(bid)
+                .and_then(|b| {
+                    (0..b.line_count().min(80)).find_map(|i| {
+                        let t = b.rope.line(i).to_string().trim().to_string();
+                        (!t.is_empty()).then_some(t)
+                    })
+                })
+                .map(|s| {
+                    if s.chars().count() > 72 {
+                        format!("{}…", s.chars().take(71).collect::<String>())
+                    } else {
+                        s
+                    }
+                })
+                .unwrap_or_default();
+            return (name, gist, 0);
+        }
         let w = tid.and_then(|t| self.watches.get(&t));
         // Honest content: a summary earns its line only when it says something the
         // status doesn't. The LLM verdict when present; else the exit outcome, the
@@ -1627,28 +1756,29 @@ impl App {
             PaneContent::Terminal(tid) => {
                 let t = self.terms.get(tid)?;
                 let screen = t.screen();
-                let (_, cols) = screen.size();
-                // Per-row ANSI (SGR colours + attributes) so the phone renders colour, not
-                // just white text — rows_formatted re-emits each row's styling self-contained.
-                let mut text = String::new();
-                for (i, row) in screen.rows_formatted(0, cols).enumerate() {
-                    if i > 0 {
-                        text.push('\n');
-                    }
-                    text.push_str(&String::from_utf8_lossy(&row));
-                }
+                // Serialize the grid cell-by-cell as SGR + literal characters. We deliberately
+                // avoid `rows_formatted`, which optimizes blank runs into cursor-forward escapes
+                // (`\x1b[<n>C`); the phone's lightweight parser renders SGR only, so those gaps
+                // would collapse and columns misalign. Emitting real spaces keeps alignment exact.
+                let text = terminal_screen_to_ansi(&screen);
                 serde_json::json!({ "pane": pane_id.to_string(), "kind": "terminal", "text": text })
             }
             PaneContent::Editor(bid) => {
                 // Editors are sent as STRUCTURED lines (not a fixed-width screenshot) so the
-                // phone can wrap and render them natively for mobile — a window of the file
-                // around the cursor, each with its 1-based line number.
+                // phone can wrap and render them natively for mobile. Send the WHOLE document so
+                // the phone can scroll all of it; only a pathologically large file falls back to
+                // a big window around the cursor, to bound the payload.
                 let buf = self.buffers.get(bid)?;
                 let total = buf.line_count().max(1);
-                let window = 160usize;
                 let cur = pane.cursor_row.min(total - 1);
-                let start = cur.saturating_sub(window / 2).min(total.saturating_sub(window));
-                let lines: Vec<serde_json::Value> = (start..(start + window).min(total))
+                const MAX_LINES: usize = 6000;
+                let (start, end) = if total <= MAX_LINES {
+                    (0, total)
+                } else {
+                    let s = cur.saturating_sub(MAX_LINES / 2).min(total - MAX_LINES);
+                    (s, s + MAX_LINES)
+                };
+                let lines: Vec<serde_json::Value> = (start..end)
                     .map(|i| {
                         let line = buf.rope.line(i).to_string();
                         serde_json::json!({ "n": i + 1, "t": line.trim_end_matches(['\n', '\r']) })
@@ -5322,12 +5452,37 @@ impl App {
                         .unwrap_or(0);
                     crate::worklog::save_goals(&self.session_label(), &goals, ts);
                 }
+                AgentEvent::RoverSummary { term_id, text, provider } => {
+                    // Store against the tail hash it was computed from (captured at
+                    // fire time), so the incremental guard knows this pane is fresh.
+                    let hash = match self.rover_map_inflight.take() {
+                        Some((id, h)) if id == term_id => h,
+                        other => {
+                            self.rover_map_inflight = other; // a stray/duplicate — leave the gate
+                            hash_str(&self.terminal_tail(term_id, self.tuning.agent_scrollback_context))
+                        }
+                    };
+                    self.rover_summaries.insert(term_id, RoverSummary { text, tail_hash: hash, provider });
+                    self.needs_redraw = true;
+                }
+                AgentEvent::RoverBrief { text } => {
+                    self.rover_prev_brief = text.clone(); // continuity for the next reduce
+                    self.rover_brief = Some(text);
+                    self.rover_brief_fallback = false; // host-composed: the real briefing
+                    self.needs_redraw = true;
+                }
             }
         }
 
         self.maybe_auto_name();
         self.maybe_auto_name_session();
         self.maybe_fire_watches();
+        // Rover Mission Control (only while a phone is subscribed): the incremental
+        // per-workspace MAP, then the REDUCE that composes the briefing from it.
+        // After the higher-priority watch verdicts, so a phone glance never starves
+        // the desktop's own supervision.
+        self.maybe_rover_map();
+        self.maybe_rover_brief();
 
         // Timer-driven surfaces that animate without input: the agent spinner
         // (every frame while thinking) and the which-key panel (appears a few
@@ -6068,6 +6223,170 @@ impl App {
         }
         self.bg_busy = true;
         agent::watch_summary(cfg, id, reason, tail, exit, self.tuning.watch_quiet_secs, self.agent_tx.clone());
+    }
+
+    /// The TermId of each board workspace that is a terminal, in board order —
+    /// exactly the panes the phone shows a row for, so the MAP summarizes what the
+    /// board displays (the "worst" pane per tab that `bar_workspace_rows` picks).
+    fn rover_terminal_surfaces(&self) -> Vec<TermId> {
+        self.bar_workspace_rows()
+            .into_iter()
+            .filter_map(|r| {
+                let crate::palette::ItemKind::Surface(s) = r.kind else { return None };
+                match self.panes.get(&s.pane_id).map(|p| &p.content) {
+                    Some(PaneContent::Terminal(t)) => Some(*t),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Rover MAP (daemon-side, incremental): (re)summarize the ONE workspace
+    /// whose raw tail changed since its cached summary; leave the rest cached.
+    /// One LLM call per fire, throttled, gated on `bg_busy` — so it never hammers
+    /// the model and idle workspaces are never re-summarized. Keyless hosts fill
+    /// the cache deterministically (tier-0 triage), no tokens spent.
+    fn maybe_rover_map(&mut self) {
+        if !self.rover_active || self.bg_busy || self.agent_pending {
+            return;
+        }
+        // Cold start (nothing mapped yet) fires promptly for a snappy first board;
+        // once the cache is warm, throttle to one changed pane per interval.
+        if !self.rover_summaries.is_empty() {
+            let ticks = (self.tuning.rover_map_min_secs * 1000 / self.tuning.poll_interval_ms.max(1)).max(1);
+            if self.frame_tick % ticks != 0 {
+                return;
+            }
+        }
+        let cfg = agent::AgentConfig::from_env();
+        // Remote box with the tunnel down: don't spend the trigger — try again once
+        // the broker is reachable (mirrors maybe_fire_watches).
+        if cfg.provider == "broker" && !cfg.is_configured() {
+            return;
+        }
+        let keyed = cfg.is_configured();
+        for id in self.rover_terminal_surfaces() {
+            let tail = self.terminal_tail(id, self.tuning.agent_scrollback_context);
+            if tail.trim().is_empty() {
+                continue;
+            }
+            let hash = hash_str(&tail);
+            let fresh = self.rover_summaries.get(&id).map(|s| s.tail_hash == hash).unwrap_or(false);
+            if fresh {
+                continue;
+            }
+            if !keyed {
+                // Keyless: deterministic tier-0 line stands in for the model. Free,
+                // so fill every stale pane in one pass.
+                let exited = self.terms.get(&id).map(|t| t.exited).unwrap_or(false);
+                let exit = self.terms.get(&id).and_then(|t| t.exit_code());
+                let tri = crate::briefing::triage(&tail, exit, !exited);
+                self.rover_summaries.insert(id, RoverSummary {
+                    text: tri.text,
+                    tail_hash: hash,
+                    provider: "tier-0".into(),
+                });
+                continue;
+            }
+            // Keyed: one model call, then stop (the gate serializes the rest).
+            self.rover_map_inflight = Some((id, hash));
+            self.bg_busy = true;
+            agent::rover_summarize(cfg, id, tail, self.agent_tx.clone());
+            return;
+        }
+    }
+
+    /// Rover REDUCE (daemon-side): compose the mission briefing as a synthesis
+    /// over the cached per-workspace summaries — re-run ONLY when a summary,
+    /// verdict, or the mission changed (the `rover_brief_sig` guard), never every
+    /// tick. Keyless hosts get the deterministic placeholder instead.
+    fn maybe_rover_brief(&mut self) {
+        if !self.rover_active || self.bg_busy || self.agent_pending {
+            return;
+        }
+        // Cold start (no briefing yet) fires promptly; once one exists, throttle.
+        if self.rover_brief.is_some() {
+            let ticks = (self.tuning.rover_brief_min_secs * 1000 / self.tuning.poll_interval_ms.max(1)).max(1);
+            if self.frame_tick % ticks != 0 {
+                return;
+            }
+        }
+        let mission = crate::worklog::load_mission(&self.session_label()).map(|(m, _)| m).unwrap_or_default();
+        let Some(summaries) = self.rover_summaries_block() else { return };
+        let sig = hash_str(&format!("{mission}\n{summaries}"));
+        if sig == self.rover_brief_sig && self.rover_brief.is_some() {
+            return; // nothing changed since the last briefing
+        }
+        let cfg = agent::AgentConfig::from_env();
+        if cfg.provider == "broker" && !cfg.is_configured() {
+            return;
+        }
+        self.rover_brief_sig = sig; // claim the signature before firing so we don't double-fire
+        if !cfg.is_configured() {
+            // Keyless: the deterministic placeholder briefing, pushed as-is but
+            // FLAGGED as a fallback candidate — the phone escalates it to Lovable
+            // (rather than treating it as the real briefing) while showing it now.
+            let det = self.rover_deterministic_brief();
+            self.rover_prev_brief = det.clone();
+            self.rover_brief = Some(det);
+            self.rover_brief_fallback = true;
+            self.needs_redraw = true;
+            return;
+        }
+        self.bg_busy = true;
+        agent::rover_brief(cfg, summaries, mission, self.rover_prev_brief.clone(), self.agent_tx.clone());
+    }
+
+    /// The reduce input: one line per workspace — name, verdict, and its cached
+    /// MAP summary (falling back to the board's tier-0 `why` for a pane not yet
+    /// mapped, or a document's gist). `None` when the board has no content.
+    fn rover_summaries_block(&self) -> Option<String> {
+        let mut lines = Vec::new();
+        for r in self.bar_workspace_rows() {
+            let crate::palette::ItemKind::Surface(s) = &r.kind else { continue };
+            let verdict = s.verdict.label();
+            let summary = match self.panes.get(&s.pane_id).map(|p| &p.content) {
+                Some(PaneContent::Terminal(t)) => self.rover_summaries.get(t).map(|x| x.text.clone()),
+                _ => None,
+            }
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| r.description.clone());
+            lines.push(format!("- {} [{}]: {}", r.label, verdict, summary.trim()));
+        }
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
+
+    /// Keyless live briefing: plain English from the board's verdict counts —
+    /// never blocked on a model, never wrong (the placeholder the reduce would
+    /// otherwise author).
+    fn rover_deterministic_brief(&self) -> String {
+        use crate::briefing::Verdict;
+        let rows = self.bar_workspace_rows();
+        let count = |v: Verdict| {
+            rows.iter()
+                .filter(|r| matches!(&r.kind, crate::palette::ItemKind::Surface(s) if s.verdict == v))
+                .count()
+        };
+        let (failed, blocked, done, running) =
+            (count(Verdict::Failed), count(Verdict::Blocked), count(Verdict::Done), count(Verdict::Running));
+        let mut parts = Vec::new();
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+        if blocked > 0 {
+            parts.push(format!("{blocked} waiting on you"));
+        }
+        if running > 0 {
+            parts.push(format!("{running} still running"));
+        }
+        if done > 0 {
+            parts.push(format!("{done} finished clean"));
+        }
+        if parts.is_empty() {
+            "The board is quiet — nothing running, nothing waiting on you.".to_string()
+        } else {
+            format!("On the board: {}.", parts.join(", "))
+        }
     }
 
     /// Workspaces-panel `s`: pull an on-demand summary for the highlighted surface.
@@ -6883,4 +7202,78 @@ fn key_to_bytes(key: &KeyEvent) -> Vec<u8> {
         KeyCode::Delete    => vec![0x1b, b'[', b'3', b'~'],
         _ => vec![],
     }
+}
+
+/// Append the SGR params for one vt100 colour (foreground when `fg`, else background).
+/// Default colours emit nothing, so the client falls back to its own terminal defaults.
+fn push_sgr_color(p: &mut Vec<String>, c: vt100::Color, fg: bool) {
+    match c {
+        vt100::Color::Default => {}
+        vt100::Color::Idx(n) if n < 8 => p.push(((if fg { 30 } else { 40 }) + n as u16).to_string()),
+        vt100::Color::Idx(n) if n < 16 => p.push(((if fg { 90 } else { 100 }) + (n as u16 - 8)).to_string()),
+        vt100::Color::Idx(n) => p.push(format!("{};5;{}", if fg { 38 } else { 48 }, n)),
+        vt100::Color::Rgb(r, g, b) => p.push(format!("{};2;{};{};{}", if fg { 38 } else { 48 }, r, g, b)),
+    }
+}
+
+/// The full self-contained SGR sequence for a cell's style (leading `0` resets any prior run).
+fn cell_sgr(cell: &vt100::Cell) -> String {
+    let mut p: Vec<String> = vec!["0".to_string()];
+    if cell.bold() { p.push("1".to_string()); }
+    if cell.italic() { p.push("3".to_string()); }
+    if cell.underline() { p.push("4".to_string()); }
+    if cell.inverse() { p.push("7".to_string()); }
+    push_sgr_color(&mut p, cell.fgcolor(), true);
+    push_sgr_color(&mut p, cell.bgcolor(), false);
+    format!("\x1b[{}m", p.join(";"))
+}
+
+/// Serialize a terminal screen to newline-separated rows of SGR-styled text, using real
+/// spaces for blank cells (never cursor-movement escapes) so a simple SGR-only client parser
+/// keeps every column aligned. Wide-char continuation cells are skipped (the grapheme already
+/// occupies two columns); trailing blank cells per row are trimmed to keep the payload small.
+fn terminal_screen_to_ansi(screen: &vt100::Screen) -> String {
+    let (rows, cols) = screen.size();
+    let mut text = String::new();
+    for row in 0..rows {
+        if row > 0 {
+            text.push('\n');
+        }
+        // Last column worth emitting: a non-blank glyph, or a cell painting a background.
+        let mut last: i32 = -1;
+        for col in 0..cols {
+            if let Some(cell) = screen.cell(row, col) {
+                let blank = cell.contents().is_empty()
+                    && matches!(cell.bgcolor(), vt100::Color::Default)
+                    && !cell.inverse();
+                if !blank {
+                    last = col as i32;
+                }
+            }
+        }
+        if last < 0 {
+            continue;
+        }
+        let mut prev: Option<String> = None;
+        for col in 0..=(last as u16) {
+            match screen.cell(row, col) {
+                Some(cell) if cell.is_wide_continuation() => {}
+                Some(cell) => {
+                    let sgr = cell_sgr(cell);
+                    if prev.as_deref() != Some(sgr.as_str()) {
+                        text.push_str(&sgr);
+                        prev = Some(sgr);
+                    }
+                    let c = cell.contents();
+                    if c.is_empty() {
+                        text.push(' ');
+                    } else {
+                        text.push_str(&c);
+                    }
+                }
+                None => text.push(' '),
+            }
+        }
+    }
+    text
 }

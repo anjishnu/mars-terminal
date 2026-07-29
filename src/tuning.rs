@@ -149,6 +149,15 @@ pub struct Tuning {
     /// briefing to a subscribed mobile client (the Rover phone bridge). The main
     /// loop ticks far faster; this throttles the LAN push to a sane cadence.
     pub mobile_push_interval_ms: u64,
+    /// Minimum seconds between Rover MAP calls (the per-workspace summary). One
+    /// changed pane is (re)summarized per interval, so a busy board fans out over
+    /// several intervals instead of hammering the model. Only active while a phone
+    /// is subscribed and a key is configured.
+    pub rover_map_min_secs: u64,
+    /// Minimum seconds between Rover REDUCE calls (the mission briefing composed
+    /// from the summaries). It only re-runs when a summary/verdict actually
+    /// changed; this bounds how often a burst of map updates re-briefs.
+    pub rover_brief_min_secs: u64,
     /// The resolved color palette (theme + per-token knob overrides). Read by the
     /// render layer; the `theme_*`/`selection_bg`/… knobs above are its override
     /// surface, not read directly by `ui.rs`.
@@ -222,6 +231,8 @@ impl Default for Tuning {
             watch_min_active_secs: 10,
             goal_tracking: 1,
             mobile_push_interval_ms: 1000,
+            rover_map_min_secs: 4,
+            rover_brief_min_secs: 12,
             palette: Palette::mission_control(),
         }
     }
@@ -452,6 +463,14 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
              briefing to a subscribed phone (the Rover bridge). The tick loop \
              runs far faster; this throttles the LAN push. Only active while a \
              phone is subscribed.")),
+        ("rover_map_min_secs", knob(json!(d.rover_map_min_secs),
+            "Minimum seconds between Rover per-workspace summary (MAP) calls. One \
+             changed workspace is re-summarized per interval; idle workspaces are \
+             never re-summarized. Only fires while a phone is subscribed.")),
+        ("rover_brief_min_secs", knob(json!(d.rover_brief_min_secs),
+            "Minimum seconds between Rover mission-briefing (REDUCE) calls, which \
+             compose the briefing from the cached summaries. Re-runs only when a \
+             summary or verdict changed. Only fires while a phone is subscribed.")),
     ]
 }
 
@@ -592,6 +611,8 @@ pub fn load() -> Tuning {
         t.goal_tracking = get_u64(&map, "goal_tracking", t.goal_tracking);
         t.mobile_push_interval_ms =
             get_u64(&map, "mobile_push_interval_ms", t.mobile_push_interval_ms).max(1);
+        t.rover_map_min_secs = get_u64(&map, "rover_map_min_secs", t.rover_map_min_secs).max(1);
+        t.rover_brief_min_secs = get_u64(&map, "rover_brief_min_secs", t.rover_brief_min_secs).max(1);
         if let Some(list) = map.get("project_ignore").and_then(|e| e.value.as_array()) {
             let dirs: Vec<String> =
                 list.iter().filter_map(|v| v.as_str().map(String::from)).collect();
