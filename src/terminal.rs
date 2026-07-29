@@ -460,9 +460,13 @@ impl Term {
         let mut p = vt100::Parser::new(tall, cols, 0); // no scrollback: the screen IS the answer
         p.process(&raw);
         let rows: Vec<Vec<u8>> = p.screen().rows_formatted(0, cols).collect();
-        // A tall grid leaves the content sitting at the bottom — drop the empty run above it.
-        let first = rows.iter().position(|r| !r.is_empty()).unwrap_or(rows.len());
-        let keep = &rows[first..];
+        // Blankness must be judged on the PLAIN text: a formatted row for an empty line still
+        // carries SGR bytes, so `is_empty()` is never true and a tall grid emitted ~2000 rows of
+        // black space. Use the text rows to find the real content window.
+        let text: Vec<String> = p.screen().rows(0, cols).collect();
+        let first = text.iter().position(|r| !r.trim().is_empty()).unwrap_or(text.len());
+        let last = text.iter().rposition(|r| !r.trim().is_empty()).map(|i| i + 1).unwrap_or(first);
+        let keep = &rows[first.min(rows.len())..last.min(rows.len())];
         let mut out = Vec::new();
         for row in keep {
             out.extend_from_slice(row);
