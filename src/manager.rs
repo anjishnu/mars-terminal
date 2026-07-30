@@ -29,6 +29,8 @@ pub struct PaneRow {
     pub why: String,
     pub age_secs: u64,
     pub blocked_prompt: Option<String>,
+    /// The pane the engineer is looking at right now. A note about it describes their own screen.
+    pub focused: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -763,6 +765,7 @@ fn parse_board(json: &str) -> Option<SessionSnap> {
             why: r["why"].as_str().unwrap_or_default().to_string(),
             age_secs: r["ageSecs"].as_u64().unwrap_or(0),
             blocked_prompt: r["blocked"]["prompt"].as_str().map(|s| s.to_string()),
+            focused: r["focused"].as_bool().unwrap_or(false),
         })
         .collect();
     Some(SessionSnap {
@@ -1365,6 +1368,7 @@ pub fn emit(
                     "id": p.id, "paneId": p.pane_id, "name": p.name, "verdict": p.verdict,
                     "kind": p.kind, "why": p.why, "ageSecs": p.age_secs,
                     "blockedPrompt": p.blocked_prompt,
+                    "focused": p.focused,
                     "output": { "tail": tail, "delta": delta, "signals": sig },
                 })
             }).collect::<Vec<_>>(),
@@ -1717,6 +1721,7 @@ fn read_all_sessions() -> Vec<SessionSnap> {
                     why: w["why"].as_str().unwrap_or_default().to_string(),
                     age_secs: w["ageSecs"].as_u64().unwrap_or(0),
                     blocked_prompt: w["blockedPrompt"].as_str().map(|s| s.to_string()),
+                    focused: w["focused"].as_bool().unwrap_or(false),
                 }).collect::<Vec<_>>()).unwrap_or_default();
                 (v["health"].as_str().unwrap_or_default().to_string(), panes)
             })

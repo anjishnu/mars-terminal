@@ -1059,6 +1059,10 @@ impl App {
                     "why": description,
                     "ageSecs": s.age_secs,
                     "paneId": s.pane_id.to_string(), // so the phone can type into this pane
+                    // The pane the engineer is actually looking at. The manager has been told
+                    // since its first draft never to write about the watched workspace — and
+                    // nothing had ever told it which one that was, so the rule was dead text.
+                    "focused": s.pane_id == self.focused_pane_id(),
                 });
                 if blocked {
                     row["blocked"] = serde_json::json!({

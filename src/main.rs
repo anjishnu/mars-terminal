@@ -3197,7 +3197,7 @@ fn selfcheck() -> Result<()> {
         let pane = |pane_id: &str, name: &str, verdict: &str, why: &str, age: u64| PaneRow {
             id: pane_id.into(), pane_id: pane_id.into(), name: name.into(),
             verdict: verdict.into(), kind: "terminal".into(), why: why.into(),
-            age_secs: age, blocked_prompt: (verdict == "blocked").then(|| why.to_string()),
+            age_secs: age, blocked_prompt: (verdict == "blocked").then(|| why.to_string()), focused: false,
         };
         let snap = |panes: Vec<PaneRow>| vec![SessionSnap {
             name: "0".into(), health: "up 3h · load 2.1".into(), panes,
@@ -3402,7 +3402,7 @@ fn selfcheck() -> Result<()> {
                 panes: vec![PaneRow {
                     id: "1".into(), pane_id: "1".into(), name: "terminal 1".into(),
                     verdict: "idle".into(), kind: "terminal".into(), why: String::new(),
-                    age_secs: age, blocked_prompt: None,
+                    age_secs: age, blocked_prompt: None, focused: false,
                 }],
             }];
             let summary_at = |age: u64, ts: u64| -> String {
@@ -6295,7 +6295,7 @@ fn selfcheck() -> Result<()> {
                 panes: vec![manager::PaneRow {
                     id: "0".into(), pane_id: "0".into(), name: "terminal 1".into(),
                     verdict: "running".into(), kind: "terminal".into(), why: String::new(),
-                    age_secs: 5, blocked_prompt: None,
+                    age_secs: 5, blocked_prompt: None, focused: false,
                 }],
             }];
             manager::emit(&repo, "testbox", &board, 1_000_500, 2700, &serde_json::Value::Null)?;

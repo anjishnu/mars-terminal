@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 10 -->
+<!-- mars-doc-version: 12 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -73,9 +73,10 @@ The single most common failure is repetition down that column. A memo saying "th
 worth nothing under a row that already reads `build · failed`.
 
 4. **Write `workspaces/<pane-id>.md`** — one per workspace whose situation actually changed.
-   The last command, the intent behind it, where it stands, and three likely next actions with
-   one recommended — format in [`docs/workspaces.md`](docs/workspaces.md). Skip the ones that
-   have not moved. An untouched file beats a rewritten identical one.
+   What the workspace is FOR, where it has got to, and any useful intervention — format in
+   [`docs/workspaces.md`](docs/workspaces.md). Skip the ones that have not moved, and skip any pane with
+   `"focused": true` entirely: that is the one on their screen. An untouched file beats a rewritten
+   identical one.
 5. **Write memos** into `memos/` — format in [`docs/memos.md`](docs/memos.md). A memo is
    something worth *keeping track of* that is not what a workspace is doing right now. The
    workspace rows already say what is happening; a memo says what is being forgotten. Give it a
