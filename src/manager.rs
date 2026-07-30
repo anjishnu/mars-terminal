@@ -1049,6 +1049,14 @@ fn last_run_path(repo: &Path) -> PathBuf {
     repo.join("memory/last_run")
 }
 
+/// How long a lock may go unrefreshed before another daemon may take it.
+///
+/// Derived from how often the lock is REFRESHED — every manager tick, 60s by default — not from
+/// the agent's own cadence. Deriving it from the agent floor (20 min) meant a killed daemon parked
+/// the agent for an hour: its last refresh was seconds old, so every survivor politely backed off
+/// from a lock whose owner no longer existed. Three missed refreshes is dead.
+const AGENT_LOCK_STALE_SECS: u64 = 180;
+
 /// Only one daemon may drive the agent. Every session runs its own tick, so without this each
 /// would spawn its own `claude` in its own hidden pane and they would all write the same files.
 /// The lock is claimable when stale so a killed daemon does not park the manager forever.
@@ -1098,7 +1106,7 @@ pub fn agent_tick(
     let snap = parse_board(board_json)?;
     let sessions = [snap];
 
-    if !claim_agent_lock(&repo, owner, ts, floor_secs.saturating_mul(3).max(180)) {
+    if !claim_agent_lock(&repo, owner, ts, AGENT_LOCK_STALE_SECS) {
         return None;
     }
     // The flag file is the cadence gate. Absent → due now, which is what makes deleting it the
@@ -1458,6 +1466,22 @@ fn fingerprint_detail(s: &SessionSnap) -> String {
 /// Takes no repo path ON PURPOSE. It derives one from `repo_dir()`, so a caller cannot pass the
 /// wrong root — a hardcoded `~/.mars/manager` at the daemon's call site is exactly how an isolated
 /// test run wrote into the user's live repo.
+/// Every live session as the tree records it, for an index rebuild that is not tied to one
+/// session's board frame.
+fn read_all_sessions() -> Vec<SessionSnap> {
+    let Some(root) = sessions_root() else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let dir = e.path();
+        let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else { continue };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let Some(name) = meta["name"].as_str() else { continue };
+        out.push(SessionSnap { name: name.to_string(), health: String::new(), panes: Vec::new() });
+    }
+    out
+}
+
 pub fn tick_session(
     origin: &str,
     board_json: &str,
@@ -1487,6 +1511,15 @@ pub fn tick_session(
             // Nothing material, and either the text is the same or it changed too recently to be
             // worth rewriting the tree and re-rendering a phone for.
             if material_same && (detail_same || since < detail_min_secs) {
+                // The BOARD is unchanged — so write no snapshot, no reflex memo, no tree. But the
+                // index still has to be reassembled, because the agent writes on her own clock and
+                // her prose is the thing most likely to have changed since the last tick. Gating
+                // assembly on board movement meant a briefing written over an idle board never
+                // reached the phone at all, and score_runs never ran to notice the turn happened.
+                // write_index has its own unchanged-check, so on a truly quiet system this still
+                // costs a read and no write.
+                let all = read_all_sessions();
+                write_index(repo, &[], &all, ts, stale_secs)?;
                 return Ok(());
             }
         }
