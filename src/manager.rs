@@ -200,6 +200,24 @@ fn human_age(secs: u64) -> String {
     }
 }
 
+
+/// Write only if the content actually differs.
+///
+/// Every daemon regenerates the SHARED index, so with three sessions running the file was rewritten
+/// roughly every seven seconds regardless of whether anything changed — and a phone polling it
+/// re-rendered each time. Nothing downstream can tell "this is new" from "this was rewritten"
+/// except by comparing, so the comparison belongs here, once.
+fn write_if_changed(path: &Path, body: &str) -> Result<bool> {
+    if std::fs::read_to_string(path).is_ok_and(|old| old == body) {
+        return Ok(false);
+    }
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(path, body)?;
+    Ok(true)
+}
+
 /// Write a reflex card. Markdown body, YAML-ish frontmatter — structure in the frontmatter,
 /// meaning in the body, so a parse failure degrades to a readable document rather than to nothing.
 fn write_card(
@@ -277,21 +295,32 @@ fn expire_card(c: &OpenCard, ts: u64) -> Result<()> {
 /// long, and saying "nothing needs you" when nothing does are all things arithmetic does better,
 /// faster, and without a plan window.
 
-/// A one-line status for a workspace. Deterministic: verdict, age, and the board's own
-/// description. This is what replaces a per-pane LLM summary call — counting and naming are not
-/// judgement, and a model adds latency and cost to produce the same sentence.
+/// A one-line status for a workspace. Deterministic, and deliberately TIME-FREE: the age travels
+/// as its own `ageSecs` field for the renderer to format. Embedding it here made the summary churn
+/// every tick ("idle · 1m" -> "idle · 2m"), rewriting the file and re-rendering the phone for no
+/// new information — the exact failure the design rule against quoting live values describes.
 fn workspace_summary(p: &PaneRow) -> String {
     let why = p.why.trim();
+    let tail = if why.is_empty() { String::new() } else { format!(" · {why}") };
     match p.verdict.as_str() {
-        "blocked" => format!("waiting on input · {}{}", human_age(p.age_secs),
-                             if why.is_empty() { String::new() } else { format!(" · {why}") }),
-        "failed" => format!("failed · {}{}", human_age(p.age_secs),
-                            if why.is_empty() { String::new() } else { format!(" · {why}") }),
-        "running" => format!("running · {}{}", human_age(p.age_secs),
-                             if why.is_empty() { String::new() } else { format!(" · {why}") }),
-        "done" => format!("finished · {}", human_age(p.age_secs)),
-        _ if !why.is_empty() => format!("{why} · idle {}", human_age(p.age_secs)),
-        _ => format!("idle · {}", human_age(p.age_secs)),
+        "blocked" => format!("waiting on input{tail}"),
+        "failed" => format!("failed{tail}"),
+        "running" => format!("running{tail}"),
+        "done" => "finished".into(),
+        _ if !why.is_empty() => why.to_string(),
+        _ => "idle".into(),
+    }
+}
+
+/// Age, coarsened so prose does not churn. Exact ages belong in a field the renderer formats, not
+/// in a sentence: "idle 1m" became "idle 2m" on the next tick, rewriting the file and re-rendering
+/// the phone every 20 seconds. Buckets change on a human timescale instead.
+fn coarse_age(secs: u64) -> String {
+    match secs {
+        0..=89 => "just now".into(),
+        90..=3599 => format!("{}m", (secs + 30) / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
     }
 }
 
@@ -316,10 +345,10 @@ fn session_narrative(s: &SessionSnap) -> String {
     if !blocked.is_empty() {
         let oldest = blocked.iter().map(|p| p.age_secs).max().unwrap_or(0);
         parts.push(format!(
-            "{} {} waiting on you — {} now.",
+            "{} {} waiting on you — {}.",
             names(&blocked),
             if blocked.len() == 1 { "is" } else { "are" },
-            human_age(oldest)
+            coarse_age(oldest)
         ));
     }
     if !failed.is_empty() {
@@ -355,7 +384,9 @@ fn session_briefing(s: &SessionSnap, ts: u64) -> String {
     let idle = s.panes.len() - running - needs.len();
 
     let mut md = String::new();
-    md.push_str(&format!("# {} · mission briefing\n\n_{}_\n\n", s.name, iso(ts)));
+    // No timestamp in the body: it is the only thing that changed between ticks, so it alone
+    // made the file differ and the phone re-render. `meta.json` carries `updated_ts`.
+    md.push_str(&format!("# {} · mission briefing\n\n", s.name));
     if needs.is_empty() {
         md.push_str("**Nothing needs you.**\n\n");
     } else {
@@ -366,7 +397,7 @@ fn session_briefing(s: &SessionSnap, ts: u64) -> String {
         ));
         for p in &needs {
             let mark = if p.verdict == "blocked" { "⚠" } else { "✗" };
-            md.push_str(&format!("- {mark} **{}** — {} · {}\n", p.name, p.verdict, human_age(p.age_secs)));
+            md.push_str(&format!("- {mark} **{}** — {} · {}\n", p.name, p.verdict, coarse_age(p.age_secs)));
             if !p.why.trim().is_empty() {
                 md.push_str(&format!("  \n  {}\n", p.why.trim()));
             }
@@ -379,7 +410,7 @@ fn session_briefing(s: &SessionSnap, ts: u64) -> String {
     } else {
         md.push_str("| workspace | state | age |\n|---|---|---|\n");
         for p in &s.panes {
-            md.push_str(&format!("| {} | {} | {} |\n", p.name, p.verdict, human_age(p.age_secs)));
+            md.push_str(&format!("| {} | {} | {} |\n", p.name, p.verdict, coarse_age(p.age_secs)));
         }
         md.push('\n');
     }
@@ -512,9 +543,28 @@ fn write_index(
     // Temp + rename: atomic on POSIX, so a reader never sees half an index even when two
     // daemons refresh it in the same instant. Last writer wins, and both are correct because
     // the index is derived from the tree.
-    let tmp = repo.join("index.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&index)?)?;
-    std::fs::rename(&tmp, repo.join("index.json"))?;
+    // Compare with the stamp removed: `generated` changes every tick by construction, so a plain
+    // byte comparison would never match and the file would churn forever.
+    let strip = |v: &serde_json::Value| {
+        let mut v = v.clone();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("generated");
+            o.remove("generated_ts");
+        }
+        v
+    };
+    let path = repo.join("index.json");
+    let unchanged = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .is_some_and(|old| strip(&old) == strip(&index));
+    if !unchanged {
+        // temp + rename: atomic, so a reader never sees half an index even when two daemons
+        // refresh it in the same instant.
+        let tmp = repo.join("index.json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(&index)?)?;
+        std::fs::rename(&tmp, &path)?;
+    }
 
     // …and the same thing as a document, because a human should be able to read the status of
     // everything without a JSON viewer. This is the file to open first.
@@ -541,7 +591,7 @@ fn write_index(
     }
     md.push_str("\n## memory\n\n- [beliefs](memory/beliefs.md)\n- [projects](memory/projects.md)\n\n");
     md.push_str("_Generated by `mars snapshot`. See [AGENTS.md](AGENTS.md)._\n");
-    std::fs::write(repo.join("index.md"), md)?;
+    write_if_changed(&repo.join("index.md"), &md)?;
     Ok(())
 }
 
@@ -645,7 +695,11 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Res
     for s in sessions {
         // Session artifacts live under ~/.mars/sessions/<id>/, NOT under the manager repo keyed by
         // name. A rename now rewrites meta.json instead of forking a new directory.
-        let Some(sdir) = session_dir(&s.name, origin, ts) else { continue };
+        let Some(sdir) =
+            session_dir_fp(&s.name, origin, ts, &fingerprint_material(s), &fingerprint_detail(s))
+        else {
+            continue;
+        };
         let cards = sdir.join("cards");
         let snaps = sdir.join("snapshots");
         std::fs::create_dir_all(&cards)?;
@@ -705,18 +759,17 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Res
 
         // 4. session → workspaces → summary.
         let brief = session_briefing(s, ts);
-        std::fs::write(sdir.join("mission_briefing.md"), &brief)?;
+        write_if_changed(&sdir.join("mission_briefing.md"), &brief)?;
         // …and one document per workspace, so a single workspace can be read (or later enriched
         // by an agent) without touching the session summary.
         let wdir = sdir.join("workspaces");
         std::fs::create_dir_all(&wdir)?;
         for p in &s.panes {
-            std::fs::write(
-                wdir.join(format!("{}.md", p.pane_id)),
-                format!(
-                    "# {} · {}\n\n_{}_\n\n{}\n\n- state: {}\n- age: {}\n- kind: {}\n",
-                    p.name, s.name, iso(ts), workspace_summary(p),
-                    p.verdict, human_age(p.age_secs), p.kind
+            write_if_changed(
+                &wdir.join(format!("{}.md", p.pane_id)),
+                &format!(
+                    "# {} · {}\n\n{}\n\n- state: {}\n- kind: {}\n",
+                    p.name, s.name, workspace_summary(p), p.verdict, p.kind
                 ),
             )?;
         }
@@ -765,6 +818,25 @@ pub fn sessions_root() -> Option<PathBuf> {
     crate::sys::paths::home_dir().map(|h| h.join(".mars").join("sessions"))
 }
 
+/// Find a session's directory without minting one — used by the idle fast path, which must not
+/// create anything just to discover there is nothing to do.
+pub fn existing_session_dir_pub(name: &str) -> Option<PathBuf> { existing_session_dir(name) }
+
+fn existing_session_dir(name: &str) -> Option<PathBuf> {
+    let root = sessions_root()?;
+    for e in std::fs::read_dir(root).ok()?.flatten() {
+        // `continue`, not `?`: one directory without a readable meta.json must not abort the
+        // search. As a `?` it did, so the idle fast path never found its own session and every
+        // tick fell through to a full regeneration.
+        let Ok(txt) = std::fs::read_to_string(e.path().join("meta.json")) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+        if v["name"].as_str() == Some(name) {
+            return Some(e.path());
+        }
+    }
+    None
+}
+
 /// Resolve (or mint) the directory for a session, keyed by an id the session KEEPS.
 ///
 /// The id is immutable once minted and the current name lives in `meta.json`, so a rename rewrites
@@ -774,6 +846,16 @@ pub fn sessions_root() -> Option<PathBuf> {
 /// Lookup is still by name today — the daemon has no persisted session id yet — but the *storage*
 /// is already id-keyed, which is the half that has to be right first.
 pub fn session_dir(name: &str, instance_id: &str, ts: u64) -> Option<PathBuf> {
+    session_dir_fp(name, instance_id, ts, "", "")
+}
+
+pub fn session_dir_fp(
+    name: &str,
+    instance_id: &str,
+    ts: u64,
+    fp: &str,
+    detail: &str,
+) -> Option<PathBuf> {
     let root = sessions_root()?;
     std::fs::create_dir_all(&root).ok()?;
     // An existing session with this name keeps its directory.
@@ -783,7 +865,7 @@ pub fn session_dir(name: &str, instance_id: &str, ts: u64) -> Option<PathBuf> {
             let Ok(txt) = std::fs::read_to_string(&meta) else { continue };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
             if v["name"].as_str() == Some(name) {
-                write_meta(&e.path(), &v["id"].as_str().unwrap_or(name).to_string(), name, instance_id, ts);
+                write_meta(&e.path(), v["id"].as_str().unwrap_or(name), name, instance_id, ts, fp, detail);
                 return Some(e.path());
             }
         }
@@ -801,13 +883,15 @@ pub fn session_dir(name: &str, instance_id: &str, ts: u64) -> Option<PathBuf> {
     }
     let dir = root.join(&id);
     std::fs::create_dir_all(&dir).ok()?;
-    write_meta(&dir, &id, name, instance_id, ts);
+    write_meta(&dir, &id, name, instance_id, ts, fp, detail);
     Some(dir)
 }
 
 /// `meta.json` — the indirection that makes a rename cheap. The id is the directory; the name is
 /// data.
-fn write_meta(dir: &Path, id: &str, name: &str, instance_id: &str, ts: u64) {
+fn write_meta(
+    dir: &Path, id: &str, name: &str, instance_id: &str, ts: u64, fp: &str, detail: &str,
+) {
     let existing: Option<serde_json::Value> = std::fs::read_to_string(dir.join("meta.json"))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
@@ -819,10 +903,51 @@ fn write_meta(dir: &Path, id: &str, name: &str, instance_id: &str, ts: u64) {
         "id": id, "name": name, "instance_id": instance_id,
         "created": iso(created), "created_ts": created,
         "updated": iso(ts), "updated_ts": ts,
+        // What the idle fast path compares against.
+        "fingerprint": fp,
+        "detail": detail,
     });
     if let Ok(txt) = serde_json::to_string_pretty(&meta) {
         let _ = std::fs::write(dir.join("meta.json"), txt);
     }
+}
+
+
+/// Two fingerprints, because two kinds of change deserve two answers.
+///
+/// MATERIAL — which workspaces exist and what state they are in. A verdict flipping to failed or
+/// blocked is news; it should reach the phone at once.
+///
+/// DETAIL — the descriptive text a workspace carries. For a pane running an agent this changes
+/// every time it prints, which is many times a second. Regenerating on it would rewrite the tree
+/// continuously and churn the phone for nothing, so it is rate-limited instead.
+///
+/// Neither includes ages or timestamps: those change on every board push and would make every tick
+/// look like news.
+fn fingerprint_material(s: &SessionSnap) -> String {
+    let mut parts: Vec<String> = s
+        .panes
+        .iter()
+        .map(|p| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                p.pane_id, p.name, p.verdict, p.kind,
+                p.blocked_prompt.as_deref().unwrap_or("")
+            )
+        })
+        .collect();
+    parts.sort();
+    format!("{}::{}", s.name, parts.join("~"))
+}
+
+fn fingerprint_detail(s: &SessionSnap) -> String {
+    let mut parts: Vec<String> = s
+        .panes
+        .iter()
+        .map(|p| format!("{}|{}", p.pane_id, p.why.trim()))
+        .collect();
+    parts.sort();
+    parts.join("~")
 }
 
 /// Write ONE session's subtree, from the daemon's own state. Called on a timer by the session
@@ -834,16 +959,41 @@ fn write_meta(dir: &Path, id: &str, name: &str, instance_id: &str, ts: u64) {
 /// Takes no repo path ON PURPOSE. It derives one from `repo_dir()`, so a caller cannot pass the
 /// wrong root — a hardcoded `~/.mars/manager` at the daemon's call site is exactly how an isolated
 /// test run wrote into the user's live repo.
-pub fn tick_session(origin: &str, board_json: &str, ts: u64, keep: usize) -> Result<()> {
+pub fn tick_session(
+    origin: &str,
+    board_json: &str,
+    ts: u64,
+    keep: usize,
+    detail_min_secs: u64,
+) -> Result<()> {
     let Some(repo) = repo_dir() else { return Ok(()) };
     let repo = repo.as_path();
     let Some(snap) = parse_board(board_json) else { return Ok(()) };
     if snap.name.is_empty() {
         return Ok(());
     }
+    // An idle session should cost ONE read and zero writes, however often the timer fires. The
+    // rate was never the problem — regenerating unconditionally was. Nothing here is news unless
+    // a workspace appeared, vanished, changed state, or changed what it says.
+    let (mat, det) = (fingerprint_material(&snap), fingerprint_detail(&snap));
+    if let Some(dir) = existing_session_dir(&snap.name) {
+        if let Some(m) = std::fs::read_to_string(dir.join("meta.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        {
+            let material_same = m["fingerprint"].as_str() == Some(mat.as_str());
+            let detail_same = m["detail"].as_str() == Some(det.as_str());
+            let since = ts.saturating_sub(m["updated_ts"].as_u64().unwrap_or(0));
+            // Nothing material, and either the text is the same or it changed too recently to be
+            // worth rewriting the tree and re-rendering a phone for.
+            if material_same && (detail_same || since < detail_min_secs) {
+                return Ok(());
+            }
+        }
+    }
     scaffold_docs(repo)?;
     emit(repo, origin, std::slice::from_ref(&snap), ts)?;
-    if let Some(d) = session_dir(&snap.name, origin, ts) {
+    if let Some(d) = existing_session_dir(&snap.name) {
         prune_snapshots(&d.join("snapshots"), keep)?;
     }
     Ok(())

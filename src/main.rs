@@ -3307,17 +3307,25 @@ fn selfcheck() -> Result<()> {
         // does not show.
         let board = app.mobile_board_json();
         for i in 0..4u64 {
-            manager::tick_session("testbox", &board, 2_000_000 + i * 60, 2)?;
+            manager::tick_session("testbox", &board, 2_000_000 + i * 60, 2, 0)?;
         }
         let sdir = manager::session_dir("auto", "testbox", 2_000_000).expect("no session dir");
         assert!(sdir.join("mission_briefing.md").exists(), "daemon tick wrote no briefing");
         assert!(repo.join("index.json").exists(), "daemon tick wrote no index");
         assert!(repo.join("AGENTS.md").exists(), "daemon tick did not scaffold the guide");
+        // Four ticks on an unchanged board wrote ONE stimulus — repeated ticks are not news.
         let snaps = std::fs::read_dir(sdir.join("snapshots"))?.flatten().count();
-        assert_eq!(snaps, 2, "stimuli not pruned to manager_snapshot_keep: {snaps}");
+        assert_eq!(snaps, 1, "an unchanged board wrote {snaps} stimuli; expected 1");
+        // Now change state on each tick, and confirm the ring prunes to manager_snapshot_keep.
+        for (i, v) in ["running", "failed", "idle", "running"].iter().enumerate() {
+            let b = board.replace("\"verdict\":\"idle\"", &format!("\"verdict\":\"{v}\""));
+            manager::tick_session("testbox", &b, 2_000_100 + i as u64 * 60, 2, 0)?;
+        }
+        let snaps = std::fs::read_dir(sdir.join("snapshots"))?.flatten().count();
+        assert!(snaps <= 2, "stimuli not pruned to manager_snapshot_keep: {snaps}");
         // The index must describe the whole TREE, so a second session's daemon does not erase
         // the first from it.
-        manager::tick_session("testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2)?;
+        manager::tick_session("testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2, 0)?;
         let idx: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
         let names: Vec<&str> =
@@ -3355,6 +3363,89 @@ fn selfcheck() -> Result<()> {
             let meta: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(a.join("meta.json"))?)?;
             assert_eq!(meta["name"], "renamed-later", "meta.json did not follow the rename");
+        }
+        // A summary must be STABLE while only time passes. Baking the age into it rewrote the
+        // file every tick ("idle · 1m" -> "idle · 2m") and re-rendered the phone for no new
+        // information. Age travels as its own field; the text says what is true, not what o'clock.
+        {
+            use manager::{PaneRow, SessionSnap};
+            let repo = manager::repo_dir().expect("no manager repo");
+            let mk = |age: u64| vec![SessionSnap {
+                name: "stable".into(), health: String::new(),
+                panes: vec![PaneRow {
+                    id: "1".into(), pane_id: "1".into(), name: "terminal 1".into(),
+                    verdict: "idle".into(), kind: "terminal".into(), why: String::new(),
+                    age_secs: age, blocked_prompt: None,
+                }],
+            }];
+            let summary_at = |age: u64, ts: u64| -> String {
+                manager::emit(&repo, "testbox", &mk(age), ts).expect("emit");
+                let idx: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(repo.join("index.json")).expect("index")).expect("json");
+                idx["sessions"].as_array().unwrap().iter()
+                    .find(|s| s["name"] == "stable").expect("session")
+                    ["workspaces"][0]["summary"].as_str().unwrap_or_default().to_string()
+            };
+            let a = summary_at(60, 4_000_000);
+            let b = summary_at(3_600, 4_000_600);
+            let c = summary_at(90_000, 4_001_200);
+            assert_eq!(a, b, "summary changed with age alone: {a:?} -> {b:?}");
+            assert_eq!(b, c, "summary changed with age alone: {b:?} -> {c:?}");
+            for t in [a.as_str(), b.as_str(), c.as_str()] {
+                assert!(!t.contains('m') || !t.chars().any(|c| c.is_ascii_digit()),
+                        "summary still carries a clock: {t:?}");
+            }
+        }
+        // An idle session must write NOTHING, however often the timer fires. Regenerating
+        // unconditionally — three daemons each rewriting one shared index — is what made the
+        // phone's summaries churn every few seconds.
+        {
+            let board = {
+                let mut a = App::new(None)?;
+                a.session_name = Some("quiet".into());
+                a.open_terminal();
+                a.mobile_board_json()
+            };
+            manager::tick_session("testbox", &board, 5_000_000, 5, 0)?;
+            let dir = manager::existing_session_dir_pub("quiet").expect("session dir");
+            let stamp = |p: &std::path::Path| -> Vec<(String, u64)> {
+                let mut v: Vec<(String, u64)> = walk(p).into_iter()
+                    .filter_map(|f| {
+                        let m = std::fs::metadata(&f).ok()?;
+                        Some((f.display().to_string(), m.modified().ok()?
+                            .duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as u64))
+                    }).collect();
+                v.sort(); v
+            };
+            fn walk(p: &std::path::Path) -> Vec<std::path::PathBuf> {
+                let mut out = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(p) {
+                    for e in rd.flatten() {
+                        if e.path().is_dir() { out.extend(walk(&e.path())); } else { out.push(e.path()); }
+                    }
+                }
+                out
+            }
+            let before = stamp(&dir);
+            assert!(!before.is_empty(), "first tick wrote nothing");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            for i in 0..5 {
+                manager::tick_session("testbox", &board, 5_000_060 + i * 60, 5, 300)?;
+            }
+            assert_eq!(before, stamp(&dir), "an idle session rewrote its files");
+
+            // A workspace's DESCRIPTION changing is not news: a pane running an agent rewrites it
+            // every time it prints. Rate-limited, so the tree stays still.
+            let chatty = board.replace("\"why\":\"", "\"why\":\"printing output ");
+            // INSIDE the 300s window (last write was at 5_000_000) — otherwise the rewrite is
+            // correct behaviour and the assertion tests nothing.
+            manager::tick_session("testbox", &chatty, 5_000_200, 5, 300)?;
+            assert_eq!(before, stamp(&dir), "a description change alone rewrote the tree");
+
+            // A STATE change is news, and lands at once whatever the rate limit says.
+            let failed = board.replace("\"verdict\":\"idle\"", "\"verdict\":\"failed\"");
+            manager::tick_session("testbox", &failed, 5_000_201, 5, 300)?;
+            assert_ne!(before, stamp(&dir), "a state change did not reach the tree immediately");
         }
     println!("[selfcheck] manager auto-tick ......... PASS");
 

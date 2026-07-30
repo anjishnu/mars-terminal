@@ -157,6 +157,7 @@ pub struct Tuning {
     pub mobile_pane_interval_ms: u64,
     pub manager_snapshot_secs: u64,
     pub manager_snapshot_keep: u64,
+    pub manager_detail_min_secs: u64,
     /// Minimum seconds between Rover MAP calls (the per-workspace summary). One
     /// changed pane is (re)summarized per interval, so a busy board fans out over
     /// several intervals instead of hammering the model. Only active while a phone
@@ -241,8 +242,9 @@ impl Default for Tuning {
             goal_tracking: 1,
             mobile_push_interval_ms: 1000,
             mobile_pane_interval_ms: 40,
-            manager_snapshot_secs: 20,
+            manager_snapshot_secs: 60,
             manager_snapshot_keep: 20,
+            manager_detail_min_secs: 300,
             rover_map_min_secs: 1,
             rover_brief_min_secs: 12,
             palette: Palette::mission_control(),
@@ -475,14 +477,18 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
              scrolled off, numbered, as formatted ANSI. This is what the phone pages through, \
              so it sets how far back scrollback reaches. Oldest lines are dropped past it.")),
         ("manager_snapshot_secs", knob(json!(d.manager_snapshot_secs),
-            "How often (seconds) the session daemon refreshes ~/.mars/manager — the stimulus, \
-             reflex cards, the mission briefing and the timeline. 0 = off. This is what makes the \
-             phone's briefing and workspace summaries appear with no LLM call and no command to \
-             run; it costs a few small file writes.")),
+            "How often (seconds) the daemon CHECKS whether anything changed. It writes nothing \
+             unless a workspace appeared, vanished, changed state, or changed what it says, so a \
+             quiet session costs one file read per tick and nothing else. 0 = off.")),
         ("manager_snapshot_keep", knob(json!(d.manager_snapshot_keep),
             "How many stimulus files to keep per session under \
              ~/.mars/manager/sessions/<name>/snapshots/. Older ones are pruned each tick so the \
              directory cannot grow without limit.")),
+        ("manager_detail_min_secs", knob(json!(d.manager_detail_min_secs),
+            "Minimum seconds between rewrites caused only by a workspace's DESCRIPTION changing. \
+             A pane running an agent changes its description every time it prints, and rewriting \
+             the tree for that would churn the phone continuously. A state change (failed, \
+             blocked, a pane appearing) still lands immediately, whatever this is set to.")),
         ("mobile_pane_interval_ms", knob(json!(d.mobile_pane_interval_ms),
             "How often the watched pane's live screen is pushed to the phone, in ms. Separate \
              from the board's cadence because this one is felt as typing latency. Identical \
@@ -645,6 +651,8 @@ pub fn load() -> Tuning {
         t.manager_snapshot_secs = get_u64(&map, "manager_snapshot_secs", t.manager_snapshot_secs);
         t.manager_snapshot_keep =
             get_u64(&map, "manager_snapshot_keep", t.manager_snapshot_keep).max(1);
+        t.manager_detail_min_secs =
+            get_u64(&map, "manager_detail_min_secs", t.manager_detail_min_secs);
         t.terminal_line_log_bytes =
             get_u64(&map, "terminal_line_log_bytes", t.terminal_line_log_bytes as u64).max(64 * 1024) as usize;
         t.rover_map_min_secs = get_u64(&map, "rover_map_min_secs", t.rover_map_min_secs).max(1);

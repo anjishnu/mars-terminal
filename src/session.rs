@@ -870,6 +870,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     &json,
                     crate::worklog::now_secs(),
                     keep,
+                    app.tuning.manager_detail_min_secs,
                 );
             }
         }
