@@ -697,14 +697,17 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     // workspace its prose and nothing else.
                     let w = dir.as_ref()
                         .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs, false));
-                    let (summary, source) = match w {
-                        Some(a) => (a, "agent"),
-                        None => (workspace_summary(p), "computed"),
-                    };
+                    // Two FIELDS, not one. The ticker ("running · 5m") and the agent's note are
+                    // different kinds of thing on different clocks — one is arithmetic that must
+                    // always be current, the other is judgement that may be minutes old or absent.
+                    // Sharing a field meant whichever wrote last erased the other, so a live
+                    // status could silently replace a considered note and vice versa.
                     serde_json::json!({
                         "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
                         "kind": p.kind, "ageSecs": p.age_secs,
-                        "summary": summary, "summarySource": source,
+                        "status": workspace_summary(p),
+                        "summary": w.unwrap_or_default(),
+                        "summarySource": "agent",
                     })
                 }).collect::<Vec<_>>()).unwrap_or_default(),
             })
