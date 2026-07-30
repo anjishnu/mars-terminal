@@ -884,7 +884,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         .clone()
                         .unwrap_or_else(|| origin.clone());
                     if let Some(line) = crate::manager::agent_tick(&json, now, agent_secs, &owner) {
-                        app.nudge_manager(&line);
+                        // Only advance the cadence once the turn is actually in the pane.
+                        if app.nudge_manager(&line) {
+                            crate::manager::mark_run(&json, now);
+                        }
                     }
                 }
             }

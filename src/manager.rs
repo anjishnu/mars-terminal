@@ -1030,6 +1030,18 @@ pub fn agent_switch_path() -> Option<PathBuf> {
     Some(repo_dir()?.join("agent.enabled"))
 }
 
+/// Record that a turn was actually DELIVERED to the agent — called only once the bytes are in the
+/// pane, never merely because we decided to send them. The first attempt failed exactly here: the
+/// pane had just been created, the prompt went to a shell that had not finished starting, and
+/// marking the run anyway would have parked the agent for a further twenty minutes.
+pub fn mark_run(board_json: &str, ts: u64) {
+    let Some(repo) = repo_dir() else { return };
+    if let Some(snap) = parse_board(board_json) {
+        let _ = mark_nudged(&repo, &[snap], ts);
+    }
+    let _ = std::fs::write(last_run_path(&repo), format!("{}\n", iso(ts)));
+}
+
 /// The file whose mtime gates the agent's cadence. Deleting it forces a run on the next tick —
 /// that is its second job, and the reason the gate is a file rather than an in-memory instant:
 /// `rm ~/.mars/manager/memory/last_run` is the whole iteration loop when working on the agent.
@@ -1107,8 +1119,6 @@ pub fn agent_tick(
     // Only now do we touch the inbox: no pending snapshots means no turn, whatever the clock says.
     let batch = compose_batch(&repo, &sessions, ts).ok().flatten()?;
     let name = batch.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    mark_nudged(&repo, &sessions, ts).ok()?;
-    let _ = std::fs::write(last_run_path(&repo), format!("{}\n", iso(ts)));
     Some(format!("Warm-up run — process inbox/{name} per AGENTS.md ({reason})"))
 }
 

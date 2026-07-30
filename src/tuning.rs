@@ -255,7 +255,11 @@ impl Default for Tuning {
             manager_snapshot_keep: 20,
             manager_detail_min_secs: 300,
             manager_agent_secs: 1200,
-            manager_agent_command: "claude --model claude-sonnet-5 --effort medium".into(),
+            manager_agent_command:
+                "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude \
+                  --model claude-sonnet-5 --effort medium \
+                  --add-dir ~/.mars/sessions --permission-mode acceptEdits"
+                    .into(),
             manager_agent_stale_secs: 2700,
             rover_map_min_secs: 1,
             rover_brief_min_secs: 12,
@@ -507,9 +511,16 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
              workspace wakes the agent immediately regardless. Delete \
              ~/.mars/manager/memory/last_run to force a run on the next tick. 0 = agent off.")),
         ("manager_agent_command", knob(json!(d.manager_agent_command),
-            "The command typed into the manager's hidden pane to start the agent. Sonnet at \
-             medium effort by default: the work is reading prepared files and writing short \
-             prose, which does not need a larger model, and the cadence makes latency invisible.")),
+            "The command run in the manager's hidden pane for each turn; the prompt is appended \
+             as `-p '<line>'`. ANTHROPIC_API_KEY is scrubbed deliberately — when it is set it \
+             takes precedence over the claude.ai login, so the agent would bill credits instead \
+             of using the subscription (and fail outright when that key is empty). \
+             --add-dir is required, not optional: session artifacts live in ~/.mars/sessions \
+             while the repo is ~/.mars/manager, so without it the agent can read neither the \
+             snapshots nor the directories it must write. acceptEdits lets it write files \
+             without a human at the keyboard, which is the whole point, while still gating \
+             everything that is not an edit. Sonnet at medium effort: the work is reading \
+             prepared files and writing short prose.")),
         ("manager_agent_stale_secs", knob(json!(d.manager_agent_stale_secs),
             "How old agent-written prose may be before the phone stops trusting it and falls \
              back. Should comfortably exceed manager_agent_secs, or a healthy agent reads as \

@@ -5145,33 +5145,51 @@ impl App {
     /// interleave with its own output. Nothing is lost by declining: the batch stays open in the
     /// inbox and merges with whatever arrives next, so a slow turn produces one larger turn
     /// rather than a backlog. Never steals focus; the engineer opts in through the command bar.
-    pub fn nudge_manager(&mut self, line: &str) {
-        let Some(tab_id) = self.ensure_manager_pane(false) else { return };
-        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+    pub fn nudge_manager(&mut self, line: &str) -> bool {
+        let Some((tab_id, just_created)) = self.ensure_manager_pane(false) else { return false };
+        // Never on the tick that created the pane. The shell has not finished starting, so the
+        // command would be typed into a terminal that is not reading yet and silently vanish —
+        // which is exactly how the first live run failed. The batch stays open; the next tick
+        // finds a settled shell and delivers into it.
+        if just_created {
+            return false;
+        }
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return false };
         let pane_id = tab.focused_pane;
         if self.pane_verdict(pane_id) == crate::briefing::Verdict::Running {
-            return;
+            return false;
         }
         let Some(PaneContent::Terminal(tid)) = self.panes.get(&pane_id).map(|p| p.content.clone())
         else {
-            return;
+            return false;
         };
+        // One-shot `-p` per turn rather than typing into a live REPL. A REPL needs its startup,
+        // its trust prompt and its turn state all detected from the outside; a shell is idle at a
+        // prompt and runs what it is given. The agent's memory lives on disk by design, so
+        // nothing is lost by each turn being a fresh process.
+        let cmd = format!(
+            "{} -p '{}'",
+            self.tuning.manager_agent_command,
+            line.replace('\'', "")
+        );
         if let Some(t) = self.terms.get_mut(&tid) {
-            t.send_bytes(line.as_bytes());
+            t.send_bytes(cmd.as_bytes());
             t.send_bytes(b"\r");
+            return true;
         }
+        false
     }
 
     /// The manager's hidden tab, created on first use. `focus` distinguishes the engineer opening
     /// it from the daemon quietly starting it behind their back.
-    fn ensure_manager_pane(&mut self, focus: bool) -> Option<TabId> {
+    fn ensure_manager_pane(&mut self, focus: bool) -> Option<(TabId, bool)> {
         if let Some(i) = self.tabs.iter().position(|t| Some(t.id) == self.manager_tab) {
             if focus {
                 self.active_tab = i;
                 self.mode = self.mode_for_focused_pane();
                 self.status_msg = Some("Manager — the agent that writes your feed".into());
             }
-            return self.manager_tab;
+            return self.manager_tab.map(|t| (t, false));
         }
         let repo = crate::manager::repo_dir()?;
         let id = self.next_term_id;
@@ -5207,12 +5225,9 @@ impl App {
                 }
                 // The PTY buffers input until the shell reads it, so typing straight after
                 // spawn is safe; if it ever misses, the pane is still a shell in the right dir.
-                let cmd = self.tuning.manager_agent_command.clone();
-                if let Some(t) = self.terms.get_mut(&id) {
-                    t.send_bytes(cmd.as_bytes());
-                    t.send_bytes(b"\r");
-                }
-                Some(tab_id)
+                // The pane is just a shell in the manager repo. Each turn is run into it as a
+                // command, so nothing needs to be started here.
+                Some((tab_id, true))
             }
             Err(e) => {
                 if focus {
