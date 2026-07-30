@@ -265,6 +265,20 @@ fn main() -> Result<()> {
             let repo = flags.iter().position(|a| a == "--repo").and_then(|i| flags.get(i + 1)).cloned();
             return manager::snapshot_main(repo);
         }
+        // The agent loop, on demand. `run` does exactly one turn with no daemon, no cadence and
+        // no lock, so working on the agent costs one command instead of a restart and a wait.
+        Some("manager") => {
+            let flags: Vec<String> = args.collect();
+            let sub = flags.first().map(String::as_str).unwrap_or("status");
+            let ts = manager::now_secs();
+            match sub {
+                "run" => println!("{}", manager::run_once(ts, flags.iter().any(|f| f == "--force"))?),
+                "snapshot" => println!("snapshotted {} live session(s)", manager::force_snapshot(ts)?),
+                "status" => print!("{}", manager::status_report(ts)?),
+                other => anyhow::bail!("unknown: mars manager {other} (status | run [--force] | snapshot)"),
+            }
+            return Ok(());
+        }
         // LLM observability: profile the debug log to right-size models per call.
         Some("llm-stats") => {
             let flags: Vec<String> = args.collect();
@@ -3171,6 +3185,9 @@ fn selfcheck() -> Result<()> {
     }
     println!("[selfcheck] llm log integrity ......... PASS");
 
+    // Session trees here have no daemons behind them, so the view's live-session filter would
+    // hide every one of them. The filter itself is checked separately below.
+    std::env::set_var("MARS_VIEW_ALL_SESSIONS", "1");
     // 29a3. The deterministic manager pass: reflex cards, briefing, timeline, index. No model,
     //       so every assertion here is about plumbing — which is exactly why this ships before
     //       any agent does: a bug found here can only be a plumbing bug.
@@ -6215,6 +6232,28 @@ fn selfcheck() -> Result<()> {
             assert_eq!(row["files_written"].as_u64(), Some(1), "wrong file count: {row}");
         }
         println!("[selfcheck] manager: run timing derived from artifact mtimes ... PASS");
+        // A directory whose daemon is gone must not be reported as a live session. Checked with
+        // the seam OFF, since the seam is what lets every other block here see its fixtures.
+        {
+            // A name that certainly has no daemon, rather than a count — other blocks in this
+            // run do spawn real daemons, so an absolute number would be asserting the wrong thing.
+            let ghost = format!("ghost-{}", std::process::id());
+            let gdir = manager::session_dir(&ghost, "testbox", 7_000_600).expect("no dir");
+            std::fs::create_dir_all(&gdir)?;
+            std::fs::write(gdir.join("meta.json"),
+                serde_json::json!({ "name": ghost }).to_string())?;
+            let listed = |ts: u64| -> bool {
+                manager::view(&repo, ts, 2700)["sessions"].as_array()
+                    .is_some_and(|a| a.iter().any(|s| s["name"].as_str() == Some(ghost.as_str())))
+            };
+            assert!(listed(7_000_601), "the seam did not surface the fixture at all");
+            std::env::remove_var("MARS_VIEW_ALL_SESSIONS");
+            assert!(!listed(7_000_602),
+                "a session directory with no live daemon was reported as a live session");
+            std::env::set_var("MARS_VIEW_ALL_SESSIONS", "1");
+        }
+        println!("[selfcheck] manager: dead session dirs are not live sessions ... PASS");
+
 
         // Provenance comes from the agent SIGNING her work, never from how recently a file was
         // touched. An unsigned file is somebody else's, however fresh it looks — that inference

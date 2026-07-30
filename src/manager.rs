@@ -572,7 +572,10 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                 .filter_map(|p| {
                     let meta: serde_json::Value =
                         serde_json::from_str(&std::fs::read_to_string(p.join("meta.json")).ok()?).ok()?;
-                    Some((meta["name"].as_str()?.to_string(), p))
+                    let name = meta["name"].as_str()?.to_string();
+                    // Same filter as read_all_sessions: this scan feeds `briefs` directly, so
+                    // leaving it unfiltered let every dead session back into the view.
+                    session_is_live(&name).then_some((name, p))
                 })
                 .collect()
         })
@@ -915,10 +918,12 @@ fn score_runs(repo: &Path, ts: u64) {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             let Ok(batch) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
             let opened = batch["opened_ts"].as_u64().unwrap_or(0);
-            // The agent moves the file when it finishes, so the mtime of the file in done/ IS the
-            // finish time — measured by us rather than reported by it.
             let delivered = batch["delivered_ts"].as_u64().unwrap_or(0);
-            let finished = mtime_secs(&path);
+            // NOT the mtime of the file in done/. Moving it is a rename, and rename preserves
+            // mtime — so that timestamp is when WE last wrote the batch (stamping delivered_ts),
+            // which made every duration come out as zero. The receipt is the last thing written
+            // in a run and is a real write, so its mtime is the honest finish time.
+            let finished = mtime_secs(&repo.join("runs").join(&name)).max(mtime_secs(&path));
             let duration = (delivered > 0 && finished >= delivered).then(|| finished - delivered);
 
             let sessions = batch["sessions"].as_array().cloned().unwrap_or_default();
@@ -1544,6 +1549,16 @@ fn fingerprint_detail(s: &SessionSnap) -> String {
 /// test run wrote into the user's live repo.
 /// Every live session as the tree records it, for an index rebuild that is not tied to one
 /// session's board frame.
+/// Is this session backed by a running daemon? A directory that outlives its daemon is history,
+/// not a session — worth keeping on disk, not worth describing as the present.
+///
+/// MARS_VIEW_ALL_SESSIONS exists for the headless checks, which build session trees with no
+/// daemons behind them and would otherwise see an empty view.
+fn session_is_live(name: &str) -> bool {
+    std::env::var("MARS_VIEW_ALL_SESSIONS").is_ok()
+        || crate::session::socket_path(name).map(|p| p.exists()).unwrap_or(false)
+}
+
 fn read_all_sessions() -> Vec<SessionSnap> {
     let Some(root) = sessions_root() else { return Vec::new() };
     let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
@@ -1553,6 +1568,15 @@ fn read_all_sessions() -> Vec<SessionSnap> {
         let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else { continue };
         let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         let Some(name) = meta["name"].as_str() else { continue };
+        // A directory outliving its daemon is not a session. Without this the view reports every
+        // session that ever existed, and the agent writes a briefing about five boards when one
+        // is live — history worth keeping on disk, but not worth describing as the present.
+        //
+        // MARS_VIEW_ALL_SESSIONS exists for the headless checks, which build session trees with
+        // no daemons behind them and would otherwise see an empty view.
+        if !session_is_live(name) {
+            continue;
+        }
         // Reconstruct the board from the NEWEST snapshot only — one file per session, not the
         // directory. Snapshots are ground truth and the latest one is the current board, so the
         // query stays bounded by how many sessions exist rather than by how long they have run.
@@ -1684,4 +1708,102 @@ pub fn snapshot_main(repo: Option<String>) -> Result<()> {
         println!("  {}", e.replace("**", ""));
     }
     Ok(())
+}
+
+// ── `mars manager` — the agent loop, detached from the daemon ────────────────────────────
+//
+// The daemon decides WHEN a turn should happen; these decide nothing and just do it. Keeping the
+// two welded together meant every experiment on the agent needed a daemon on the right binary, a
+// board that happened to change, an elapsed floor, a free lock and an idle pane — five gates
+// between an edit and an observation. Policy stays in `agent_tick`; the mechanism lives here.
+
+/// Snapshot every live session right now, whatever the fingerprint says.
+///
+/// The tick deliberately writes nothing when nothing changed, which is correct in production and
+/// useless when you want something to feed the agent on demand.
+pub fn force_snapshot(ts: u64) -> Result<usize> {
+    let Some(repo) = repo_dir() else { return Ok(0) };
+    let mut n = 0;
+    for name in live_session_names() {
+        let Some(snap) = board_of(&name) else { continue };
+        emit(&repo, &host_name(), std::slice::from_ref(&snap), ts, 2700)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+fn live_session_names() -> Vec<String> {
+    let Some(root) = sessions_root() else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
+    rd.flatten()
+        .filter_map(|e| {
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(e.path().join("meta.json")).ok()?).ok()?;
+            let name = meta["name"].as_str()?.to_string();
+            session_is_live(&name).then_some(name)
+        })
+        .collect()
+}
+
+/// Run exactly one turn, synchronously, and report what happened. No daemon, no cadence, no lock.
+pub fn run_once(ts: u64, force: bool) -> Result<String> {
+    let Some(repo) = repo_dir() else { anyhow::bail!("no manager repo") };
+    scaffold_docs(&repo)?;
+    if force {
+        let n = force_snapshot(ts)?;
+        println!("snapshotted {n} live session(s)");
+    }
+    let sessions: Vec<SessionSnap> = live_session_names().iter().filter_map(|n| board_of(n)).collect();
+    let Some(batch) = compose_batch(&repo, &sessions, ts)? else {
+        return Ok("nothing to do — no unconsumed snapshots (try --force)".into());
+    };
+    let name = batch.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    // Stamp BEFORE running. The agent moves the batch into done/ as its last act, so writing
+    // afterwards both misses the file and recreates a phantom open batch in inbox/.
+    if let Ok(t) = std::fs::read_to_string(&batch) {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&t) {
+            v["delivered_ts"] = serde_json::json!(ts);
+            let _ = std::fs::write(&batch, v.to_string());
+        }
+    }
+    println!("running batch {name} …");
+    let started = std::time::Instant::now();
+    let out = std::process::Command::new("sh")
+        .arg(repo.join("run.sh"))
+        .current_dir(&repo)
+        .output()?;
+    let secs = started.elapsed().as_secs();
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    if !out.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    }
+    score_runs(&repo, ts + secs + 1);
+    Ok(format!("turn finished in {secs}s (exit {})", out.status))
+}
+
+/// Why the agent is or is not about to run. Every gate, in one place, instead of five files.
+pub fn status_report(ts: u64) -> Result<String> {
+    let Some(repo) = repo_dir() else { anyhow::bail!("no manager repo") };
+    let live = live_session_names();
+    let pending: usize = live
+        .iter()
+        .filter_map(|n| existing_session_dir(n))
+        .map(|d| snapshots_after(&d, None).len())
+        .sum();
+    let last = std::fs::metadata(last_run_path(&repo))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let (ok, total, timing) = run_tally(&repo);
+    let mut s = String::new();
+    s.push_str(&format!("repo          {}\n", repo.display()));
+    s.push_str(&format!("agent         {}\n", if agent_enabled(&repo) { "ON" } else { "OFF — touch agent.enabled" }));
+    s.push_str(&format!("live sessions {}\n", if live.is_empty() { "(none)".into() } else { live.join(", ") }));
+    s.push_str(&format!("snapshots     {pending} on disk\n"));
+    s.push_str(&format!("open batch    {}\n", open_batch(&repo).map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_else(|| "(none)".into())));
+    s.push_str(&format!("last run      {}\n", last.map(|t| format!("{} ago", human_age(ts.saturating_sub(t)))).unwrap_or_else(|| "never (floor open)".into())));
+    s.push_str(&format!("lock          {}\n", if repo.join("agent.lock").exists() { "held" } else { "free" }));
+    s.push_str(&format!("runs          {ok}/{total} clean · {timing}\n"));
+    Ok(s)
 }
