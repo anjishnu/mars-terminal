@@ -6179,6 +6179,24 @@ fn selfcheck() -> Result<()> {
         assert!(log.contains("no-receipt"), "a run with no receipt scored clean: {log}");
 
         println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
+        // Provenance must come from a RECEIPT, never from mtime. A fresh file nobody claimed is
+        // somebody else's deterministic output, and labelling it "agent" is the provenance mark
+        // telling the exact lie it exists to prevent.
+        {
+            let unclaimed = manager::session_dir("9", "testbox", 7_000_300).expect("no dir");
+            std::fs::create_dir_all(&unclaimed)?;
+            std::fs::write(unclaimed.join("meta.json"), serde_json::json!({"name":"9"}).to_string())?;
+            std::fs::write(unclaimed.join("mission_briefing.md"), "written by something else\n")?;
+            manager::emit(&repo, "testbox", &[], 7_000_400, 2700)?;
+            let idx: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(repo.join("index.json"))?)?;
+            let nine = idx["sessions"].as_array().unwrap().iter()
+                .find(|s| s["name"] == "9").cloned().unwrap_or_default();
+            assert_eq!(nine["narrativeSource"].as_str(), Some("computed"),
+                "an unclaimed briefing was credited to the agent: {nine}");
+        }
+        println!("[selfcheck] manager: provenance comes from receipts, not mtime ... PASS");
+
     }
 
     // ── The manager's hidden tab ────────────────────────────────────────────────────────

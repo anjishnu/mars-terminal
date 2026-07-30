@@ -497,7 +497,36 @@ fn append_timeline(repo: &Path, ts: u64, lines: &[String]) -> Result<()> {
 /// to arithmetic, because an eloquent briefing about a board that has since moved is worse than a
 /// blunt sentence about the board as it is. This is also the deterministic check that a dead
 /// agent cannot go unnoticed — it stops being preferred the moment it stops writing.
-fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64) -> Option<String> {
+/// Every file the agent has CLAIMED to write, gathered from her receipts.
+///
+/// Authorship has to be proven, not inferred. Freshness was standing in for it, and freshness is
+/// not authorship: an older daemon still writing mission_briefing.md produced a recent mtime, so
+/// its deterministic markdown was labelled "agent" on the phone — the provenance mark whose only
+/// job is honesty was the thing lying. A receipt naming the path is a claim she made and that
+/// score_runs already audits against the filesystem, which makes it evidence rather than a guess.
+fn agent_claimed_paths(repo: &Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(rd) = std::fs::read_dir(repo.join("runs")) else { return out };
+    for e in rd.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        if let Some(a) = v["wrote"].as_array() {
+            out.extend(a.iter().filter_map(|p| p.as_str().map(String::from)));
+        }
+    }
+    out
+}
+
+fn read_agent_prose(
+    path: &Path,
+    ts: u64,
+    stale_secs: u64,
+    claimed: &std::collections::HashSet<String>,
+) -> Option<String> {
+    // Not hers unless she said so in a receipt.
+    if !claimed.contains(&path.display().to_string()) {
+        return None;
+    }
     let age = ts.saturating_sub(mtime_secs(path));
     if age > stale_secs {
         return None;
@@ -588,6 +617,7 @@ fn write_index(
             .then(b["created_ts"].as_u64().unwrap_or(0).cmp(&a["created_ts"].as_u64().unwrap_or(0)))
     });
     let (runs_ok, runs_total) = score_runs(repo, ts);
+    let claimed = agent_claimed_paths(repo);
     let index = serde_json::json!({
         "generated": iso(ts), "generated_ts": ts,
         "sessions": briefs.iter().map(|(n, b)| {
@@ -604,7 +634,7 @@ fn write_index(
             // …then prefer the agent, but only while its prose is FRESHER than the ground truth
             // it describes. An eloquent briefing about a board that has since moved is worse
             // than a blunt sentence about the board as it is.
-            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs));
+            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs, &claimed));
             let (narrative, narrative_source) = match agent {
                 Some(a) => (a, "agent"),
                 None => (computed, "computed"),
@@ -621,7 +651,7 @@ fn write_index(
                     // Per FIELD, not per document: a garbled workspace summary costs that one
                     // workspace its prose and nothing else.
                     let w = dir.as_ref()
-                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs));
+                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs, &claimed));
                     let (summary, source) = match w {
                         Some(a) => (a, "agent"),
                         None => (workspace_summary(p), "computed"),
@@ -635,6 +665,7 @@ fn write_index(
             })
         }).collect::<Vec<_>>(),
         "agentStaleSecs": stale_secs,
+        "writerVersion": INDEX_WRITER_VERSION,
         "agentRuns": { "ok": runs_ok, "total": runs_total },
         "agentEnabled": agent_enabled(repo),
         "memos": cards,
@@ -653,6 +684,19 @@ fn write_index(
         v
     };
     let path = repo.join("index.json");
+    // Refuse to downgrade. The index is derived, so "last writer wins" was safe while every
+    // daemon shared a schema — and stopped being safe the moment two builds disagreed about it.
+    // An older daemon rebuilding from the same tree produces a valid but OLDER-SHAPED index, and
+    // the two then overwrite each other every tick. Newer writers win; equal versions proceed.
+    if let Some(theirs) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["writerVersion"].as_u64())
+    {
+        if theirs > INDEX_WRITER_VERSION {
+            return Ok(());
+        }
+    }
     let unchanged = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -1057,6 +1101,11 @@ fn last_run_path(repo: &Path) -> PathBuf {
 /// from a lock whose owner no longer existed. Three missed refreshes is dead.
 const AGENT_LOCK_STALE_SECS: u64 = 180;
 
+/// Schema version of `index.json`. Bump when the shape changes; a daemon will not overwrite an
+/// index stamped by a HIGHER version than its own, so a stale daemon in a mixed fleet degrades to
+/// writing nothing rather than to fighting the current one.
+const INDEX_WRITER_VERSION: u64 = 1;
+
 /// Only one daemon may drive the agent. Every session runs its own tick, so without this each
 /// would spawn its own `claude` in its own hidden pane and they would all write the same files.
 /// The lock is claimable when stale so a killed daemon does not park the manager forever.
@@ -1171,6 +1220,19 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("docs/memos.md"), include_str!("manager_docs/memos.md"))?;
     seed(&repo.join("docs/receipts.md"), include_str!("manager_docs/receipts.md"))?;
     seed(&repo.join("prompt.md"), include_str!("manager_docs/prompt.md"))?;
+    let runner = repo.join("run.sh");
+    seed(&runner, include_str!("manager_docs/run.sh"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(&runner) {
+            let mut perm = md.permissions();
+            if perm.mode() & 0o111 == 0 {
+                perm.set_mode(0o755);
+                let _ = std::fs::set_permissions(&runner, perm);
+            }
+        }
+    }
     seed(&repo.join("docs/memory.md"), include_str!("manager_docs/memory.md"))?;
     seed(&repo.join("docs/tools.md"), include_str!("manager_docs/tools.md"))?;
     seed(&repo.join("policy.md"), include_str!("manager_docs/policy.md"))?;
