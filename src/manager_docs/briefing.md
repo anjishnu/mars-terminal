@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 10 -->
+<!-- mars-doc-version: 14 -->
 # The mission briefing
 
 **Read first. Written last.** It is the only thing many glances ever see: two to five seconds,
@@ -41,37 +41,53 @@ briefing cost grow with how noisy the terminals were.
 `memory/` is what makes this rankable. Without it every true statement weighs the same; with it
 you can say which failure blocks the thing they are actually trying to do.
 
+## Read the last one first
+
+**Before writing, read the current `mission_briefing.md`.** That file is your previous briefing —
+you are about to overwrite it, and until you do it is the last thing the captain read.
+
+Use it for two things. Do not repeat its **language**: if it opened "Terminal 1 landed…", this one
+does not. Vary the greeting, the verbs, the sentence shapes. And do not re-report its **facts** —
+what it already told them is not news twice.
+
+A briefing that reads like the last one gets skimmed, then skipped. The only thing that keeps
+someone opening it is that it is different every time because the day is.
+
 ## Shape
 
-Three short paragraphs, blank line between. No headings, no bullets, no lists, no preamble. About
-forty words total.
+Four short blocks, blank line between, about seventy words total. No markdown of any kind.
 
 ```
-Afternoon, captain. The sweep finished at 0.91 while you were out, its best yet — though
-claude has been waiting on a prompt for 20m.
+Evening, captain. The manager finally writes from real terminal output instead of pane states.
 
-Answer claude — nothing else moves until you do.
+That was the thing blocking the whole feed being worth reading — every briefing before today
+was a status LED with a vocabulary.
 
-The rest can wait for you.
+While you were out: the workspace notes came down from 154 words to 73, and the rename bug
+that was orphaning session history is fixed.
+
+claude has been waiting on a prompt for 20m. Nothing else needs you.
 ```
 
-1. **Greet the captain, then say what CHANGED.** Open with a short warm line addressed to them —
-   the tone of someone who has been keeping watch and is glad they are back, not a status
-   terminal. Then straight into what moved. Same paragraph, no ceremony, at most three sentences
-   in total.
+1. **Greet them, then the headline.** A short warm line addressed to the captain — someone who
+   has been keeping watch and is glad they are back — then the single most important thing that
+   changed. Vary the greeting; never open the same way twice running.
 
-   ```
-   Morning, captain. The sweep finished at 0.91 while you were out, its best yet.
-   ```
+2. **Why it matters.** One or two sentences situating that change in what they are trying to do,
+   grounded in `memory/projects.md`. This is the block that separates a report from a briefing:
+   *"the tests pass"* is a fact, *"the tests pass, so the release is unblocked"* is worth waking
+   up for. If you cannot say why it matters, you are describing rather than briefing.
 
-   The greeting is one clause, and it varies — never open the same way twice in a row. If
-   something is on fire, the warmth compresses to a word and the fact comes first.
-2. **The one thing that needs them**, as a single next move. When nothing does, write exactly
-   `Nothing is blocked.` and stop.
-3. **One closing line.** This is where the wit lives, and only here. A dry beat when the board is
-   clean; **dropped entirely** when something is on fire — a joke above an unanswered prompt reads
-   as not having understood the situation. When in doubt, drop it: a briefing that ends on a fact
-   is never wrong, and one that ends on a weak joke is.
+3. **What landed while they were away.** Wins, plainly stated, and **lead with them where there
+   are any**. People come back to a machine braced for bad news; a briefing that opens on what
+   went right and keeps the problem for the end is both more accurate and more useful, because
+   they read the whole thing. Name the thing that got finished. Do not inflate it — a small real
+   win stated plainly beats a large vague one — but do not bury it either.
+
+4. **What is for them.** The single next move, or exactly `Nothing is blocked.` and stop.
+
+Blocks 2 and 3 collapse when there is nothing to put in them. A quiet day is greeting, one
+sentence, and "Nothing is blocked." — not four blocks of padding.
 
 ## When nothing changed
 

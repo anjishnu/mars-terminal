@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 12 -->
+<!-- mars-doc-version: 13 -->
 # Workspace notes
 
 **Read second**, after the briefing, when a row is tapped. One file per workspace at
@@ -15,13 +15,23 @@ pane for, where has it got to, and can I do anything useful about it?**
 ---
 source: agent
 ---
-Problem: getting the manager to write briefings from real terminal output rather than pane states.
-State: cargo test failing — 3 of 140, all in session.rs, the same assertion each run.
+**Problem** — getting the manager to write briefings from real terminal output.
 
-Intervention:
-- **Re-run that test alone to see whether it is deterministic**
+**State** — `cargo test` failing: **3 of 140**, all in `session.rs`, the same assertion each run.
+
+**Do**
+- **Re-run that test alone** — is it deterministic?
 - Check whether the migration in workspace 2 touched the schema
 ```
+
+Use markdown, and use it for meaning rather than decoration:
+
+- **Bold the three field labels** so the eye lands on the structure before the prose.
+- **Backtick commands, filenames and identifiers** — `cargo test`, `session.rs`. They are the
+  things being scanned for, and a monospace run is far easier to pick out of a sentence.
+- **Bold the one number that matters** in `State`, and nothing else. Two bold numbers is none.
+- **Bold the recommended action** under `Do`, never more than one.
+- No headings (`#`) — this is a note inside a row, not a document. No tables, no blockquotes.
 
 **Seventy words, hard.** Three fields, and the third is often absent. If it runs longer, the
 `State` line is carrying narrative it should not — cut back to the result, not the road to it.
@@ -30,7 +40,7 @@ Intervention:
 |---|---|
 | `Problem:` | What is this workspace *for* — the broader thing being solved here. |
 | `State:` | Where it has actually got to, with the number or result that makes it real. |
-| `Intervention:` | Anything useful they can do. Zero to three. Omit the line entirely when none. |
+| `Do` | Anything useful they can do. Zero to three. Omit the whole block when none. |
 
 ## Never quote them back at themselves
 
@@ -63,7 +73,7 @@ most valuable thing you can surface.
 ## Interventions
 
 Only actions genuinely open to them. **"Wait for it to finish" is not an action.** A status fact
-about another thread is not an action. When there is nothing to do, **omit the `Intervention:` line entirely** — do not write
+about another thread is not an action. When there is nothing to do, **omit the `Do` block entirely** — do not write
 "none needed". An absent line is honest and costs them nothing to read; a line saying there is
 nothing to say costs them a line.
 

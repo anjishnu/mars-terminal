@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 5 -->
+<!-- mars-doc-version: 13 -->
 # Memos
 
 **Read last**, behind a closed folder, after the briefing and the board. By the time anyone opens
@@ -79,6 +79,13 @@ is the only thing that touched the schema today.
 
 Do not write a memo that says only "X is failing". The row already says that. If you have nothing
 to add beyond the board, write no memo — that is a success, not a gap.
+
+## Formatting
+
+Markdown is rendered here, so use it — sparingly and for meaning. Backtick commands, files and
+identifiers; bold the one number or name the memo turns on; bullets for genuinely parallel items.
+No headings: a memo is a note, not a document, and a heading inside a card just adds a second
+title above the one it already has.
 
 ## Titles carry the identity
 

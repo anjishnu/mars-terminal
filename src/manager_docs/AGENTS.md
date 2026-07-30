@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 12 -->
+<!-- mars-doc-version: 14 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -82,7 +82,9 @@ worth nothing under a row that already reads `build · failed`.
    workspace rows already say what is happening; a memo says what is being forgotten. Give it a
    title that names the thing, state the problem in a few concrete lines, and end with the
    proposed next move — a memo that stops at the diagnosis hands back the work.
-6. **Write `mission_briefing.md` LAST**, once every document above is on disk — format in
+6. **Write `mission_briefing.md` LAST**, once every document above is on disk. Read the
+   existing file first — it is the previous briefing, and repeating its language or its facts is
+   how a feed stops being opened. Format in
    [`docs/briefing.md`](docs/briefing.md). It summarises what you just wrote, so writing it first
    means summarising work you have not done yet.
 7. **Advance `memory/cursor.json`** — set each session's entry to the newest snapshot filename you

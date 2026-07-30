@@ -179,11 +179,50 @@ fn print_wordmark() {
 
 // ── mars serve ───────────────────────────────────────────────────────────────
 
+/// Where the bridge records which daemon instance it is serving.
+///
+/// A session name is a label the engineer changes; an instance id is not. Persisting it is what
+/// lets a bridge started as `mars serve <name>` come back up after that name has moved — the case
+/// a launchd-supervised bridge hits on its very next restart.
+fn instance_note() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".mars/serve.instance"))
+}
+
+fn remember_instance(id: &str) {
+    if let Some(p) = instance_note() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, id);
+    }
+}
+
+fn remembered_instance() -> Option<String> {
+    let s = std::fs::read_to_string(instance_note()?).ok()?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
-    let socket = session::socket_path(&session)?;
+    let mut socket = session::socket_path(&session)?;
+    let mut session = session;
     if !socket.exists() {
-        return Err(anyhow!("session '{session}' has no socket — is it running? (`mars ls`)"));
+        // The name we were given no longer resolves — almost always because the session was
+        // renamed. An instance id is minted once per daemon and survives renames, so follow the
+        // one this bridge served last. Without this, a supervised `mars serve <name>` dies on
+        // every restart after a rename and the phone is simply cut off — exactly what the
+        // per-connection re-resolve below already exists to prevent, missing at startup.
+        match remembered_instance().and_then(|id| session::socket_for_instance(&id)) {
+            Some((name, p)) => {
+                eprintln!("session '{session}' is gone — following the rename to '{name}'");
+                session = name;
+                socket = p;
+            }
+            None => {
+                return Err(anyhow!("session '{session}' has no socket — is it running? (`mars ls`)"));
+            }
+        }
     }
     // Bind to the session's INSTANCE ID, not its name. The socket is named after the session, so
     // `mars rename` moves it and a path captured here would go stale — the bridge would keep
@@ -196,6 +235,8 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
              Restart the session so the bridge can follow it across renames."
         ));
     }
+    // Remember it: this is what a later start reads when the name it was given has moved.
+    remember_instance(&instance_id);
     let port = DEFAULT_PORT;
     // Bind localhost; cloudflared fronts it with a public https/wss URL, so the phone
     // (loading the app from Lovable over https) can reach this bridge over wss without a
@@ -763,7 +804,14 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             if let Some(name) = v.get("name").and_then(|x| x.as_str()) {
                 let name = name.trim();
                 if !name.is_empty() {
-                    if let Ok(mut conn) = crate::sys::control::connect(socket) {
+                    // Re-resolve by instance rather than reusing the path captured when this
+                    // websocket opened: after one rename that path is gone, so a SECOND rename
+                    // from the phone would silently do nothing.
+                    let live = remembered_instance()
+                        .and_then(|id| session::socket_for_instance(&id))
+                        .map(|(_, p)| p)
+                        .unwrap_or_else(|| socket.to_path_buf());
+                    if let Ok(mut conn) = crate::sys::control::connect(&live) {
                         let _ = session::write_frame(&mut conn, &ClientFrame::Rename { to: name.to_string() });
                     }
                 }
