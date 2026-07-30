@@ -229,6 +229,18 @@ fn human_age(secs: u64) -> String {
 /// roughly every seven seconds regardless of whether anything changed — and a phone polling it
 /// re-rendered each time. Nothing downstream can tell "this is new" from "this was rewritten"
 /// except by comparing, so the comparison belongs here, once.
+/// The path Mars may write for an artifact the AGENT owns.
+///
+/// Ownership was a convention in a doc, and a convention lost twice: the deterministic pass
+/// overwrote `mission_briefing.md` every 60s, and then `workspaces/<pane>.md` every 60s, in both
+/// cases erasing minutes of model work with a sentence of arithmetic. Cheap output must never be
+/// able to clobber expensive output. Every deterministic write now goes through here, so the
+/// suffix is applied by construction rather than remembered.
+fn computed(path: PathBuf) -> PathBuf {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    path.with_file_name(format!("{stem}.computed.md"))
+}
+
 fn write_if_changed(path: &Path, body: &str) -> Result<bool> {
     if std::fs::read_to_string(path).is_ok_and(|old| old == body) {
         return Ok(false);
@@ -1371,14 +1383,17 @@ pub fn emit(
         // NOT mission_briefing.md — that file belongs to the agent now, and rewriting it every
         // tick would make its work vanish every 60 seconds. The deterministic sentence lives
         // beside it as the visible floor, and reaches the phone through the index either way.
-        write_if_changed(&sdir.join("mission_briefing.computed.md"), &brief)?;
+        write_if_changed(&computed(sdir.join("mission_briefing.md")), &brief)?;
         // …and one document per workspace, so a single workspace can be read (or later enriched
         // by an agent) without touching the session summary.
         let wdir = sdir.join("workspaces");
         std::fs::create_dir_all(&wdir)?;
         for p in &s.panes {
+            // NOT <pane>.md — that belongs to the agent, exactly as mission_briefing.md does.
+            // Writing it here erased her summaries within a tick, which is why every workspace
+            // on the phone read "computed" however well the agent had described it.
             write_if_changed(
-                &wdir.join(format!("{}.md", p.pane_id)),
+                &computed(wdir.join(format!("{}.md", p.pane_id))),
                 &format!(
                     "# {} · {}\n\n{}\n\n- state: {}\n- kind: {}\n",
                     p.name, s.name, workspace_summary(p), p.verdict, p.kind

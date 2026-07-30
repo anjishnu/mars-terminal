@@ -6282,6 +6282,32 @@ fn selfcheck() -> Result<()> {
             assert_eq!(manager::plain(b"\x1b[31merror\x1b[0m: boom   "), "error: boom");
         }
         println!("[selfcheck] manager: output signals are extracted, not inferred ... PASS");
+        // The ownership boundary, enforced rather than documented. Mars writing an agent-owned
+        // path is how minutes of model work got erased by a sentence of arithmetic — twice.
+        {
+            let sdir = manager::session_dir("0", "testbox", 1_000_000).expect("no session dir");
+            let owned = [sdir.join("mission_briefing.md"), sdir.join("workspaces/0.md")];
+            for f in &owned {
+                let _ = std::fs::remove_file(f);
+            }
+            let board = vec![manager::SessionSnap {
+                name: "0".into(), health: String::new(),
+                panes: vec![manager::PaneRow {
+                    id: "0".into(), pane_id: "0".into(), name: "terminal 1".into(),
+                    verdict: "running".into(), kind: "terminal".into(), why: String::new(),
+                    age_secs: 5, blocked_prompt: None,
+                }],
+            }];
+            manager::emit(&repo, "testbox", &board, 1_000_500, 2700, &serde_json::Value::Null)?;
+            for f in &owned {
+                assert!(!f.exists(),
+                    "the deterministic pass wrote an agent-owned file: {}", f.display());
+            }
+            assert!(sdir.join("mission_briefing.computed.md").exists(),
+                "the deterministic briefing went missing entirely");
+        }
+        println!("[selfcheck] manager: cheap output cannot clobber the agent's ... PASS");
+
 
 
 

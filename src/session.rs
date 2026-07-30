@@ -885,7 +885,25 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                             .filter(|l| !l.trim().is_empty()).collect()
                     };
                     let delta = take(total.saturating_sub(MANAGER_DELTA_CAP).max(cursor), total);
-                    let tail = take(total.saturating_sub(MANAGER_TAIL), total);
+                    // The tail is the VISIBLE SCREEN, not the log. `capture()` only harvests rows
+                    // that scrolled OFF, so a pane whose output fits on screen has an entirely
+                    // empty line log — which is why every snapshot carried tail=0, delta=0 and the
+                    // agent had nothing to summarise. Screen for where it landed, log for what
+                    // streamed past: that is the split the two fields were always meant to be.
+                    let screen = term.screen();
+                    let (_, cols) = screen.size();
+                    let tail: Vec<String> = screen
+                        .rows_formatted(0, cols)
+                        .map(|r| crate::manager::plain(&r))
+                        .filter(|l| !l.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .take(MANAGER_TAIL as usize)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
                     pane_cursors.insert(tid, total);
                     out.insert(pid.to_string(), serde_json::json!({ "tail": tail, "delta": delta }));
                 }

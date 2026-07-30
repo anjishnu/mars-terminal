@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 6 -->
+<!-- mars-doc-version: 7 -->
 # The mission briefing
 
 **Read first. Written last.** It is the only thing many glances ever see: two to five seconds,
@@ -33,6 +33,25 @@ Everything else is quiet.
    `Nothing is blocked.` and stop.
 3. **One closing line.** A dry beat when the board is clean. **Drop it entirely** when something
    is on fire — a joke above an unanswered prompt reads as not having understood the situation.
+
+## When nothing changed
+
+If every pane's `delta` is empty, do **not** write a briefing about stasis. "Nothing has changed"
+is information the engineer already has — they can see the board.
+
+Shift to the project instead. Read `memory/projects.md` and lead with where the workstream stands
+and what the next step is:
+
+```
+Nothing has moved since you left. The manager agent still needs its acceptance run —
+a failing build in a pane, then check the briefing names the failure.
+
+Nothing is blocked.
+```
+
+A quiet board is the one moment there is room to answer *"what was I doing?"* rather than
+*"what just happened?"*. Spending it on "all quiet" wastes the only briefing they will read
+unhurried.
 
 ## Rules
 
