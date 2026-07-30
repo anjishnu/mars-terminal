@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 15 -->
+<!-- mars-doc-version: 16 -->
 # The mission briefing
 
 **Read first. Written last.** It is the only thing many glances ever see: two to five seconds,
@@ -55,61 +55,50 @@ someone opening it is that it is different every time because the day is.
 
 ## Shape
 
-Four short blocks, blank line between. **Seventy words, hard** — if it runs longer, block 1 or 2
-is narrating. No markdown of any kind.
+**Three blocks. Forty-five words. Hard.**
+
+That is roughly fifteen words a block — one sentence each, and a short one. If a block needs two
+sentences, the second is almost always the one to cut.
 
 ```
-Evening, captain. The manager finally writes from real terminal output instead of pane states.
+Evening, captain. The manager writes from real terminal output now, which is what
+finally makes the feed worth opening.
 
-That was the thing blocking the whole feed being worth reading — every briefing before today
-was a status LED with a vocabulary.
+Workspace notes came down from 154 words to 73, and the rename bug that was
+orphaning session history is fixed.
 
-While you were out: the workspace notes came down from 154 words to 73, and the rename bug
-that was orphaning session history is fixed.
-
-claude has been waiting on a prompt for 20m. Nothing else needs you.
+claude has been waiting on a prompt for 20m.
 ```
 
-1. **Greet them, then the headline.** A short warm line addressed to the captain — someone who
-   has been keeping watch and is glad they are back — then the single most important thing that
-   changed. Vary the greeting; never open the same way twice running.
+Thirty-nine words.
 
-2. **Why it matters.** One or two sentences situating that change in what they are trying to do,
-   grounded in `memory/projects.md`. This is the block that separates a report from a briefing:
-   *"the tests pass"* is a fact, *"the tests pass, so the release is unblocked"* is worth waking
-   up for. If you cannot say why it matters, you are describing rather than briefing.
+1. **Greeting, headline, and why — in one sentence.** The warm line and the most important change
+   share a breath; the reason it matters is a clause on the end, not a paragraph of its own.
+   *"…which is what finally makes the feed worth opening"* is the whole justification, and it is
+   six words.
 
-3. **What landed while they were away.** Wins, plainly stated, and **lead with them where there
-   are any**. A win is something that is now DONE: a bug found and fixed, a test that went green,
-   a number that improved, a piece of work that shipped. Say the number — "notes came down from
-   154 words to 73" — because a measured win is believable and an adjectival one is not. People come back to a machine braced for bad news; a briefing that opens on what
-   went right and keeps the problem for the end is both more accurate and more useful, because
-   they read the whole thing. Name the thing that got finished. Do not inflate it — a small real
-   win stated plainly beats a large vague one — but do not bury it either.
+2. **What landed while they were away.** With the number. "154 words to 73" is believable in a way
+   that "much shorter" is not. Lead here when the news is good — people come back braced for bad
+   news, and opening on what went right gets the whole thing read.
 
-4. **What is for them.** The single next move, or exactly `Nothing is blocked.` and stop.
+3. **What is for them.** One line, or exactly `Nothing is blocked.`
 
-Blocks 2 and 3 collapse when there is nothing to put in them. A quiet day is greeting, one
-sentence, and "Nothing is blocked." — not four blocks of padding.
+Blocks 2 and 3 collapse to nothing when empty. A quiet day is a greeting and "Nothing is blocked."
+— two lines, and that is a complete briefing, not a failed one.
 
-## When nothing changed
+## How to compress
 
-If every pane's `delta` is empty, do **not** write a briefing about stasis. "Nothing has changed"
-is information the engineer already has — they can see the board.
+Write it long, then cut it. In order:
 
-Shift to the project instead. Read `memory/projects.md` and lead with where the workstream stands
-and what the next step is:
+- **Every clause that does not change what they know or do.** Most of the first draft.
+- **Anything they can see on the board.** Pane names, states, ages — all already on screen.
+- **Your own reasoning.** "It found the gap already" is you narrating your analysis; the gap is
+  the news.
+- **Qualifiers.** "seems to be", "is currently", "appears" — either you know it or leave it out.
+- **The second sentence of any block.** Try it. It usually survives being gone.
 
-```
-Nothing has moved since you left. The manager agent still needs its acceptance run —
-a failing build in a pane, then check the briefing names the failure.
-
-Nothing is blocked.
-```
-
-A quiet board is the one moment there is room to answer *"what was I doing?"* rather than
-*"what just happened?"*. Spending it on "all quiet" wastes the only briefing they will read
-unhurried.
+Length is the discipline that forces the ranking. A briefing with room for everything ranks
+nothing, and something read in two seconds must have decided what matters before it was written.
 
 ## Never narrate them back at themselves
 
