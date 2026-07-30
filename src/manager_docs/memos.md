@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 2 -->
+<!-- mars-doc-version: 3 -->
 # Memos
 
 A memo is **something worth keeping track of that is not what a workspace is doing right now.**
@@ -50,6 +50,29 @@ changed between them, so this is unlikely to be flakiness.
 | `actions` | when there is an obvious next step | `keys` are literal bytes a human confirms |
 | `expired` | yes | start `false` |
 | `supersedes` | when correcting | titles you are replacing |
+
+## What a memo has to say
+
+Three or four lines, in this shape, and nothing else:
+
+1. **What is wrong**, concretely, with the number or name that makes it real. Not "the build is
+   unhappy" — "the auth test has failed the last three runs, each on the same assertion".
+2. **Why it matters**, if that is not already obvious from the first line. One clause. Skip it
+   when it would only be padding.
+3. **`Next:` the proposed move.** Always end with this. A memo that describes a problem and stops
+   hands the engineer the work of deciding what to do, which is the work they came to you to
+   avoid. If you genuinely do not know the next move, say what you would look at first.
+
+```markdown
+The auth test failed at 00:12, 00:26 and 00:38, each time on the same assertion. Nothing else in
+the run changed between them, so this is unlikely to be flakiness.
+
+Next: re-run it alone — if it fails a fourth time on that assertion, the migration in workspace 2
+is the only thing that touched the schema today.
+```
+
+Do not write a memo that says only "X is failing". The row already says that. If you have nothing
+to add beyond the board, write no memo — that is a success, not a gap.
 
 ## Titles carry the identity
 

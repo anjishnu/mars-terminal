@@ -1521,6 +1521,11 @@ pub fn tick_session(
                 // reached the phone at all, and score_runs never ran to notice the turn happened.
                 // write_index has its own unchanged-check, so on a truly quiet system this still
                 // costs a read and no write.
+                // Scaffold here too. seed() only ever writes an absent or superseded file, so
+                // this is a handful of stat calls — but skipping it meant a newly shipped doc
+                // (prompt.md, which the agent is invoked WITH) never reached a system whose
+                // board happened to be idle, which is precisely the quiet system we target.
+                scaffold_docs(repo)?;
                 let all = read_all_sessions();
                 write_index(repo, &[], &all, ts, stale_secs)?;
                 return Ok(());

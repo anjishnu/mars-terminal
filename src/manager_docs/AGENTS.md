@@ -35,7 +35,9 @@ should leave real work behind, not nothing.
    have not moved. An untouched file beats a rewritten identical one.
 5. **Write memos** into `memos/` — format in [`docs/memos.md`](docs/memos.md). A memo is
    something worth *keeping track of* that is not what a workspace is doing right now. The
-   workspace rows already say what is happening; a memo says what is being forgotten.
+   workspace rows already say what is happening; a memo says what is being forgotten. Give it a
+   title that names the thing, state the problem in a few concrete lines, and end with the
+   proposed next move — a memo that stops at the diagnosis hands back the work.
 6. **Write `mission_briefing.md` LAST**, once every document above is on disk. It summarises what
    you just wrote, so writing it first means summarising work you have not done yet.
 7. **Advance `memory/cursor.json`** — set each session's entry to the newest snapshot filename you
