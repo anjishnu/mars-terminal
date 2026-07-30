@@ -3233,7 +3233,7 @@ fn selfcheck() -> Result<()> {
 
         // T4 — the index is regenerated from the directory and ranks block above warn.
         let idx: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
+            manager::view(&repo, 1_000_400, 2700);
         assert_eq!(idx["memos"].as_array().map(|a| a.len()), Some(2), "index disagrees with disk");
         // The briefing rides INLINE per session — Rover reads one file, not N (single fs slot).
         let brief_inline = idx["sessions"][0]["briefing"].as_str().unwrap_or_default();
@@ -3246,7 +3246,7 @@ fn selfcheck() -> Result<()> {
         ]);
         manager::emit(&repo, "testbox", &s3, 1_000_180, 2700)?;
         let idx: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
+            manager::view(&repo, 1_000_400, 2700);
         let live: Vec<&serde_json::Value> = idx["memos"].as_array().unwrap().iter()
             .filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
         assert_eq!(live[0]["severity"], "block", "index does not rank block first: {idx}");
@@ -3273,8 +3273,8 @@ fn selfcheck() -> Result<()> {
         assert_eq!(std::fs::read_to_string(repo.join("memory/beliefs.md"))?, "MY BELIEFS\n",
                    "memory/ was clobbered — the AGENT owns it");
         // The human-readable status index exists and points into the hierarchy.
-        let status = std::fs::read_to_string(repo.join("index.md"))?;
-        assert!(status.contains("**0**"), "index.md does not list the session: {status}");
+        let status = manager::view(&repo, 1_000_400, 2700).to_string();
+        assert!(status.contains("\"0\""), "the query does not list the session: {status}");
 
         // T6 — the timeline is append-only, date-ordered and readable with no tooling.
         let tl = std::fs::read_to_string(repo.join("timeline.md"))?;
@@ -3316,7 +3316,12 @@ fn selfcheck() -> Result<()> {
         // would vanish every 60 seconds.
         assert!(!sdir.join("mission_briefing.md").exists(),
             "the deterministic tick created the agent's briefing file");
-        assert!(repo.join("index.json").exists(), "daemon tick wrote no index");
+        // The daemon writes NO view — that is the point. Assert the query answers instead,
+        // and that nothing was stored for it to go stale.
+        assert!(!repo.join("index.json").exists(), "a view was stored; nothing should write one");
+        assert!(!repo.join("index.md").exists(), "a view was stored; nothing should write one");
+        assert!(manager::view(&repo, 2_000_000, 2700)["sessions"].as_array()
+            .is_some_and(|a| !a.is_empty()), "the query returned no sessions");
         assert!(repo.join("AGENTS.md").exists(), "daemon tick did not scaffold the guide");
         // Four ticks on an unchanged board wrote ONE stimulus — repeated ticks are not news.
         let snaps = std::fs::read_dir(sdir.join("snapshots"))?.flatten().count();
@@ -3332,13 +3337,13 @@ fn selfcheck() -> Result<()> {
         // the first from it.
         manager::tick_session("testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2, 0, 2700)?;
         let idx: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
+            manager::view(&repo, 1_000_400, 2700);
         let names: Vec<&str> =
             idx["sessions"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
         assert!(names.contains(&"auto") && names.contains(&"other"),
                 "index built from one process's view, not the tree: {names:?}");
         // A tick with the feature off must write nothing new.
-        let before = std::fs::read_to_string(repo.join("index.json"))?;
+        let before = manager::view(&repo, 2_000_000, 2700).to_string();
         assert!(!before.is_empty());
     }
         // The repo must follow the suite's ISOLATION. A run that isolates its sockets but writes
@@ -3385,8 +3390,7 @@ fn selfcheck() -> Result<()> {
             }];
             let summary_at = |age: u64, ts: u64| -> String {
                 manager::emit(&repo, "testbox", &mk(age), ts, 2700).expect("emit");
-                let idx: serde_json::Value = serde_json::from_str(
-                    &std::fs::read_to_string(repo.join("index.json")).expect("index")).expect("json");
+                let idx: serde_json::Value = manager::view(&repo, ts, 2700);
                 idx["sessions"].as_array().unwrap().iter()
                     .find(|s| s["name"] == "stable").expect("session")
                     ["workspaces"][0]["summary"].as_str().unwrap_or_default().to_string()
@@ -6179,21 +6183,27 @@ fn selfcheck() -> Result<()> {
         assert!(log.contains("no-receipt"), "a run with no receipt scored clean: {log}");
 
         println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
-        // Provenance must come from a RECEIPT, never from mtime. A fresh file nobody claimed is
-        // somebody else's deterministic output, and labelling it "agent" is the provenance mark
-        // telling the exact lie it exists to prevent.
+        // Provenance comes from the agent SIGNING her work, never from how recently a file was
+        // touched. An unsigned file is somebody else's, however fresh it looks — that inference
+        // is what credited a daemon's markdown to the agent on the engineer's phone.
         {
-            let unclaimed = manager::session_dir("9", "testbox", 7_000_300).expect("no dir");
-            std::fs::create_dir_all(&unclaimed)?;
-            std::fs::write(unclaimed.join("meta.json"), serde_json::json!({"name":"9"}).to_string())?;
-            std::fs::write(unclaimed.join("mission_briefing.md"), "written by something else\n")?;
-            manager::emit(&repo, "testbox", &[], 7_000_400, 2700)?;
-            let idx: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(repo.join("index.json"))?)?;
-            let nine = idx["sessions"].as_array().unwrap().iter()
-                .find(|s| s["name"] == "9").cloned().unwrap_or_default();
-            assert_eq!(nine["narrativeSource"].as_str(), Some("computed"),
-                "an unclaimed briefing was credited to the agent: {nine}");
+            let unsigned = manager::session_dir("9", "testbox", 7_000_300).expect("no dir");
+            std::fs::create_dir_all(&unsigned)?;
+            std::fs::write(unsigned.join("meta.json"), serde_json::json!({"name":"9"}).to_string())?;
+            std::fs::write(unsigned.join("mission_briefing.md"), "written by something else\n")?;
+            let pick = |ts: u64| -> String {
+                manager::view(&repo, ts, 2700)["sessions"].as_array().unwrap().iter()
+                    .find(|s| s["name"] == "9")
+                    .and_then(|s| s["narrativeSource"].as_str().map(String::from))
+                    .unwrap_or_default()
+            };
+            assert_eq!(pick(7_000_400), "computed",
+                "an unsigned briefing was credited to the agent");
+
+            // …and the same file, signed, IS hers.
+            std::fs::write(unsigned.join("mission_briefing.md"),
+                "---\nsource: agent\n---\nquiet start\n")?;
+            assert_eq!(pick(7_000_400), "agent", "a signed briefing was not credited to the agent");
         }
         println!("[selfcheck] manager: provenance comes from receipts, not mtime ... PASS");
 

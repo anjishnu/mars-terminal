@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 3 -->
+<!-- mars-doc-version: 4 -->
 # Memos
 
 A memo is **something worth keeping track of that is not what a workspace is doing right now.**
@@ -17,6 +17,7 @@ meaning only in the frontmatter.
 
 ```markdown
 ---
+source: agent
 title: auth-test-flaky
 v: 1
 created: 2026-07-30T00:40:00Z
@@ -40,6 +41,7 @@ changed between them, so this is unlikely to be flakiness.
 
 | Field | Required | Notes |
 |---|---|---|
+| `source` | yes | always `agent` — unsigned files are not shown |
 | `title` | yes | kebab-case, stable, meaningful. **`(session, title)` is a memo's identity.** |
 | `priority` | yes | `0`–`100`. Ordering is by priority descending, then most recent. |
 | `severity` | yes | `block` \| `warn` \| `info` \| `ok` |

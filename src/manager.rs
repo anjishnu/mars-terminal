@@ -497,44 +497,40 @@ fn append_timeline(repo: &Path, ts: u64, lines: &[String]) -> Result<()> {
 /// to arithmetic, because an eloquent briefing about a board that has since moved is worse than a
 /// blunt sentence about the board as it is. This is also the deterministic check that a dead
 /// agent cannot go unnoticed — it stops being preferred the moment it stops writing.
-/// Every file the agent has CLAIMED to write, gathered from her receipts.
+/// Read a file another process may be writing right now.
 ///
-/// Authorship has to be proven, not inferred. Freshness was standing in for it, and freshness is
-/// not authorship: an older daemon still writing mission_briefing.md produced a recent mtime, so
-/// its deterministic markdown was labelled "agent" on the phone — the provenance mark whose only
-/// job is honesty was the thing lying. A receipt naming the path is a claim she made and that
-/// score_runs already audits against the filesystem, which makes it evidence rather than a guess.
-fn agent_claimed_paths(repo: &Path) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    let Ok(rd) = std::fs::read_dir(repo.join("runs")) else { return out };
-    for e in rd.flatten() {
-        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-        if let Some(a) = v["wrote"].as_array() {
-            out.extend(a.iter().filter_map(|p| p.as_str().map(String::from)));
-        }
+/// Read it, then look at the timestamp again: if it moved while we were reading, or the file is
+/// only a few milliseconds old, somebody is mid-write — wait a beat and take the second read.
+/// The common case pays nothing. This is handled here rather than by asking the agent to write
+/// atomically, because a rule in a markdown contract is a request, and this is a guarantee.
+fn read_settled(path: &Path) -> Option<String> {
+    let before = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let after = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let fresh = after.elapsed().map(|d| d < std::time::Duration::from_millis(50)).unwrap_or(false);
+    if before == after && !fresh {
+        return Some(text);
     }
-    out
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    std::fs::read_to_string(path).ok()
 }
 
-fn read_agent_prose(
-    path: &Path,
-    ts: u64,
-    stale_secs: u64,
-    claimed: &std::collections::HashSet<String>,
-) -> Option<String> {
-    // Not hers unless she said so in a receipt.
-    if !claimed.contains(&path.display().to_string()) {
-        return None;
-    }
+fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64) -> Option<String> {
     let age = ts.saturating_sub(mtime_secs(path));
     if age > stale_secs {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    // Strip frontmatter if the agent wrote any, and drop a leading markdown heading: the phone
-    // renders this as a sentence, not as a document.
-    let body = split_front(&text).map(|(_, b)| b.to_string()).unwrap_or(text);
+    let text = read_settled(path)?;
+    // The agent SIGNS what she writes. Authorship used to be inferred from how recently the file
+    // was touched, and freshness is not authorship: an older daemon still writing this path
+    // produced a recent mtime, so its deterministic markdown reached the phone stamped "agent" —
+    // the provenance mark telling the exact lie it exists to prevent. An unsigned file is
+    // somebody else's, and falls back to arithmetic.
+    let (front, body) = split_front(&text)?;
+    if front_field(front, "source").as_deref() != Some("agent") {
+        return None;
+    }
+    let body = body.to_string();
     let body: String = body
         .lines()
         .skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
@@ -544,13 +540,24 @@ fn read_agent_prose(
     (!body.is_empty()).then(|| body.to_string())
 }
 
-fn write_index(
-    repo: &Path,
-    briefs: &[(String, String)],
-    sessions: &[SessionSnap],
-    ts: u64,
-    stale_secs: u64,
-) -> Result<()> {
+/// The whole manager view, computed from the tree at the moment it is asked for.
+///
+/// Nothing is stored. `index.json` used to hold this, rewritten by every daemon on a 60s timer
+/// and polled by the phone on a 4s one — two clocks, neither related to when the data changed.
+/// Every serious bug in this module came from that: daemons on different builds overwrote each
+/// other's schema, the phone read a copy forty minutes stale, and authorship had to be guessed
+/// because the view was assembled by someone other than the writer.
+///
+/// Reading is cheap because it only opens what the phone needs — a briefing, a workspace summary
+/// and a memo per workspace, a few dozen small files. The bulk (snapshots, inbox, receipts) is
+/// the agent's raw material and is never opened here, so this cost is bounded by how many
+/// workspaces exist rather than by how long the machine has been running.
+pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
+    let all = read_all_sessions();
+    let computed: Vec<(String, String)> =
+        all.iter().map(|s| (s.name.clone(), session_briefing(s, ts))).collect();
+    let briefs: &[(String, String)] = &computed;
+    let sessions: &[SessionSnap] = &all;
     // Scan the TREE, not just the sessions this process just wrote: each session's daemon owns
     // its own subtree, so an index built from one process's view would omit the others. The
     // directory is the truth; this is a cache of it.
@@ -616,8 +623,7 @@ fn write_index(
             .then(b["priority"].as_u64().unwrap_or(0).cmp(&a["priority"].as_u64().unwrap_or(0)))
             .then(b["created_ts"].as_u64().unwrap_or(0).cmp(&a["created_ts"].as_u64().unwrap_or(0)))
     });
-    let (runs_ok, runs_total) = score_runs(repo, ts);
-    let claimed = agent_claimed_paths(repo);
+    let (runs_ok, runs_total) = run_tally(repo);
     let index = serde_json::json!({
         "generated": iso(ts), "generated_ts": ts,
         "sessions": briefs.iter().map(|(n, b)| {
@@ -634,7 +640,7 @@ fn write_index(
             // …then prefer the agent, but only while its prose is FRESHER than the ground truth
             // it describes. An eloquent briefing about a board that has since moved is worse
             // than a blunt sentence about the board as it is.
-            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs, &claimed));
+            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs));
             let (narrative, narrative_source) = match agent {
                 Some(a) => (a, "agent"),
                 None => (computed, "computed"),
@@ -651,7 +657,7 @@ fn write_index(
                     // Per FIELD, not per document: a garbled workspace summary costs that one
                     // workspace its prose and nothing else.
                     let w = dir.as_ref()
-                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs, &claimed));
+                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs));
                     let (summary, source) = match w {
                         Some(a) => (a, "agent"),
                         None => (workspace_summary(p), "computed"),
@@ -665,7 +671,6 @@ fn write_index(
             })
         }).collect::<Vec<_>>(),
         "agentStaleSecs": stale_secs,
-        "writerVersion": INDEX_WRITER_VERSION,
         "agentRuns": { "ok": runs_ok, "total": runs_total },
         "agentEnabled": agent_enabled(repo),
         "memos": cards,
@@ -673,71 +678,9 @@ fn write_index(
     // Temp + rename: atomic on POSIX, so a reader never sees half an index even when two
     // daemons refresh it in the same instant. Last writer wins, and both are correct because
     // the index is derived from the tree.
-    // Compare with the stamp removed: `generated` changes every tick by construction, so a plain
-    // byte comparison would never match and the file would churn forever.
-    let strip = |v: &serde_json::Value| {
-        let mut v = v.clone();
-        if let Some(o) = v.as_object_mut() {
-            o.remove("generated");
-            o.remove("generated_ts");
-        }
-        v
-    };
-    let path = repo.join("index.json");
-    // Refuse to downgrade. The index is derived, so "last writer wins" was safe while every
-    // daemon shared a schema — and stopped being safe the moment two builds disagreed about it.
-    // An older daemon rebuilding from the same tree produces a valid but OLDER-SHAPED index, and
-    // the two then overwrite each other every tick. Newer writers win; equal versions proceed.
-    if let Some(theirs) = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v["writerVersion"].as_u64())
-    {
-        if theirs > INDEX_WRITER_VERSION {
-            return Ok(());
-        }
-    }
-    let unchanged = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .is_some_and(|old| strip(&old) == strip(&index));
-    if !unchanged {
-        // temp + rename: atomic, so a reader never sees half an index even when two daemons
-        // refresh it in the same instant.
-        let tmp = repo.join("index.json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&index)?)?;
-        std::fs::rename(&tmp, &path)?;
-    }
-
-    // …and the same thing as a document, because a human should be able to read the status of
-    // everything without a JSON viewer. This is the file to open first.
-    let mut md = format!("# Status · {}\n\n", iso(ts));
-    let live: Vec<&serde_json::Value> =
-        index["memos"].as_array().map(|a| a.as_slice()).unwrap_or(&[])
-            .iter().filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
-    if live.is_empty() {
-        md.push_str("Nothing needs you.\n\n");
-    } else {
-        md.push_str("## needs you\n\n");
-        for c in &live {
-            md.push_str(&format!(
-                "- `{}` **{}** — {}\n",
-                c["session"].as_str().unwrap_or(""),
-                c["headline"].as_str().unwrap_or(""),
-                c["severity"].as_str().unwrap_or("")
-            ));
-        }
-        md.push('\n');
-    }
-    md.push_str("## sessions\n\n");
-    for (n, d) in &dirs {
-        md.push_str(&format!("- **{n}** — `{}`\n", d.display()));
-    }
-    md.push_str("\n## memory\n\n- [beliefs](memory/beliefs.md)\n- [projects](memory/projects.md)\n\n");
-    md.push_str("_Generated by `mars snapshot`. See [AGENTS.md](AGENTS.md)._\n");
-    write_if_changed(&repo.join("index.md"), &md)?;
-    Ok(())
+    index
 }
+
 
 /// Read one board frame from a live session by subscribing exactly as Rover does.
 fn board_of(session: &str) -> Option<SessionSnap> {
@@ -950,7 +893,7 @@ pub fn mark_nudged(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<()>
 /// exactly like a quiet board from the outside, and without this it would never be noticed.
 ///
 /// Appends one line per newly-scored run to `memory/runs.jsonl` and returns the rolling tally.
-fn score_runs(repo: &Path, ts: u64) -> (u64, u64) {
+fn score_runs(repo: &Path, ts: u64) {
     let done = repo.join("inbox/done");
     let log = repo.join("memory/runs.jsonl");
     let seen: std::collections::HashSet<String> = std::fs::read_to_string(&log)
@@ -1044,8 +987,12 @@ fn score_runs(repo: &Path, ts: u64) -> (u64, u64) {
             let _ = f.write_all(lines.as_bytes());
         }
     }
-    // Rolling tally over the recent tail — a bad week should not be hidden by a good year.
-    let all: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+}
+
+/// Rolling tally over the recent tail — a bad week should not be hidden by a good year. A pure
+/// read: scoring is a write and happens on the tick, so asking for the view changes nothing.
+fn run_tally(repo: &Path) -> (u64, u64) {
+    let all: Vec<serde_json::Value> = std::fs::read_to_string(repo.join("memory/runs.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -1101,10 +1048,6 @@ fn last_run_path(repo: &Path) -> PathBuf {
 /// from a lock whose owner no longer existed. Three missed refreshes is dead.
 const AGENT_LOCK_STALE_SECS: u64 = 180;
 
-/// Schema version of `index.json`. Bump when the shape changes; a daemon will not overwrite an
-/// index stamped by a HIGHER version than its own, so a stale daemon in a mixed fleet degrades to
-/// writing nothing rather than to fighting the current one.
-const INDEX_WRITER_VERSION: u64 = 1;
 
 /// Only one daemon may drive the agent. Every session runs its own tick, so without this each
 /// would spawn its own `claude` in its own hidden pane and they would all write the same files.
@@ -1258,6 +1201,7 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
 /// directly with synthetic boards and never needs a live daemon.
 pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64, stale_secs: u64) -> Result<Vec<String>> {
     scaffold_docs(repo)?;
+    score_runs(repo, ts);
     let mut events: Vec<String> = Vec::new();
     let mut briefs: Vec<(String, String)> = Vec::new();
 
@@ -1349,7 +1293,6 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64, stale_
         briefs.push((s.name.clone(), brief));
     }
 
-    write_index(repo, &briefs, sessions, ts, stale_secs)?;
     append_timeline(repo, ts, &events)?;
     Ok(events)
 }
@@ -1542,7 +1485,33 @@ fn read_all_sessions() -> Vec<SessionSnap> {
         let Ok(text) = std::fs::read_to_string(dir.join("meta.json")) else { continue };
         let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
         let Some(name) = meta["name"].as_str() else { continue };
-        out.push(SessionSnap { name: name.to_string(), health: String::new(), panes: Vec::new() });
+        // Reconstruct the board from the NEWEST snapshot only — one file per session, not the
+        // directory. Snapshots are ground truth and the latest one is the current board, so the
+        // query stays bounded by how many sessions exist rather than by how long they have run.
+        let newest = std::fs::read_dir(dir.join("snapshots")).ok().and_then(|rd| {
+            let mut names: Vec<PathBuf> = rd.flatten().map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json")).collect();
+            names.sort();
+            names.pop()
+        });
+        let (health, panes) = newest
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .map(|v| {
+                let panes = v["workspaces"].as_array().map(|a| a.iter().map(|w| PaneRow {
+                    id: w["id"].as_str().unwrap_or_default().to_string(),
+                    pane_id: w["paneId"].as_str().unwrap_or_default().to_string(),
+                    name: w["name"].as_str().unwrap_or_default().to_string(),
+                    verdict: w["verdict"].as_str().unwrap_or("idle").to_string(),
+                    kind: w["kind"].as_str().unwrap_or("terminal").to_string(),
+                    why: w["why"].as_str().unwrap_or_default().to_string(),
+                    age_secs: w["ageSecs"].as_u64().unwrap_or(0),
+                    blocked_prompt: w["blockedPrompt"].as_str().map(|s| s.to_string()),
+                }).collect::<Vec<_>>()).unwrap_or_default();
+                (v["health"].as_str().unwrap_or_default().to_string(), panes)
+            })
+            .unwrap_or_default();
+        out.push(SessionSnap { name: name.to_string(), health, panes });
     }
     out
 }
@@ -1557,6 +1526,9 @@ pub fn tick_session(
 ) -> Result<()> {
     let Some(repo) = repo_dir() else { return Ok(()) };
     let repo = repo.as_path();
+    // Bookkeeping first, on every tick and before any early return: a finished agent run must be
+    // scored whether or not the board moved, and the read path must stay free of writes.
+    score_runs(repo, ts);
     let Some(snap) = parse_board(board_json) else { return Ok(()) };
     if snap.name.is_empty() {
         return Ok(());
@@ -1583,13 +1555,9 @@ pub fn tick_session(
                 // reached the phone at all, and score_runs never ran to notice the turn happened.
                 // write_index has its own unchanged-check, so on a truly quiet system this still
                 // costs a read and no write.
-                // Scaffold here too. seed() only ever writes an absent or superseded file, so
-                // this is a handful of stat calls — but skipping it meant a newly shipped doc
-                // (prompt.md, which the agent is invoked WITH) never reached a system whose
-                // board happened to be idle, which is precisely the quiet system we target.
+                // Docs must still reach an idle system; nothing else is owed here, because
+                // no view is stored to go stale.
                 scaffold_docs(repo)?;
-                let all = read_all_sessions();
-                write_index(repo, &[], &all, ts, stale_secs)?;
                 return Ok(());
             }
         }

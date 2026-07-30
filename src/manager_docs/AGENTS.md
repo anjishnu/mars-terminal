@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 3 -->
+<!-- mars-doc-version: 4 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -48,6 +48,25 @@ should leave real work behind, not nothing.
    skipped, format in [`docs/receipts.md`](docs/receipts.md). Mars checks the account against the
    filesystem, so a skip with a reason is a clean outcome and silence is not.
 10. **Move the batch file to `inbox/done/`.** That is how a run is recorded as finished.
+
+## Sign everything you write
+
+Every file you write into a session — the briefing, each workspace summary, each memo — starts
+with frontmatter carrying `source: agent`:
+
+```markdown
+---
+source: agent
+---
+terminal 1 came up idle and has stayed that way.
+```
+
+This is not decoration. Mars will not show your prose unless it is signed, and falls back to its
+own blunt arithmetic instead. Authorship used to be inferred from how recently a file was
+touched, which credited another program's output to you on the engineer's screen. An unsigned
+file is treated as somebody else's.
+
+Write to a temporary file and rename it into place, so a reader never catches a half-written one.
 
 ## The mission briefing
 

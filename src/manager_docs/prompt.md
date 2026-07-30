@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 3 -->
+<!-- mars-doc-version: 4 -->
 Warm-up run.
 
 List `inbox/`. If there is no batch file there, stop — there is nothing to do, and that is the

@@ -777,6 +777,15 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
             let _ = tx.send(fs_list_json(path));
         }
+        // The manager view, computed from the tree on request. There is no index file to read,
+        // so there is nothing to be stale. Three verbs rather than one because they change at
+        // completely different rates — the board with every command you run, memos and health
+        // only after an agent run — and the phone should not refetch a briefing to learn a
+        // run tally.
+        Some("manager.board") | Some("manager.memos") | Some("manager.health") => {
+            let want = v.get("t").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+            let _ = tx.send(manager_view_json(&want));
+        }
         Some("fs.read") => {
             let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
             let _ = tx.send(fs_read_json(path));
@@ -797,6 +806,8 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
 fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }
+
+const MANAGER_STALE_SECS: u64 = 2700;
 
 // ── Filesystem explorer (fs.list / fs.read / fs.write) ───────────────────────────────
 // v1 has NO path containment — reads/writes hit arbitrary absolute paths, exactly as the
@@ -881,6 +892,30 @@ fn fs_list_json(raw: &str) -> String {
         "entries": entries,
     })
     .to_string()
+}
+
+
+/// Slice the computed view for one verb. Computing the whole thing and slicing is deliberate:
+/// it is a couple of kilobytes over a couple of dozen small files, so three separate walks would
+/// buy nothing but three code paths to keep in step.
+fn manager_view_json(want: &str) -> String {
+    let Some(repo) = crate::manager::repo_dir() else {
+        return serde_json::json!({ "t": want, "error": "no manager repo" }).to_string();
+    };
+    let ts = crate::worklog::now_secs();
+    let v = crate::manager::view(&repo, ts, MANAGER_STALE_SECS);
+    let body = match want {
+        "manager.memos" => serde_json::json!({ "memos": v["memos"] }),
+        "manager.health" => serde_json::json!({
+            "agentEnabled": v["agentEnabled"], "agentRuns": v["agentRuns"],
+            "agentStaleSecs": v["agentStaleSecs"],
+        }),
+        _ => serde_json::json!({ "sessions": v["sessions"] }),
+    };
+    let mut out = body;
+    out["t"] = serde_json::Value::String(want.to_string());
+    out["generated_ts"] = serde_json::json!(ts);
+    out.to_string()
 }
 
 fn fs_read_json(raw: &str) -> String {
