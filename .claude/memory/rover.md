@@ -171,3 +171,16 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   standalone `.mjs`, generate the frames, print the shift per frame. That immediately showed
   the estimator was returning a clean 3 every frame and the loss was downstream — three
   speculative "fixes" had been aimed at the wrong function.
+
+- **`fs.read` answers with the RESOLVED path, never the `~/…` literal you sent.**
+  `fs_read_json` (`serve.rs`) runs `resolve_path` then serialises `path.display()`, so a
+  request for `~/.mars/manager/index.json` comes back as `/Users/<me>/.mars/manager/index.json`.
+  Any client guard of the form `fsFile.path !== SOME_TILDE_CONST` is therefore false on every
+  read. This silently disabled the whole manager feed (`useFeed` never left `null`) for its
+  entire life; the symptom was Rover showing an LLM briefing instead of the deterministic
+  narrative. Match on the expanded tail (`path.endsWith(CONST.replace(/^~/, ""))`).
+- **The LLM briefing ratchets its own hallucinations.** `briefingPrompt` passes the previous
+  briefing in as `prev` and asks for only what CHANGED, so once the model invents an item it
+  restates it as still-true forever — a quiet board never contradicts it. `lastGreeting` is
+  worse: cached in localStorage, keyed by session NAME, asserts board state, never expires.
+  Clearing `rover.briefing.*` / `rover.greeting.*` is the only way to flush a poisoned cache.

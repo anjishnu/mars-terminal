@@ -644,6 +644,160 @@ fn parse_board(json: &str) -> Option<SessionSnap> {
 }
 
 
+// ── The agent inbox ──────────────────────────────────────────────────────────────────────
+//
+// Snapshots are ground truth: deterministic, append-only, never model-touched. The agent reads
+// them in batches. `memory/cursor.json` maps a session id to the last snapshot FILENAME it
+// consumed — filenames are ISO timestamps, so "unconsumed" is a lexicographic comparison and
+// needs no parsing. Advancing the cursor is the agent's job, so a crashed run re-reads rather
+// than skips.
+
+/// Snapshot filenames under a session dir that the agent has not consumed, oldest first.
+fn snapshots_after(sdir: &Path, after: Option<&str>) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(sdir.join("snapshots")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            if !n.ends_with(".json") {
+                return None;
+            }
+            match after {
+                Some(a) if n.as_str() <= a => None,
+                _ => Some(n),
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The one open batch, if there is one. Never more than a single file: a second open batch is
+/// how a slow agent turns a busy period into a queue of disconnected wake-ups.
+fn open_batch(repo: &Path) -> Option<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(repo.join("inbox"))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().starts_with("batch-") && n.to_string_lossy().ends_with(".json"))
+                .unwrap_or(false)
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
+/// Compose (or extend) the batch the agent will work. Returns the batch path when there is
+/// anything to do, `None` when every session is already consumed — the common, quiet case.
+///
+/// A session's entry carries the snapshot filenames rather than their contents: the agent has a
+/// filesystem and the batch stays small enough to re-read cheaply on every merge.
+pub fn compose_batch(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<Option<PathBuf>> {
+    let cursor: serde_json::Value = std::fs::read_to_string(repo.join("memory/cursor.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for s in sessions {
+        let Some(sdir) = existing_session_dir(&s.name) else { continue };
+        let id = sdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let after = cursor.get(&id).and_then(|v| v.as_str());
+        let pending = snapshots_after(&sdir, after);
+        if pending.is_empty() {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "id": id,
+            "name": s.name,
+            "dir": sdir.display().to_string(),
+            "after": after,
+            "snapshots": pending,
+            "blocked": s.panes.iter().filter(|p| p.verdict == "blocked")
+                .map(|p| p.pane_id.clone()).collect::<Vec<_>>(),
+        }));
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let inbox = repo.join("inbox");
+    std::fs::create_dir_all(&inbox)?;
+    // Merge into the open batch when there is one, so related work stays one run and one
+    // context. `opened_ts` is preserved — the agent should see how long the story has been
+    // accumulating, not just when we last touched it.
+    let (path, opened_ts) = match open_batch(repo) {
+        Some(p) => {
+            let prior: serde_json::Value = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let o = prior.get("opened_ts").and_then(|v| v.as_u64()).unwrap_or(ts);
+            (p, o)
+        }
+        None => (inbox.join(format!("batch-{}.json", iso(ts).replace(':', "-"))), ts),
+    };
+    let body = serde_json::json!({
+        "v": 1,
+        "opened": iso(opened_ts), "opened_ts": opened_ts,
+        "updated": iso(ts), "updated_ts": ts,
+        "sessions": entries,
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&body)?)?;
+    Ok(Some(path))
+}
+
+/// Whether to wake the agent, and why. Two gates: a floor so a busy board cannot spiral the way
+/// the LLM summaries did, and one exception — a workspace that has newly entered `blocked` wakes
+/// it immediately, because that is the state where the engineer is the bottleneck and latency is
+/// pure waste. A block already seen at the last nudge is not new and does not re-fire.
+pub fn nudge_reason(repo: &Path, sessions: &[SessionSnap], ts: u64, floor_secs: u64) -> Option<&'static str> {
+    let state: serde_json::Value = std::fs::read_to_string(repo.join("memory/agent.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let seen: Vec<String> = state["blocked"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let fresh_block = sessions.iter().any(|s| {
+        s.panes.iter().any(|p| {
+            p.verdict == "blocked" && !seen.contains(&format!("{}:{}", s.name, p.pane_id))
+        })
+    });
+    if fresh_block {
+        return Some("blocked");
+    }
+    let last = state["last_nudge_ts"].as_u64().unwrap_or(0);
+    (ts.saturating_sub(last) >= floor_secs).then_some("material-change")
+}
+
+/// Record that the agent was woken. Stores the blocked set alongside, so the next tick can tell
+/// a *new* block from one it has already been told about.
+pub fn mark_nudged(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<()> {
+    let blocked: Vec<String> = sessions
+        .iter()
+        .flat_map(|s| {
+            s.panes
+                .iter()
+                .filter(|p| p.verdict == "blocked")
+                .map(move |p| format!("{}:{}", s.name, p.pane_id))
+        })
+        .collect();
+    std::fs::create_dir_all(repo.join("memory"))?;
+    std::fs::write(
+        repo.join("memory/agent.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "last_nudge_ts": ts, "last_nudge": iso(ts), "blocked": blocked,
+        }))?,
+    )?;
+    Ok(())
+}
+
 /// Write a file only if it is absent. `AGENTS.md`, `docs/**`, `policy.md` and the memory seeds
 /// belong to the human and the agent — scaffolded once, then never touched again, so an edit is
 /// never silently reverted by the next tick.
