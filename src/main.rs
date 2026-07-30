@@ -3299,7 +3299,7 @@ fn selfcheck() -> Result<()> {
     //       feature; the feature is that nobody has to run it. Drives the real tick with the real
     //       board JSON, and asserts the tree appears and prunes.
     {
-        let repo = cfg_dir.join("mgr-auto");
+        let repo = manager::repo_dir().expect("no manager repo");
         let mut app = App::new(None)?;
         app.session_name = Some("auto".into());
         app.open_terminal();
@@ -3307,7 +3307,7 @@ fn selfcheck() -> Result<()> {
         // does not show.
         let board = app.mobile_board_json();
         for i in 0..4u64 {
-            manager::tick_session(&repo, "testbox", &board, 2_000_000 + i * 60, 2)?;
+            manager::tick_session("testbox", &board, 2_000_000 + i * 60, 2)?;
         }
         let sdir = manager::session_dir("auto", "testbox", 2_000_000).expect("no session dir");
         assert!(sdir.join("mission_briefing.md").exists(), "daemon tick wrote no briefing");
@@ -3317,7 +3317,7 @@ fn selfcheck() -> Result<()> {
         assert_eq!(snaps, 2, "stimuli not pruned to manager_snapshot_keep: {snaps}");
         // The index must describe the whole TREE, so a second session's daemon does not erase
         // the first from it.
-        manager::tick_session(&repo, "testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2)?;
+        manager::tick_session("testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2)?;
         let idx: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
         let names: Vec<&str> =

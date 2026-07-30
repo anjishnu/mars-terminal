@@ -831,7 +831,12 @@ fn write_meta(dir: &Path, id: &str, name: &str, instance_id: &str, ts: u64) {
 ///
 /// The daemon that owns a session is the only process that writes `sessions/<name>/`, so the
 /// "one writer per path" rule is enforced by process boundaries rather than by convention.
-pub fn tick_session(repo: &Path, origin: &str, board_json: &str, ts: u64, keep: usize) -> Result<()> {
+/// Takes no repo path ON PURPOSE. It derives one from `repo_dir()`, so a caller cannot pass the
+/// wrong root — a hardcoded `~/.mars/manager` at the daemon's call site is exactly how an isolated
+/// test run wrote into the user's live repo.
+pub fn tick_session(origin: &str, board_json: &str, ts: u64, keep: usize) -> Result<()> {
+    let Some(repo) = repo_dir() else { return Ok(()) };
+    let repo = repo.as_path();
     let Some(snap) = parse_board(board_json) else { return Ok(()) };
     if snap.name.is_empty() {
         return Ok(());

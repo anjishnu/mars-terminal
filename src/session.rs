@@ -857,23 +857,20 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 .unwrap_or(true);
             if mgr_due {
                 last_manager = Some(std::time::Instant::now());
-                if let Some(repo) = crate::sys::paths::home_dir()
-                    .map(|h| h.join(".mars").join("manager"))
-                {
-                    let json = app.mobile_board_json();
-                    let keep = app.tuning.manager_snapshot_keep as usize;
-                    let origin = std::env::var("MARS_ORIGIN")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "local".to_string());
-                    let _ = crate::manager::tick_session(
-                        &repo,
-                        &origin,
-                        &json,
-                        crate::worklog::now_secs(),
-                        keep,
-                    );
-                }
+                let json = app.mobile_board_json();
+                let keep = app.tuning.manager_snapshot_keep as usize;
+                let origin = std::env::var("MARS_ORIGIN")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "local".to_string());
+                // No repo path passed: `tick_session` derives it, so this call site cannot send
+                // writes somewhere the runtime isolation does not cover.
+                let _ = crate::manager::tick_session(
+                    &origin,
+                    &json,
+                    crate::worklog::now_secs(),
+                    keep,
+                );
             }
         }
 
