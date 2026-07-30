@@ -1333,7 +1333,13 @@ pub fn emit(
         // Session artifacts live under ~/.mars/sessions/<id>/, NOT under the manager repo keyed by
         // name. A rename now rewrites meta.json instead of forking a new directory.
         let Some(sdir) =
-            session_dir_fp(&s.name, origin, ts, &fingerprint_material(s), &fingerprint_detail(s))
+            session_dir_fp(
+                &s.name,
+                &instance_of(&s.name).unwrap_or_else(|| origin.to_string()),
+                ts,
+                &fingerprint_material(s),
+                &fingerprint_detail(s),
+            )
         else {
             continue;
         };
@@ -1475,19 +1481,66 @@ pub fn sessions_root() -> Option<PathBuf> {
 /// create anything just to discover there is nothing to do.
 pub fn existing_session_dir_pub(name: &str) -> Option<PathBuf> { existing_session_dir(name) }
 
+/// Lookup with an explicit identity — for tests, which have no live daemon to ask.
+pub fn existing_session_dir_for(name: &str, instance: Option<&str>) -> Option<PathBuf> {
+    existing_session_dir_by(name, instance)
+}
+
+/// The daemon instance backing a session, asked of the socket it is already serving.
+///
+/// Derived rather than passed: a parameter is one more thing a call site can fill in with the
+/// wrong value, which is exactly how `instance_id` came to hold the string "local" — the origin,
+/// which identifies nothing and matches everything.
+fn instance_of(name: &str) -> Option<String> {
+    let path = crate::session::socket_path(name).ok()?;
+    crate::session::identify(&path).map(|(_, id, _)| id).filter(|s| !s.is_empty())
+}
+
 fn existing_session_dir(name: &str) -> Option<PathBuf> {
+    existing_session_dir_by(name, instance_of(name).as_deref())
+}
+
+/// Find a session's directory by IDENTITY where possible, falling back to its name.
+///
+/// Matching on name alone is what a rename breaks: renaming `0` to `daemon-restart` found no
+/// directory, so a fresh empty one was created and every artifact — briefing, workspace notes,
+/// memos, snapshots and the cursor — was orphaned in a directory that no longer had a socket and
+/// so vanished from the view entirely. A name is a label the engineer changes; identity is the
+/// daemon instance, which they do not.
+///
+/// The name fallback carries records written before instances were recorded, and any session
+/// whose daemon we cannot identify.
+fn existing_session_dir_by(name: &str, instance: Option<&str>) -> Option<PathBuf> {
     let root = sessions_root()?;
+    let mut by_name: Option<PathBuf> = None;
     for e in std::fs::read_dir(root).ok()?.flatten() {
         // `continue`, not `?`: one directory without a readable meta.json must not abort the
         // search. As a `?` it did, so the idle fast path never found its own session and every
         // tick fell through to a full regeneration.
         let Ok(txt) = std::fs::read_to_string(e.path().join("meta.json")) else { continue };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+        let stored = v["instance_id"].as_str().unwrap_or_default();
+        // "local" was the origin written into this field before it meant anything; it identifies
+        // nothing, so it must not be allowed to match every session at once.
+        if let Some(want) = instance.filter(|i| !i.is_empty() && *i != "local") {
+            if stored == want {
+                // A rename updates the record rather than forking a directory.
+                if v["name"].as_str() != Some(name) {
+                    let mut v2 = v.clone();
+                    v2["name"] = serde_json::json!(name);
+                    let _ = std::fs::write(
+                        e.path().join("meta.json"),
+                        serde_json::to_string_pretty(&v2).unwrap_or_default(),
+                    );
+                }
+                return Some(e.path());
+            }
+        }
         if v["name"].as_str() == Some(name) {
-            return Some(e.path());
+            by_name = Some(e.path());
         }
     }
-    None
+    by_name
 }
 
 /// Resolve (or mint) the directory for a session, keyed by an id the session KEEPS.

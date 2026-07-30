@@ -6307,6 +6307,33 @@ fn selfcheck() -> Result<()> {
                 "the deterministic briefing went missing entirely");
         }
         println!("[selfcheck] manager: cheap output cannot clobber the agent's ... PASS");
+        // A rename must move the record, not fork a new directory. Getting this wrong orphaned a
+        // whole session's briefing, notes, memos, snapshots and cursor in a directory that then
+        // had no socket and so vanished from the view.
+        {
+            let dir = manager::session_dir("renametest", "inst-abc", 1_000_600).expect("no dir");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("meta.json"), serde_json::json!({
+                "name": "renametest", "instance_id": "inst-abc",
+            }).to_string())?;
+            std::fs::write(dir.join("mission_briefing.md"), "---\nsource: agent\n---\nkeep me\n")?;
+
+            // Same instance, new name: must resolve to the SAME directory, and rewrite the name.
+            let found = manager::existing_session_dir_for("renamed-away", Some("inst-abc"))
+                .expect("a renamed session lost its directory");
+            assert_eq!(found, dir, "a rename forked a new directory instead of moving the record");
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json"))?)?;
+            assert_eq!(meta["name"].as_str(), Some("renamed-away"), "the record kept the old name");
+            assert!(dir.join("mission_briefing.md").exists(), "history was orphaned by the rename");
+
+            // "local" is an origin, not an identity — it must never match everything at once.
+            assert!(manager::existing_session_dir_for("nobody", Some("local")).is_none()
+                || manager::existing_session_dir_for("nobody", Some("local")) != Some(dir.clone()),
+                "the placeholder instance matched an unrelated session");
+        }
+        println!("[selfcheck] manager: a rename moves the record, not the history ... PASS");
+
 
 
 
