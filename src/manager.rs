@@ -527,6 +527,26 @@ fn read_settled(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Strip inline markup from agent prose.
+///
+/// The briefing is rendered as markdown on the phone, so one stray backtick swallows the rest of
+/// a line and a lone asterisk turns the sentence bold. The contract says plain text; this makes
+/// it true. Deliberately minimal — emphasis markers and fences only, so ordinary punctuation and
+/// anything an em-dash is doing survive untouched.
+fn strip_markup(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            // A leading heading or bullet marker is structure, not content.
+            let t = t.strip_prefix("### ").or_else(|| t.strip_prefix("## "))
+                .or_else(|| t.strip_prefix("# ")).unwrap_or(t);
+            let t = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")).unwrap_or(t);
+            t.replace("**", "").replace('`', "")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64) -> Option<String> {
     let age = ts.saturating_sub(mtime_secs(path));
     if age > stale_secs {
@@ -548,6 +568,7 @@ fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64) -> Option<String> {
         .skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
+    let body = strip_markup(body.trim());
     let body = body.trim();
     (!body.is_empty()).then(|| body.to_string())
 }

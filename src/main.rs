@@ -6332,6 +6332,19 @@ fn selfcheck() -> Result<()> {
             std::fs::write(unsigned.join("mission_briefing.md"),
                 "---\nsource: agent\n---\nquiet start\n")?;
             assert_eq!(pick(7_000_400), "agent", "a signed briefing was not credited to the agent");
+
+            // Markup never reaches the phone. The briefing renders as markdown there, so one
+            // stray backtick swallows a line — the contract says plain prose, this makes it so.
+            std::fs::write(unsigned.join("mission_briefing.md"),
+                "---\nsource: agent\n---\n# Head\nRan `cargo test` and it **failed**.\n- a bullet\n")?;
+            let narrative = manager::view(&repo, 7_000_400, 2700)["sessions"].as_array().unwrap()
+                .iter().find(|s| s["name"] == "9")
+                .and_then(|s| s["narrative"].as_str().map(String::from)).unwrap_or_default();
+            for m in ["`", "**", "# ", "- "] {
+                assert!(!narrative.contains(m), "markup {m:?} survived into the briefing: {narrative}");
+            }
+            assert!(narrative.contains("cargo test") && narrative.contains("failed"),
+                "stripping markup ate the content: {narrative}");
         }
         println!("[selfcheck] manager: provenance comes from receipts, not mtime ... PASS");
 
