@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 14 -->
+<!-- mars-doc-version: 15 -->
 # The mission briefing
 
 **Read first. Written last.** It is the only thing many glances ever see: two to five seconds,
@@ -55,7 +55,8 @@ someone opening it is that it is different every time because the day is.
 
 ## Shape
 
-Four short blocks, blank line between, about seventy words total. No markdown of any kind.
+Four short blocks, blank line between. **Seventy words, hard** — if it runs longer, block 1 or 2
+is narrating. No markdown of any kind.
 
 ```
 Evening, captain. The manager finally writes from real terminal output instead of pane states.
@@ -79,7 +80,9 @@ claude has been waiting on a prompt for 20m. Nothing else needs you.
    up for. If you cannot say why it matters, you are describing rather than briefing.
 
 3. **What landed while they were away.** Wins, plainly stated, and **lead with them where there
-   are any**. People come back to a machine braced for bad news; a briefing that opens on what
+   are any**. A win is something that is now DONE: a bug found and fixed, a test that went green,
+   a number that improved, a piece of work that shipped. Say the number — "notes came down from
+   154 words to 73" — because a measured win is believable and an adjectival one is not. People come back to a machine braced for bad news; a briefing that opens on what
    went right and keeps the problem for the end is both more accurate and more useful, because
    they read the whole thing. Name the thing that got finished. Do not inflate it — a small real
    win stated plainly beats a large vague one — but do not bury it either.
@@ -107,6 +110,16 @@ Nothing is blocked.
 A quiet board is the one moment there is room to answer *"what was I doing?"* rather than
 *"what just happened?"*. Spending it on "all quiet" wastes the only briefing they will read
 unhurried.
+
+## Never narrate them back at themselves
+
+**Do not report what the captain asked for.** "You asked it to bring markdown into the notes",
+"you moved on to the fleet page, then circled back" — they typed those words, they were there, and
+a briefing that recounts their own session is a diary of a day they already had.
+
+Report what **exists now that did not before**: files written, tests passed, a bug found, a thing
+that finished. The test is whether a sentence would still be worth reading by someone who had
+watched them type all day. If not, cut it.
 
 ## Never report what did not change
 
