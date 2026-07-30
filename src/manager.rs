@@ -1,12 +1,14 @@
 //! `mars snapshot` — the deterministic half of the manager.
 //!
-//! Subscribes to every live session exactly as Rover does, takes one board frame each, and writes
-//! four things into a plain directory:
+//! Subscribes to every live session exactly as Rover does, takes one board frame each, and
+//! maintains `~/.mars/manager` — a repo laid out session → workspaces → summary. See
+//! `docs/layout.md`, which this module writes on first run.
 //!
-//! * `snapshots/<ts>.json` — the machine-readable stimulus (what an agent would read later)
-//! * `feed/card-*.md`      — REFLEX cards: markdown + YAML frontmatter, no model involved
-//! * `feed/briefing.md`    — a workspace briefing, regenerated each run, also deterministic
-//! * `timeline.md`         — an append-only, date-ordered, human-readable event log
+//! OWNERSHIP is the load-bearing rule, because an agent joins this repo later:
+//!
+//! * this module owns `sessions/**`, `index.json`, `index.md`, `timeline.md` — regenerated freely
+//! * the AGENT owns `memory/**` — never written here, only read
+//! * the HUMAN owns `AGENTS.md`, `docs/**`, `policy.md` — scaffolded once, never overwritten
 //!
 //! Nothing here uses an LLM. That is the point: the whole card pipeline — format, citations,
 //! expiry, supersession, rendering on the phone — is proven against content that cannot be
@@ -257,65 +259,52 @@ fn expire_card(c: &OpenCard) -> Result<()> {
 /// Deliberately NOT a model's job. Counting panes by verdict, naming what is blocked and for how
 /// long, and saying "nothing needs you" when nothing does are all things arithmetic does better,
 /// faster, and without a plan window.
-fn write_briefing(feed: &Path, sessions: &[SessionSnap], ts: u64) -> Result<()> {
-    let mut needs: Vec<&PaneRow> = Vec::new();
-    let mut running = 0usize;
-    let mut idle = 0usize;
-    for s in sessions {
-        for p in &s.panes {
-            match p.verdict.as_str() {
-                "blocked" | "failed" => needs.push(p),
-                "running" => running += 1,
-                _ => idle += 1,
-            }
-        }
-    }
+fn session_briefing(s: &SessionSnap, ts: u64) -> String {
+    let mut needs: Vec<&PaneRow> = s
+        .panes
+        .iter()
+        .filter(|p| p.verdict == "blocked" || p.verdict == "failed")
+        .collect();
     needs.sort_by(|a, b| {
         let rank = |v: &str| if v == "blocked" { 0 } else { 1 };
         rank(&a.verdict).cmp(&rank(&b.verdict)).then(b.age_secs.cmp(&a.age_secs))
     });
+    let running = s.panes.iter().filter(|p| p.verdict == "running").count();
+    let idle = s.panes.len() - running - needs.len();
 
     let mut md = String::new();
-    md.push_str("---\nid: briefing\nv: 1\nkind: briefing\nseverity: info\n");
-    md.push_str(&format!("created: {}\ncreated_ts: {ts}\nsource: reflex\nexpired: false\n---\n", iso(ts)));
-    md.push_str(&format!("# Workspaces · {}\n\n", iso(ts)));
-
+    md.push_str(&format!("# {} · mission briefing\n\n_{}_\n\n", s.name, iso(ts)));
     if needs.is_empty() {
         md.push_str("**Nothing needs you.**\n\n");
     } else {
-        md.push_str(&format!("**{} need{} you**\n\n", needs.len(), if needs.len() == 1 { "s" } else { "" }));
+        md.push_str(&format!(
+            "**{} need{} you**\n\n",
+            needs.len(),
+            if needs.len() == 1 { "s" } else { "" }
+        ));
         for p in &needs {
             let mark = if p.verdict == "blocked" { "⚠" } else { "✗" };
-            md.push_str(&format!(
-                "- {mark} **{}** — {} · {}\n",
-                p.name,
-                p.verdict,
-                human_age(p.age_secs)
-            ));
+            md.push_str(&format!("- {mark} **{}** — {} · {}\n", p.name, p.verdict, human_age(p.age_secs)));
             if !p.why.trim().is_empty() {
                 md.push_str(&format!("  \n  {}\n", p.why.trim()));
             }
         }
         md.push('\n');
     }
-    md.push_str(&format!("{running} running · {idle} idle\n\n"));
-    for s in sessions {
-        md.push_str(&format!("## {}\n\n", s.name));
-        if s.panes.is_empty() {
-            md.push_str("_no panes_\n\n");
-            continue;
-        }
-        md.push_str("| pane | state | age |\n|---|---|---|\n");
+    md.push_str(&format!("{running} running · {idle} idle\n\n## workspaces\n\n"));
+    if s.panes.is_empty() {
+        md.push_str("_no panes_\n\n");
+    } else {
+        md.push_str("| workspace | state | age |\n|---|---|---|\n");
         for p in &s.panes {
             md.push_str(&format!("| {} | {} | {} |\n", p.name, p.verdict, human_age(p.age_secs)));
         }
         md.push('\n');
-        if !s.health.trim().is_empty() {
-            md.push_str(&format!("_{}_\n\n", s.health.trim()));
-        }
     }
-    std::fs::write(feed.join("briefing.md"), md)?;
-    Ok(())
+    if !s.health.trim().is_empty() {
+        md.push_str(&format!("_{}_\n", s.health.trim()));
+    }
+    md
 }
 
 /// Append to the human-readable timeline. One line per event, date-ordered because it is only
@@ -339,32 +328,28 @@ fn append_timeline(repo: &Path, ts: u64, lines: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Regenerate `feed/index.json` from the directory. The directory is the truth; the index is a
-/// cache, so it is rebuilt rather than mutated and can never drift.
-fn write_index(feed: &Path, ts: u64) -> Result<()> {
-    // Bodies are INLINED. Rover reads files through a single-slot `fs.read`, so N reads for one
-    // screen would race each other; one self-contained file is both simpler and correct. The
-    // index is a generated cache, so duplicating a few hundred bytes per card costs nothing.
-    let mut cards: Vec<serde_json::Value> = read_open_cards(feed)
-        .into_iter()
-        .map(|c| {
-            let body = std::fs::read_to_string(&c.file)
-                .ok()
-                .and_then(|t| split_front(&t).map(|(_, b)| b.trim().to_string()))
-                .unwrap_or_default();
-            let actions = std::fs::read_to_string(&c.file)
-                .ok()
-                .and_then(|t| split_front(&t).map(|(f, _)| parse_actions(f)))
-                .unwrap_or_default();
-            serde_json::json!({
-                "id": c.id, "file": c.file.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+/// Regenerate the aggregate `index.json` from `sessions/**`. The tree is the truth; this is a
+/// cache, rebuilt wholesale so it can never drift.
+///
+/// Bodies and actions are INLINED. Rover reads through a single-slot `fs.read`, so a screenful of
+/// cards must be one round trip, not one per card.
+fn write_index(repo: &Path, briefs: &[(String, String)], ts: u64) -> Result<()> {
+    let mut cards: Vec<serde_json::Value> = Vec::new();
+    for (name, _) in briefs {
+        let dir = repo.join("sessions").join(name).join("cards");
+        for c in read_open_cards(&dir) {
+            let text = std::fs::read_to_string(&c.file).unwrap_or_default();
+            let (front, body) = split_front(&text).unwrap_or(("", ""));
+            cards.push(serde_json::json!({
+                "id": c.id,
+                "path": format!("sessions/{}/cards/{}", name,
+                                c.file.file_name().and_then(|n| n.to_str()).unwrap_or_default()),
                 "severity": c.severity, "headline": c.headline, "session": c.session,
                 "pane": c.pane, "kind": c.kind, "created_ts": c.created, "expired": c.expired,
-                "body": body, "actions": actions,
-            })
-        })
-        .collect();
-    // Most severe first, then newest — the order Rover pins in.
+                "body": body.trim(), "actions": parse_actions(front),
+            }));
+        }
+    }
     let rank = |s: &str| match s { "block" => 0, "warn" => 1, "info" => 2, _ => 3 };
     cards.sort_by(|a, b| {
         let (sa, sb) = (a["severity"].as_str().unwrap_or(""), b["severity"].as_str().unwrap_or(""));
@@ -372,15 +357,42 @@ fn write_index(feed: &Path, ts: u64) -> Result<()> {
             .then(rank(sa).cmp(&rank(sb)))
             .then(b["created_ts"].as_u64().unwrap_or(0).cmp(&a["created_ts"].as_u64().unwrap_or(0)))
     });
-    let briefing = std::fs::read_to_string(feed.join("briefing.md"))
-        .ok()
-        .and_then(|t| split_front(&t).map(|(_, b)| b.trim().to_string()));
     let index = serde_json::json!({
         "generated": iso(ts), "generated_ts": ts,
-        "briefing": briefing,
+        "sessions": briefs.iter().map(|(n, b)| serde_json::json!({
+            "name": n, "briefing": b,
+            "path": format!("sessions/{n}/mission_briefing.md"),
+        })).collect::<Vec<_>>(),
         "cards": cards,
     });
-    std::fs::write(feed.join("index.json"), serde_json::to_string_pretty(&index)?)?;
+    std::fs::write(repo.join("index.json"), serde_json::to_string_pretty(&index)?)?;
+
+    // …and the same thing as a document, because a human should be able to read the status of
+    // everything without a JSON viewer. This is the file to open first.
+    let mut md = format!("# Status · {}\n\n", iso(ts));
+    let live: Vec<&serde_json::Value> =
+        index["cards"].as_array().unwrap().iter().filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
+    if live.is_empty() {
+        md.push_str("Nothing needs you.\n\n");
+    } else {
+        md.push_str("## needs you\n\n");
+        for c in &live {
+            md.push_str(&format!(
+                "- `{}` **{}** — {}\n",
+                c["session"].as_str().unwrap_or(""),
+                c["headline"].as_str().unwrap_or(""),
+                c["severity"].as_str().unwrap_or("")
+            ));
+        }
+        md.push('\n');
+    }
+    md.push_str("## sessions\n\n");
+    for (n, _) in briefs {
+        md.push_str(&format!("- [{n}](sessions/{n}/mission_briefing.md)\n"));
+    }
+    md.push_str("\n## memory\n\n- [beliefs](memory/beliefs.md)\n- [projects](memory/projects.md)\n\n");
+    md.push_str("_Generated by `mars snapshot`. See [AGENTS.md](AGENTS.md)._\n");
+    std::fs::write(repo.join("index.md"), md)?;
     Ok(())
 }
 
@@ -432,37 +444,81 @@ fn parse_board(json: &str) -> Option<SessionSnap> {
     })
 }
 
+
+/// Write a file only if it is absent. `AGENTS.md`, `docs/**`, `policy.md` and the memory seeds
+/// belong to the human and the agent — scaffolded once, then never touched again, so an edit is
+/// never silently reverted by the next tick.
+fn seed(path: &Path, body: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(path, body)?;
+    Ok(())
+}
+
+/// The comprehensive guide any coding agent reads on entry. A hub in `AGENTS.md` with spokes in
+/// `docs/`, so the cached prefix stays small and detail is loaded only when it is needed.
+fn scaffold_docs(repo: &Path) -> Result<()> {
+    seed(&repo.join("AGENTS.md"), include_str!("manager_docs/AGENTS.md"))?;
+    seed(&repo.join("docs/layout.md"), include_str!("manager_docs/layout.md"))?;
+    seed(&repo.join("docs/cards.md"), include_str!("manager_docs/cards.md"))?;
+    seed(&repo.join("docs/memory.md"), include_str!("manager_docs/memory.md"))?;
+    seed(&repo.join("docs/tools.md"), include_str!("manager_docs/tools.md"))?;
+    seed(&repo.join("policy.md"), include_str!("manager_docs/policy.md"))?;
+    seed(
+        &repo.join("memory/beliefs.md"),
+        "# Beliefs\n\nWorking memory. Rewritten, not appended. Keep under 200 lines.\n\n\
+         Nothing believed yet.\n",
+    )?;
+    seed(
+        &repo.join("memory/projects.md"),
+        "# Projects\n\nWhat each project IS — stable context the snapshot cannot know.\n\n\
+         _Add a section per project._\n",
+    )?;
+    seed(&repo.join("memory/cursor.json"), "{}\n")?;
+    seed(
+        &repo.join(".gitignore"),
+        "inbox/\nsessions/*/snapshots/\n*.tmp\n",
+    )?;
+    Ok(())
+}
+
 /// The whole deterministic pass. Pure once `sessions` is in hand, so `--selfcheck` drives it
 /// directly with synthetic boards and never needs a live daemon.
 pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Result<Vec<String>> {
-    let feed = repo.join("feed");
-    let snaps = repo.join("snapshots");
-    std::fs::create_dir_all(&feed)?;
-    std::fs::create_dir_all(&snaps)?;
+    scaffold_docs(repo)?;
+    let mut events: Vec<String> = Vec::new();
+    let mut briefs: Vec<(String, String)> = Vec::new();
 
-    // 1. The stimulus, for whatever reads it later (an agent, or a human with `jq`).
-    let stim = serde_json::json!({
-        "at": iso(ts), "at_ts": ts, "origin": origin,
-        "sessions": sessions.iter().map(|s| serde_json::json!({
-            "name": s.name, "health": s.health,
-            "panes": s.panes.iter().map(|p| serde_json::json!({
+    for s in sessions {
+        let sdir = repo.join("sessions").join(&s.name);
+        let cards = sdir.join("cards");
+        let snaps = sdir.join("snapshots");
+        std::fs::create_dir_all(&cards)?;
+        std::fs::create_dir_all(&snaps)?;
+
+        // 1. The stimulus for this session — what an agent reads, or a human with `jq`.
+        let stim = serde_json::json!({
+            "at": iso(ts), "at_ts": ts, "origin": origin, "session": s.name,
+            "health": s.health,
+            "workspaces": s.panes.iter().map(|p| serde_json::json!({
                 "id": p.id, "paneId": p.pane_id, "name": p.name, "verdict": p.verdict,
                 "kind": p.kind, "why": p.why, "ageSecs": p.age_secs,
                 "blockedPrompt": p.blocked_prompt,
             })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-    });
-    std::fs::write(
-        snaps.join(format!("{}.json", iso(ts).replace(':', "-"))),
-        serde_json::to_string_pretty(&stim)?,
-    )?;
+        });
+        std::fs::write(
+            snaps.join(format!("{}.json", iso(ts).replace(':', "-"))),
+            serde_json::to_string_pretty(&stim)?,
+        )?;
 
-    // 2. Reflex cards, one open card per (pane, kind) — a pane blocked for six hours is one card.
-    let open = read_open_cards(&feed);
-    let mut events: Vec<String> = Vec::new();
-    let mut live: Vec<(String, String, &'static str)> = Vec::new();
-
-    for s in sessions {
+        // 2. Reflex cards. One open card per (workspace, kind) — a pane blocked for six hours is
+        //    one card, not one per tick.
+        let open = read_open_cards(&cards);
+        let mut live: Vec<(String, &'static str)> = Vec::new();
         for p in &s.panes {
             let kind = match p.verdict.as_str() {
                 "blocked" => Some(Reflex::Blocked),
@@ -470,40 +526,40 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Res
                 _ => None,
             };
             let Some(kind) = kind else { continue };
-            live.push((s.name.clone(), p.pane_id.clone(), kind.slug()));
-            let already = open.iter().any(|c| {
-                !c.expired && c.session == s.name && c.pane == p.pane_id && c.kind == kind.slug()
-            });
-            if already {
+            live.push((p.pane_id.clone(), kind.slug()));
+            if open.iter().any(|c| !c.expired && c.pane == p.pane_id && c.kind == kind.slug()) {
                 continue;
             }
             let id = format!("card-{}-{}-{}-{ts}", s.name, p.pane_id, kind.slug());
-            write_card(&feed, &id, kind, origin, &s.name, p, ts)?;
+            write_card(&cards, &id, kind, origin, &s.name, p, ts)?;
             events.push(format!(
-                "**{}** {} in `{}` — card `{id}`",
+                "`{}` **{}** {} — card `{id}`",
+                s.name,
                 p.name,
-                if kind == Reflex::Blocked { "blocked on a prompt" } else { "failed" },
-                s.name
+                if kind == Reflex::Blocked { "blocked on a prompt" } else { "failed" }
             ));
         }
+
+        // 3. Expire what no longer holds. Declarative staleness: nothing re-examined the card,
+        //    the condition simply stopped being true.
+        for c in &open {
+            if c.expired || c.kind.is_empty() {
+                continue;
+            }
+            if !live.iter().any(|(pid, k)| *pid == c.pane && *k == c.kind) {
+                expire_card(c)?;
+                events.push(format!("`{}` resolved — card `{}` ({})", s.name, c.id, c.headline));
+            }
+        }
+
+        // 4. session → workspaces → summary.
+        let brief = session_briefing(s, ts);
+        std::fs::write(sdir.join("mission_briefing.md"), &brief)?;
+        append_timeline(&sdir, ts, &events)?;
+        briefs.push((s.name.clone(), brief));
     }
 
-    // 3. Expire cards whose condition no longer holds. Declarative staleness: a card retires
-    //    because the world moved, not because anything re-examined it.
-    for c in &open {
-        if c.expired || c.kind.is_empty() {
-            continue;
-        }
-        let still = live.iter().any(|(sn, pid, k)| *sn == c.session && *pid == c.pane && *k == c.kind);
-        if !still {
-            expire_card(c)?;
-            events.push(format!("resolved — card `{}` ({})", c.id, c.headline));
-        }
-    }
-
-    // 4. The briefing and the index, both regenerated wholesale.
-    write_briefing(&feed, sessions, ts)?;
-    write_index(&feed, ts)?;
+    write_index(repo, &briefs, ts)?;
     append_timeline(repo, ts, &events)?;
     Ok(events)
 }
@@ -521,7 +577,7 @@ fn host_name() -> String {
 pub fn snapshot_main(repo: Option<String>) -> Result<()> {
     let repo = repo
         .map(PathBuf::from)
-        .or_else(|| crate::sys::paths::home_dir().map(|h| h.join("manager")))
+        .or_else(|| crate::sys::paths::home_dir().map(|h| h.join(".mars").join("manager")))
         .ok_or_else(|| anyhow::anyhow!("no --repo and no home directory"))?;
     // `hostname()` lives behind the ssh feature; the memory-free SKU still needs an origin, and
     // an explicit override is useful anyway when one machine hosts several logical workspaces.

@@ -3150,7 +3150,7 @@ fn selfcheck() -> Result<()> {
         ]);
         let ev = manager::emit(&repo, "testbox", &s1, 1_000_000)?;
         assert_eq!(ev.len(), 2, "expected one event per needing-attention pane: {ev:?}");
-        let feed = repo.join("feed");
+        let feed = repo.join("sessions").join("0").join("cards");
         let cards = || -> Vec<String> {
             let mut v: Vec<String> = std::fs::read_dir(&feed).unwrap().flatten()
                 .filter_map(|e| e.file_name().to_str().map(String::from))
@@ -3187,11 +3187,11 @@ fn selfcheck() -> Result<()> {
 
         // T4 — the index is regenerated from the directory and ranks block above warn.
         let idx: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(feed.join("index.json"))?)?;
+            serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
         assert_eq!(idx["cards"].as_array().map(|a| a.len()), Some(2), "index disagrees with disk");
-        // The briefing rides INLINE in the index — Rover reads one file, not N (single fs slot).
-        let brief_inline = idx["briefing"].as_str().unwrap_or_default();
-        assert!(brief_inline.contains("Workspaces"), "briefing body not inlined into the index");
+        // The briefing rides INLINE per session — Rover reads one file, not N (single fs slot).
+        let brief_inline = idx["sessions"][0]["briefing"].as_str().unwrap_or_default();
+        assert!(brief_inline.contains("mission briefing"), "briefing not inlined per session: {idx}");
         let first = idx["cards"][0].as_object().expect("card entry");
         assert!(first.contains_key("body"), "card body not inlined: {first:?}");
         let s3 = snap(vec![
@@ -3200,24 +3200,39 @@ fn selfcheck() -> Result<()> {
         ]);
         manager::emit(&repo, "testbox", &s3, 1_000_180)?;
         let idx: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(feed.join("index.json"))?)?;
+            serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
         let live: Vec<&serde_json::Value> = idx["cards"].as_array().unwrap().iter()
             .filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
         assert_eq!(live[0]["severity"], "block", "index does not rank block first: {idx}");
 
-        // T5 — the briefing is markdown a human can read, and says the useful thing first.
-        let brief = std::fs::read_to_string(feed.join("briefing.md"))?;
-        assert!(manager::split_front(&brief).is_some(), "briefing has no frontmatter");
+        // T5 — session → workspaces → summary, as markdown a human can read.
+        let bpath = repo.join("sessions").join("0").join("mission_briefing.md");
+        let brief = std::fs::read_to_string(&bpath)?;
         assert!(brief.contains("2 need you"), "briefing does not lead with what needs attention: {brief}");
-        assert!(brief.contains("| pane | state | age |"), "briefing lost its per-session table");
-
+        assert!(brief.contains("| workspace | state | age |"), "briefing lost its workspace table");
         // …and when nothing is wrong it says so, rather than padding.
         manager::emit(&repo, "testbox", &snap(vec![pane("9", "notes", "idle", "", 5)]), 1_000_240)?;
-        let calm = std::fs::read_to_string(feed.join("briefing.md"))?;
-        assert!(calm.contains("Nothing needs you"), "quiet briefing is not calm: {calm}");
+        assert!(std::fs::read_to_string(&bpath)?.contains("Nothing needs you"), "quiet briefing is not calm");
+
+        // T5b — the guide the agent reads is scaffolded, and is NEVER overwritten afterwards.
+        for f in ["AGENTS.md", "docs/layout.md", "docs/cards.md", "docs/memory.md",
+                  "docs/tools.md", "policy.md", "memory/beliefs.md", ".gitignore"] {
+            assert!(repo.join(f).exists(), "{f} not scaffolded");
+        }
+        std::fs::write(repo.join("AGENTS.md"), "EDITED BY HUMAN\n")?;
+        std::fs::write(repo.join("memory/beliefs.md"), "MY BELIEFS\n")?;
+        manager::emit(&repo, "testbox", &snap(vec![]), 1_000_300)?;
+        assert_eq!(std::fs::read_to_string(repo.join("AGENTS.md"))?, "EDITED BY HUMAN\n",
+                   "AGENTS.md was clobbered — the human owns it");
+        assert_eq!(std::fs::read_to_string(repo.join("memory/beliefs.md"))?, "MY BELIEFS\n",
+                   "memory/ was clobbered — the AGENT owns it");
+        // The human-readable status index exists and points into the hierarchy.
+        let status = std::fs::read_to_string(repo.join("index.md"))?;
+        assert!(status.contains("sessions/0/mission_briefing.md"), "index.md does not link the tree: {status}");
 
         // T6 — the timeline is append-only, date-ordered and readable with no tooling.
         let tl = std::fs::read_to_string(repo.join("timeline.md"))?;
+        assert!(repo.join("sessions/0/timeline.md").exists(), "no per-session timeline");
         let stamps: Vec<&str> = tl.lines().filter(|l| l.starts_with("- `"))
             .filter_map(|l| l.split('`').nth(1)).collect();
         assert!(stamps.len() >= 4, "timeline too short: {tl}");
