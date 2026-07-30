@@ -623,7 +623,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
             .then(b["priority"].as_u64().unwrap_or(0).cmp(&a["priority"].as_u64().unwrap_or(0)))
             .then(b["created_ts"].as_u64().unwrap_or(0).cmp(&a["created_ts"].as_u64().unwrap_or(0)))
     });
-    let (runs_ok, runs_total) = run_tally(repo);
+    let (runs_ok, runs_total, timing) = run_tally(repo);
     let index = serde_json::json!({
         "generated": iso(ts), "generated_ts": ts,
         "sessions": briefs.iter().map(|(n, b)| {
@@ -671,7 +671,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
             })
         }).collect::<Vec<_>>(),
         "agentStaleSecs": stale_secs,
-        "agentRuns": { "ok": runs_ok, "total": runs_total },
+        "agentRuns": { "ok": runs_ok, "total": runs_total, "timing": timing },
         "agentEnabled": agent_enabled(repo),
         "memos": cards,
     });
@@ -915,6 +915,11 @@ fn score_runs(repo: &Path, ts: u64) {
             let Ok(text) = std::fs::read_to_string(&path) else { continue };
             let Ok(batch) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
             let opened = batch["opened_ts"].as_u64().unwrap_or(0);
+            // The agent moves the file when it finishes, so the mtime of the file in done/ IS the
+            // finish time — measured by us rather than reported by it.
+            let delivered = batch["delivered_ts"].as_u64().unwrap_or(0);
+            let finished = mtime_secs(&path);
+            let duration = (delivered > 0 && finished >= delivered).then(|| finished - delivered);
             let sessions = batch["sessions"].as_array().cloned().unwrap_or_default();
 
             // The agent's own account of the run. We verify the ACCOUNT against the filesystem
@@ -974,6 +979,8 @@ fn score_runs(repo: &Path, ts: u64) {
                 "{}\n",
                 serde_json::json!({
                     "batch": name, "scored": iso(ts), "scored_ts": ts, "opened_ts": opened,
+                    "delivered_ts": delivered, "finished_ts": finished,
+                    "duration_secs": duration,
                     "sessions": sessions.len(), "claimed": claimed.len(),
                     "skipped": receipt["skipped"].as_array().map(|a| a.len()).unwrap_or(0),
                     "faults": faults, "ok": faults.is_empty(),
@@ -991,16 +998,20 @@ fn score_runs(repo: &Path, ts: u64) {
 
 /// Rolling tally over the recent tail — a bad week should not be hidden by a good year. A pure
 /// read: scoring is a write and happens on the tick, so asking for the view changes nothing.
-fn run_tally(repo: &Path) -> (u64, u64) {
+fn run_tally(repo: &Path) -> (u64, u64, serde_json::Value) {
     let all: Vec<serde_json::Value> = std::fs::read_to_string(repo.join("memory/runs.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    let tail = all.iter().rev().take(20);
-    let total = tail.clone().count() as u64;
-    let ok = tail.filter(|v| v["ok"].as_bool().unwrap_or(false)).count() as u64;
-    (ok, total)
+    let tail: Vec<&serde_json::Value> = all.iter().rev().take(20).collect();
+    let total = tail.len() as u64;
+    let ok = tail.iter().filter(|v| v["ok"].as_bool().unwrap_or(false)).count() as u64;
+    let mut durs: Vec<u64> = tail.iter().filter_map(|v| v["duration_secs"].as_u64()).collect();
+    let last = tail.first().and_then(|v| v["duration_secs"].as_u64());
+    durs.sort_unstable();
+    let median = (!durs.is_empty()).then(|| durs[durs.len() / 2]);
+    (ok, total, serde_json::json!({ "lastSecs": last, "medianSecs": median, "samples": durs.len() }))
 }
 
 /// Is the agent switched on?
@@ -1027,6 +1038,17 @@ pub fn agent_switch_path() -> Option<PathBuf> {
 /// marking the run anyway would have parked the agent for a further twenty minutes.
 pub fn mark_run(board_json: &str, ts: u64) {
     let Some(repo) = repo_dir() else { return };
+    // Stamp the batch we just handed over. `opened_ts` is when the work ARRIVED, which can be
+    // several floors before anyone was woken — so it cannot be a start time. This can.
+    if let Some(p) = open_batch(&repo) {
+        if let Ok(t) = std::fs::read_to_string(&p) {
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&t) {
+                v["delivered_ts"] = serde_json::json!(ts);
+                v["delivered"] = serde_json::json!(iso(ts));
+                let _ = std::fs::write(&p, v.to_string());
+            }
+        }
+    }
     if let Some(snap) = parse_board(board_json) {
         let _ = mark_nudged(&repo, &[snap], ts);
     }
@@ -1161,6 +1183,8 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("docs/layout.md"), include_str!("manager_docs/layout.md"))?;
     seed(&repo.join("docs/cards.md"), include_str!("manager_docs/cards.md"))?;
     seed(&repo.join("docs/memos.md"), include_str!("manager_docs/memos.md"))?;
+    seed(&repo.join("docs/briefing.md"), include_str!("manager_docs/briefing.md"))?;
+    seed(&repo.join("docs/workspaces.md"), include_str!("manager_docs/workspaces.md"))?;
     seed(&repo.join("docs/receipts.md"), include_str!("manager_docs/receipts.md"))?;
     seed(&repo.join("prompt.md"), include_str!("manager_docs/prompt.md"))?;
     let runner = repo.join("run.sh");

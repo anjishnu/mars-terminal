@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 4 -->
+<!-- mars-doc-version: 5 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -30,6 +30,21 @@ should leave real work behind, not nothing.
 3. **Read the new snapshots** for each session, oldest first. The batch gives you their paths;
    do not guess them. Reading the *sequence* is the point — a workspace blocked across six
    snapshots is a different fact from one blocked only in the newest.
+### The order they will read it in
+
+They read **briefing → workspace summaries → memos**, and you write it in the opposite order,
+finishing with the briefing because it summarises what you wrote. That reversal is the point: each
+thing you write knows what the reader will already have seen by the time they reach it.
+
+| They read | Having already seen | So it may only say |
+|---|---|---|
+| Briefing | nothing — first glance, 2–5s | what CHANGED, and the one thing needing them |
+| Workspace summary | the briefing, and a row with name/state/age | the one fact the row cannot show |
+| Memo | the board and the briefing | what is being forgotten, which neither shows |
+
+The single most common failure is repetition down that column. A memo saying "the build failed" is
+worth nothing under a row that already reads `build · failed`.
+
 4. **Write `workspaces/<pane-id>.md`** — one per workspace whose situation actually changed.
    Two or three sentences: what it is doing, and whether it needs anything. Skip the ones that
    have not moved. An untouched file beats a rewritten identical one.
@@ -38,8 +53,9 @@ should leave real work behind, not nothing.
    workspace rows already say what is happening; a memo says what is being forgotten. Give it a
    title that names the thing, state the problem in a few concrete lines, and end with the
    proposed next move — a memo that stops at the diagnosis hands back the work.
-6. **Write `mission_briefing.md` LAST**, once every document above is on disk. It summarises what
-   you just wrote, so writing it first means summarising work you have not done yet.
+6. **Write `mission_briefing.md` LAST**, once every document above is on disk — format in
+   [`docs/briefing.md`](docs/briefing.md). It summarises what you just wrote, so writing it first
+   means summarising work you have not done yet.
 7. **Advance `memory/cursor.json`** — set each session's entry to the newest snapshot filename you
    actually read. Mars computes "unconsumed" from this: leaving it stale makes you re-read
    forever, and advancing it past files you did not read skips work silently.
@@ -67,17 +83,6 @@ touched, which credited another program's output to you on the engineer's screen
 file is treated as somebody else's.
 
 Write to a temporary file and rename it into place, so a reader never catches a half-written one.
-
-## The mission briefing
-
-Three short blocks, blank line between, no markdown, no headings, no preamble:
-
-1. What is happening, most important first. Show it rather than announce it — "the sweep finished
-   at its best accuracy yet", never "the good news is". Name the workspaces that matter. At most
-   two sentences.
-2. What needs the engineer, as the single next move. When nothing does, say exactly that in one
-   line and stop: "Nothing is blocked."
-3. One closing line. A dry beat if the board is clean; dropped entirely if something is on fire.
 
 ## Rules
 

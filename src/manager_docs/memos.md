@@ -1,5 +1,9 @@
-<!-- mars-doc-version: 4 -->
+<!-- mars-doc-version: 5 -->
 # Memos
+
+**Read last**, behind a closed folder, after the briefing and the board. By the time anyone opens
+this they have seen what is happening and dealt with what needed them — so a memo is only worth
+writing if neither of those showed it.
 
 A memo is **something worth keeping track of that is not what a workspace is doing right now.**
 
