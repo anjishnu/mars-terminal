@@ -6183,6 +6183,39 @@ fn selfcheck() -> Result<()> {
         assert!(log.contains("no-receipt"), "a run with no receipt scored clean: {log}");
 
         println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
+        // Timing is derived from artifact mtimes, so a run's phases can be read off without the
+        // agent reporting anything. What matters is that a real delivery produces a duration at
+        // all — the old bound was opened->scored, which over-reported by 87 minutes on a run that
+        // took a few, because it counted the wait before the agent was ever woken.
+        {
+            let brief = sdir.join("mission_briefing.md").display().to_string();
+            std::fs::write(&brief, "---\nsource: agent\n---\nquiet\n")?;
+            let batch = "batch-timed.json";
+            let _ = std::fs::remove_file(repo.join("memory/runs.jsonl"));
+            std::fs::write(repo.join("inbox/done").join(batch), serde_json::json!({
+                "opened_ts": 7_000_000u64,
+                "delivered_ts": std::fs::metadata(&brief).and_then(|m| m.modified()).ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()).unwrap_or(0).saturating_sub(5),
+                "sessions": [{ "id": "0", "name": "0", "dir": sdir.display().to_string(),
+                               "snapshots": ["a.json"] }],
+            }).to_string())?;
+            std::fs::write(repo.join("runs").join(batch), serde_json::json!({
+                "wrote": [brief], "skipped": [], "cursor": { "0": "a.json" },
+            }).to_string())?;
+            manager::emit(&repo, "testbox", &[], 7_000_500, 2700)?;
+            let log = std::fs::read_to_string(repo.join("memory/runs.jsonl")).unwrap_or_default();
+            let row: serde_json::Value = log.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|v| v["batch"] == batch).expect("timed run not scored");
+            assert!(row["duration_secs"].as_u64().is_some(),
+                "a delivered run produced no duration: {row}");
+            assert!(row["ramp_secs"].as_u64().is_some(),
+                "no ramp phase derived from artifact mtimes: {row}");
+            assert_eq!(row["files_written"].as_u64(), Some(1), "wrong file count: {row}");
+        }
+        println!("[selfcheck] manager: run timing derived from artifact mtimes ... PASS");
+
         // Provenance comes from the agent SIGNING her work, never from how recently a file was
         // touched. An unsigned file is somebody else's, however fresh it looks — that inference
         // is what credited a daemon's markdown to the agent on the engineer's phone.

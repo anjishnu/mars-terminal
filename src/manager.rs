@@ -920,6 +920,7 @@ fn score_runs(repo: &Path, ts: u64) {
             let delivered = batch["delivered_ts"].as_u64().unwrap_or(0);
             let finished = mtime_secs(&path);
             let duration = (delivered > 0 && finished >= delivered).then(|| finished - delivered);
+
             let sessions = batch["sessions"].as_array().cloned().unwrap_or_default();
 
             // The agent's own account of the run. We verify the ACCOUNT against the filesystem
@@ -933,6 +934,28 @@ fn score_runs(repo: &Path, ts: u64) {
             let claimed: Vec<String> = receipt["wrote"].as_array().map(|a| {
                 a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
             }).unwrap_or_default();
+
+            // Phase breakdown, free: every artifact the agent writes carries an mtime, and the
+            // receipt already names them. Statting those reconstructs the whole turn without the
+            // agent reporting anything — so "why was that slow" is answerable rather than a
+            // single opaque number.
+            //
+            //   ramp  delivered -> first write   process start, auth, reading the snapshots
+            //   write first     -> last write    producing the documents
+            //   wrap  last      -> batch moved   cursor, receipt, tidying up
+            let stamps: Vec<u64> = Some(&claimed).map(|a| a.iter()
+                .map(|p| mtime_secs(Path::new(p)))
+                .filter(|&t| t > 0)
+                .collect()).unwrap_or_default();
+            let first_write = stamps.iter().copied().min();
+            let last_write = stamps.iter().copied().max();
+            let span = |a: Option<u64>, b: Option<u64>| match (a, b) {
+                (Some(x), Some(y)) if y >= x => Some(y - x),
+                _ => None,
+            };
+            let ramp = span(Some(delivered).filter(|&d| d > 0), first_write);
+            let write = span(first_write, last_write);
+            let wrap = span(last_write, Some(finished).filter(|&f| f > 0));
 
             let mut faults: Vec<serde_json::Value> = Vec::new();
             // 1. Every file it SAYS it wrote must exist and post-date the batch. This is the
@@ -981,6 +1004,8 @@ fn score_runs(repo: &Path, ts: u64) {
                     "batch": name, "scored": iso(ts), "scored_ts": ts, "opened_ts": opened,
                     "delivered_ts": delivered, "finished_ts": finished,
                     "duration_secs": duration,
+                    "ramp_secs": ramp, "write_secs": write, "wrap_secs": wrap,
+                    "files_written": stamps.len(),
                     "sessions": sessions.len(), "claimed": claimed.len(),
                     "skipped": receipt["skipped"].as_array().map(|a| a.len()).unwrap_or(0),
                     "faults": faults, "ok": faults.is_empty(),
@@ -1007,11 +1032,30 @@ fn run_tally(repo: &Path) -> (u64, u64, serde_json::Value) {
     let tail: Vec<&serde_json::Value> = all.iter().rev().take(20).collect();
     let total = tail.len() as u64;
     let ok = tail.iter().filter(|v| v["ok"].as_bool().unwrap_or(false)).count() as u64;
-    let mut durs: Vec<u64> = tail.iter().filter_map(|v| v["duration_secs"].as_u64()).collect();
-    let last = tail.first().and_then(|v| v["duration_secs"].as_u64());
-    durs.sort_unstable();
-    let median = (!durs.is_empty()).then(|| durs[durs.len() / 2]);
-    (ok, total, serde_json::json!({ "lastSecs": last, "medianSecs": median, "samples": durs.len() }))
+    // p50 and p90 rather than a mean: run times are long-tailed, and the tail is the thing worth
+    // knowing about.
+    let pct = |key: &str, p: f64| -> Option<u64> {
+        let mut xs: Vec<u64> = tail.iter().filter_map(|v| v[key].as_u64()).collect();
+        if xs.is_empty() { return None; }
+        xs.sort_unstable();
+        Some(xs[(((xs.len() - 1) as f64) * p).round() as usize])
+    };
+    let last = tail.first();
+    (ok, total, serde_json::json!({
+        "lastSecs": last.and_then(|v| v["duration_secs"].as_u64()),
+        "p50Secs": pct("duration_secs", 0.5),
+        "p90Secs": pct("duration_secs", 0.9),
+        "phases": {
+            "rampP50": pct("ramp_secs", 0.5),
+            "writeP50": pct("write_secs", 0.5),
+            "wrapP50": pct("wrap_secs", 0.5),
+        },
+        "lastPhases": last.map(|v| serde_json::json!({
+            "ramp": v["ramp_secs"], "write": v["write_secs"], "wrap": v["wrap_secs"],
+            "files": v["files_written"],
+        })),
+        "samples": tail.iter().filter(|v| v["duration_secs"].as_u64().is_some()).count(),
+    }))
 }
 
 /// Is the agent switched on?
