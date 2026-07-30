@@ -7,6 +7,12 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Action {
+    // A generated name the agent is RECOMMENDING. Accepting it renames; ignoring it costs
+    // nothing. Naming used to apply itself, which moved the session's socket out from under
+    // anything holding it by name (the Rover bridge, the manager repo) — so a helpful rename
+    // became an outage. A recommendation cannot do that.
+    AcceptSessionName,
+    AcceptTabName,
     // windows / panes
     SplitHorizontal,
     SplitVertical,
@@ -101,6 +107,8 @@ impl Action {
     /// Short human label — used by which-key hints and the graduation nudge.
     pub fn label(&self) -> &'static str {
         match self {
+            Action::AcceptSessionName  => "rename session to the suggestion",
+            Action::AcceptTabName      => "rename tab to the suggestion",
             Action::SplitHorizontal    => "split below",
             Action::SplitVertical      => "split right",
             Action::ClosePane          => "close pane",

@@ -120,7 +120,17 @@ pub enum ServerFrame {
     /// Connection is over (detach, quit, takeover, refusal) — show `message`.
     Exit { message: String },
     /// Reply to `ClientFrame::Status`.
-    Status { attached: bool, version: String },
+    /// Reply to `ClientFrame::Status`. `instance_id` is minted ONCE per daemon process and never
+    /// re-derived from the name, so it is the stable handle for a session across renames — which
+    /// the socket path is not, since the socket is named after the session.
+    Status {
+        attached: bool,
+        version: String,
+        #[serde(default)]
+        instance_id: String,
+        #[serde(default)]
+        name: String,
+    },
     /// Reply to `ClientFrame::BrokerRoute`.
     BrokerRoute {
         session_instance_id: String,
@@ -231,6 +241,77 @@ pub fn validate_session_name(name: &str) -> Result<()> {
 pub fn socket_path(name: &str) -> Result<PathBuf> {
     validate_session_name(name)?;
     Ok(socket_dir()?.join(format!("{name}.sock")))
+}
+
+
+/// Ask a live socket who it is: `(name, instance_id, attached)`.
+///
+/// This is the only way to bind to a session that survives a rename. A socket is named after the
+/// session, so `mars rename` moves it; the instance id inside does not move.
+pub fn identify(path: &std::path::Path) -> Option<(String, String, bool)> {
+    // More patient than `query_attached`'s 500ms: this is called by a bridge re-resolving its
+    // target, sometimes moments after a rename, against a daemon that is also serving an attached
+    // client and a phone. Giving up on one slow reply would look exactly like "the session is
+    // gone" and drop a live connection.
+    let stream = crate::sys::control::connect(path).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(2500))).ok()?;
+    let mut w = stream.try_clone().ok()?;
+    write_frame(&mut w, &ClientFrame::Status).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream).read_line(&mut line).ok()?;
+    match serde_json::from_str::<ServerFrame>(line.trim()).ok()? {
+        ServerFrame::Status { attached, instance_id, name, .. } => {
+            let name = if name.is_empty() {
+                path.file_stem()?.to_str()?.to_string()
+            } else {
+                name
+            };
+            Some((name, instance_id, attached))
+        }
+        _ => None,
+    }
+}
+
+/// Find the live session with this instance id, wherever it has been renamed to.
+/// Returns `(current_name, socket_path)`.
+pub fn socket_for_instance(instance_id: &str) -> Option<(String, PathBuf)> {
+    if instance_id.is_empty() {
+        return None;
+    }
+    let dir = socket_dir().ok()?;
+    // Two passes: a rename moves the socket file while the daemon keeps serving the same inode,
+    // and the first probe can land inside that window.
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("sock") {
+                continue;
+            }
+            if let Some((name, id, _)) = identify(&p) {
+                if id == instance_id {
+                    return Some((name, p));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The session a bridge should serve when told nothing: the one a client is ATTACHED to.
+///
+/// Defaulting to "the first session listed" is how a bridge ended up serving a name whose daemon
+/// had no socket, then quietly forwarding an empty board forever — a failure that looks exactly
+/// like a broken phone app.
+pub fn attached_session() -> Option<String> {
+    let live: Vec<(String, bool, bool)> = list_sessions().ok()?;
+    live.iter()
+        .find(|(_, alive, attached)| *alive && *attached)
+        .or_else(|| live.iter().find(|(_, alive, _)| *alive))
+        .map(|(n, _, _)| n.clone())
 }
 
 /// Ask a live session whether a client is currently attached.
@@ -935,6 +1016,11 @@ fn client_connection(
                 let _ = write_frame(&mut w, &ServerFrame::Status {
                     attached: attached.load(Ordering::SeqCst),
                     version: VERSION.to_string(),
+                    instance_id: session_instance_id.to_string(),
+                    // Left empty deliberately: the socket FILENAME is the current name (a rename
+                    // moves the socket), so `identify()` reads it from the path and this cannot
+                    // go stale behind a rename.
+                    name: String::new(),
                 });
             }
             return;

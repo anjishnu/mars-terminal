@@ -721,6 +721,24 @@ fn host_name() -> String {
 }
 
 
+
+/// Where the manager repo lives.
+///
+/// `MARS_MANAGER_DIR` overrides everything. Otherwise, and this is the important part: when
+/// `MARS_RUNTIME_DIR` is set the repo goes UNDER it, because that variable is how Mars isolates a
+/// test run — and a run that isolates its sockets but writes cards into the user's real repo is
+/// worse than one that isolates nothing. `--selfcheck` did exactly that and filled a real
+/// `~/.mars/manager` with a dozen throwaway sessions.
+pub fn repo_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("MARS_MANAGER_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    if let Some(rt) = std::env::var_os(crate::session::RUNTIME_DIR_ENV) {
+        return Some(PathBuf::from(rt).join("manager"));
+    }
+    crate::sys::paths::home_dir().map(|h| h.join(".mars").join("manager"))
+}
+
 /// Write ONE session's subtree, from the daemon's own state. Called on a timer by the session
 /// daemon, so cards exist before anyone looks — the point of an ambient layer is that nobody has
 /// to ask for it.
@@ -761,7 +779,7 @@ fn prune_snapshots(dir: &Path, keep: usize) -> Result<()> {
 pub fn snapshot_main(repo: Option<String>) -> Result<()> {
     let repo = repo
         .map(PathBuf::from)
-        .or_else(|| crate::sys::paths::home_dir().map(|h| h.join(".mars").join("manager")))
+        .or_else(repo_dir)
         .ok_or_else(|| anyhow::anyhow!("no --repo and no home directory"))?;
     // `hostname()` lives behind the ssh feature; the memory-free SKU still needs an origin, and
     // an explicit override is useful anyway when one machine hosts several logical workspaces.

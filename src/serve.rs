@@ -40,11 +40,10 @@ fn resolve_session(arg: Option<String>) -> Result<String> {
             return Ok(name);
         }
     }
-    let sessions = session::list_sessions()?;
-    sessions
-        .into_iter()
-        .map(|(name, _, _)| name)
-        .next()
+    // The ATTACHED session, not merely the first listed. Taking the first is how a bridge ended
+    // up bound to a name whose daemon had no socket, then forwarded an empty board indefinitely —
+    // which looks exactly like a broken phone app rather than a misdirected bridge.
+    session::attached_session()
         .ok_or_else(|| anyhow!("no sessions found — start one with `mars` first"))
 }
 
@@ -186,6 +185,17 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     if !socket.exists() {
         return Err(anyhow!("session '{session}' has no socket — is it running? (`mars ls`)"));
     }
+    // Bind to the session's INSTANCE ID, not its name. The socket is named after the session, so
+    // `mars rename` moves it and a path captured here would go stale — the bridge would keep
+    // accepting phones and forward nothing. The instance id is minted once per daemon and never
+    // re-derived from the name, so re-resolving by it follows a rename automatically.
+    let instance_id = session::identify(&socket).map(|(_, id, _)| id).unwrap_or_default();
+    if instance_id.is_empty() {
+        return Err(anyhow!(
+            "session '{session}' did not report an instance id — is it an older `mars`? \
+             Restart the session so the bridge can follow it across renames."
+        ));
+    }
     let port = DEFAULT_PORT;
     // Bind localhost; cloudflared fronts it with a public https/wss URL, so the phone
     // (loading the app from Lovable over https) can reach this bridge over wss without a
@@ -225,8 +235,29 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let sock = socket.clone();
+        // Re-resolve per connection: follow a rename, and REFUSE loudly when the instance is
+        // gone rather than serving an empty board. Silent success is the failure mode that makes
+        // a misdirected bridge indistinguishable from a broken client.
+        let fallback = socket.clone();
+        let id = instance_id.clone();
         thread::spawn(move || {
+            let sock = match crate::session::socket_for_instance(&id) {
+                Some((name, p)) => {
+                    if p != fallback {
+                        crate::session::debug_log(&format!(
+                            "[rover] session followed a rename → '{name}' ({})",
+                            p.display()
+                        ));
+                    }
+                    p
+                }
+                None => {
+                    crate::session::debug_log(
+                        "[rover] session instance is gone — refusing the connection",
+                    );
+                    return;
+                }
+            };
             if let Err(e) = handle_conn(stream, &sock) {
                 crate::session::debug_log(&format!("[rover] conn ended: {e}"));
             }

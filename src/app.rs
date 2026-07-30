@@ -587,6 +587,12 @@ pub struct App {
     /// three days after an out-of-credit provider. A key present with `done` means settled
     /// (named, or manually renamed, or out of retries).
     auto_name_attempts: std::collections::HashMap<TabId, Attempt>,
+    /// A generated name the agent RECOMMENDS, per tab, and for the session. Never applied on its
+    /// own. Auto-applying moved the session's socket (it is named after the session) out from
+    /// under everything holding it by name — the Rover bridge, the launchd agent, the manager
+    /// repo — so a helpful rename presented as an outage. The user accepts from the command bar.
+    pub tab_name_suggestion: std::collections::HashMap<TabId, String>,
+    pub session_name_suggestion: Option<String>,
     /// Shell composer: the query is a ready-to-run command (translated or
     /// typed literally with no key) — the next Enter runs it.
     pub shell_ready: bool,
@@ -755,6 +761,8 @@ impl App {
             rover_active: false,
             rover_greeting: String::new(),
             auto_name_attempts: std::collections::HashMap::new(),
+            tab_name_suggestion: std::collections::HashMap::new(),
+            session_name_suggestion: None,
             shell_ready: false,
             translate_call_id: None,
             translate_request: None,
@@ -953,6 +961,33 @@ impl App {
     /// colored by the tab's aggregate status. A switcher AND a status board — it
     /// lists ALL workspaces (jump anywhere). Deliberately NOT filtered by the query,
     /// so the panel stays a static, fixed-height box while the command list filters.
+    /// Name recommendations, pinned ahead of everything else in the command bar. This is the
+    /// whole of what auto-naming is allowed to do now: offer. Accepting is one keystroke; ignoring
+    /// it is free and leaves every name-addressed thing (socket, bridge, manager repo) untouched.
+    pub fn bar_name_suggestions(&self) -> Vec<crate::palette::PaletteRow> {
+        use crate::palette::{Action, ItemKind, PaletteRow};
+        let mut out = Vec::new();
+        if let Some(name) = &self.session_name_suggestion {
+            out.push(PaletteRow {
+                label: format!("Rename session → {name}"),
+                kind: ItemKind::Run(Action::AcceptSessionName),
+                description: format!(
+                    "suggested from what this session is doing (currently '{}')",
+                    self.session_name.as_deref().unwrap_or("-")
+                ),
+            });
+        }
+        let tab_id = self.tab().id;
+        if let Some(name) = self.tab_name_suggestion.get(&tab_id) {
+            out.push(PaletteRow {
+                label: format!("Rename tab → {name}"),
+                kind: ItemKind::Run(Action::AcceptTabName),
+                description: "suggested from this tab's content".into(),
+            });
+        }
+        out
+    }
+
     pub fn bar_workspace_rows(&self) -> Vec<crate::palette::PaletteRow> {
         use crate::palette::{ItemKind, PaletteRow, SurfaceRef};
         let ms = self.tuning.poll_interval_ms.max(1);
@@ -1176,10 +1211,27 @@ impl App {
     /// The Commands column: the launcher / fuzzy results (query-filtered). The
     /// Workspaces column is separate — two ontologies, never interleaved.
     pub fn bar_rows(&self) -> Vec<crate::palette::PaletteRow> {
-        self.palette
+        let items = self
+            .palette
             .as_ref()
             .map(|p| p.visible_items(&self.frecency))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Name recommendations ride at the TOP — but only at the root of an UNFILTERED bar. A
+        // suggestion that shoulders aside what you actually typed would be a worse citizen than
+        // the auto-rename it replaced.
+        let at_root = self
+            .palette
+            .as_ref()
+            .is_some_and(|p| p.stack.len() <= 1 && p.query.is_empty());
+        if !at_root {
+            return items;
+        }
+        let mut out = self.bar_name_suggestions();
+        if out.is_empty() {
+            return items;
+        }
+        out.extend(items);
+        out
     }
 
     /// `↵` (or a click) on a surface row — the safe universal verb: focus its tab +
@@ -4784,6 +4836,27 @@ impl App {
         }
 
         match action {
+            // Accepting a recommendation is the ONLY path from a generated name to a real one.
+            Action::AcceptSessionName => {
+                if let Some(name) = self.session_name_suggestion.take() {
+                    match crate::session::validate_session_name(&name) {
+                        Ok(()) => {
+                            self.status_msg = Some(format!("Renaming session to '{name}'"));
+                            self.rename_session_to = Some(name);
+                        }
+                        Err(e) => self.status_msg = Some(format!("Invalid name: {e}")),
+                    }
+                }
+            }
+            Action::AcceptTabName => {
+                let id = self.tab().id;
+                if let Some(name) = self.tab_name_suggestion.remove(&id) {
+                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        self.status_msg = Some(format!("Tab renamed to '{name}'"));
+                        tab.name = name;
+                    }
+                }
+            }
             Action::SplitHorizontal    => self.split_horizontal(),
             Action::SplitVertical      => self.split_vertical(),
             Action::ClosePane          => self.close_pane(),
@@ -5362,12 +5435,15 @@ impl App {
                 AgentEvent::AutoName { tab_id, name } => {
                     self.bg_busy = false;
                     self.auto_name_attempts.entry(tab_id).or_default().succeeded();
-                    // Apply only if the tab still wears its default numeric
-                    // name — a user rename always wins the race.
-                    if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-                        if tab.name.chars().all(|c| c.is_ascii_digit()) {
-                            tab.name = name;
-                        }
+                    // RECOMMEND, never apply. Only offer it while the tab still wears its default
+                    // numeric name — a user's own name is never second-guessed.
+                    let default_named = self
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .is_some_and(|t| t.name.chars().all(|c| c.is_ascii_digit()));
+                    if default_named {
+                        self.tab_name_suggestion.insert(tab_id, name);
                     }
                 }
                 AgentEvent::SessionName { name } => {
@@ -5380,8 +5456,11 @@ impl App {
                         .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
                         .unwrap_or(false);
                     if numeric {
+                        // RECOMMEND, never apply. A session's socket is named after it, so an
+                        // automatic rename silently relocated the endpoint that the Rover bridge,
+                        // the launchd agent and the manager repo all address by name.
                         match crate::session::validate_session_name(&name) {
-                            Ok(()) => self.rename_session_to = Some(name),
+                            Ok(()) => self.session_name_suggestion = Some(name),
                             Err(e) => {
                                 self.status_msg =
                                     Some(format!("Ignored invalid generated session name: {e}"));

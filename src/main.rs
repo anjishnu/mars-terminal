@@ -1858,22 +1858,27 @@ fn selfcheck() -> Result<()> {
     typ(&mut app, "build")?;
     app.handle_key(k(KeyCode::Enter))?;
     assert_eq!(app.tab().name, "build", "tab rename failed");
-    // Auto-name must NOT override a user-chosen (non-numeric) name.
+    // A generated name must not even be OFFERED over a user-chosen (non-numeric) name.
     let tid0 = app.tab().id;
     app.agent_tx.send(agent::AgentEvent::AutoName { tab_id: tid0, name: "x".into() })?;
     app.tick();
-    assert_eq!(app.tab().name, "build", "auto-name overrode a manual rename");
+    assert_eq!(app.tab().name, "build", "generated name overrode a manual rename");
+    assert!(app.tab_name_suggestion.is_empty(), "suggested a name over a user's own");
     app.run_action(palette::Action::RenamePane);
     typ(&mut app, "logs")?;
     app.handle_key(k(KeyCode::Enter))?;
     term.draw(|f| ui::render(f, &mut app))?;
     assert!(screen_text(&term).contains(" logs "), "pane title not rendered");
-    // Positive auto-name path: a default-named tab accepts the label.
+    // A default-named tab gets a SUGGESTION, not a rename. Applying it automatically is what
+    // moved sessions out from under the things that address them by name; see 29a5.
     let mut app = App::new(None)?;
     let tid1 = app.tab().id;
     app.agent_tx.send(agent::AgentEvent::AutoName { tab_id: tid1, name: "auto-label".into() })?;
     app.tick();
-    assert_eq!(app.tab().name, "auto-label", "auto-name not applied");
+    assert_eq!(app.tab().name, "1", "a generated name was applied without being accepted");
+    assert_eq!(app.tab_name_suggestion.get(&tid1).map(String::as_str), Some("auto-label"));
+    app.run_action(palette::Action::AcceptTabName);
+    assert_eq!(app.tab().name, "auto-label", "accepting the suggestion did not rename");
     println!("[selfcheck] renames + auto-name ........ PASS");
 
     // ── Phase 1 agentic workflows ────────────────────────────────────────────
@@ -2776,6 +2781,42 @@ fn selfcheck() -> Result<()> {
                 );
             }
 
+            // Task 4: a session's IDENTITY survives a rename, and can be found by it.
+            //
+            // The bug this closes: `mars serve` captured a socket PATH at startup, the socket is
+            // named after the session, so a rename (or a restart under a new name) left the bridge
+            // forwarding an empty board forever — which reads as a broken phone app.
+            {
+                let (name0, id0, _) = session::identify(&bpath).expect("session did not identify");
+                assert_eq!(name0, bname, "identify reported the wrong name");
+                assert!(!id0.is_empty(), "session reported no instance id");
+
+                // Found by id, at its current name.
+                let (found_name, found_path) =
+                    session::socket_for_instance(&id0).expect("instance not findable by id");
+                assert_eq!(found_name, bname);
+                assert_eq!(found_path, bpath);
+
+                // Rename it, then find it again by the SAME id at its NEW name and path.
+                // Short on purpose: the socket path (isolated temp dir + name) must stay under
+                // macOS's ~104-char SUN_LEN, or the renamed socket cannot be connected to at all.
+                let renamed = "rn0".to_string();
+                session::rename_main(&bname, &renamed)?;
+                let (new_name, new_path) = session::socket_for_instance(&id0)
+                    .expect("instance id did not survive a rename — the whole point of it");
+                assert_eq!(new_name, renamed, "id resolved to a stale name");
+                assert_ne!(new_path, bpath, "socket path did not move with the rename");
+                let (_, id_after, _) = session::identify(&new_path).expect("renamed session mute");
+                assert_eq!(id_after, id0, "instance id changed across a rename");
+
+                // A dead id resolves to nothing, so a bridge can refuse instead of serving air.
+                assert!(session::socket_for_instance("deadbeef-0").is_none(),
+                        "an unknown instance id must not resolve");
+                assert!(session::socket_for_instance("").is_none(), "empty id must not resolve");
+
+                // Put the name back so the teardown below still finds it.
+                session::rename_main(&renamed, &bname)?;
+            }
             drop(sub);
             session::kill_main(&bname)?;
             bserver.join().expect("board-test server panicked")?;
@@ -2907,10 +2948,13 @@ fn selfcheck() -> Result<()> {
     );
     {
         let mut app = App::new(None)?;
-        app.session_name = Some("0".into()); // numeric → AI name may apply
+        app.session_name = Some("0".into()); // numeric → a generated name may be SUGGESTED
         app.agent_tx.send(agent::AgentEvent::SessionName { name: "mars-dev".into() })?;
         app.tick();
-        assert_eq!(app.rename_session_to.as_deref(), Some("mars-dev"), "numeric session not renamed");
+        assert!(app.rename_session_to.is_none(), "session renamed without being accepted");
+        assert_eq!(app.session_name_suggestion.as_deref(), Some("mars-dev"), "no suggestion offered");
+        app.run_action(palette::Action::AcceptSessionName);
+        assert_eq!(app.rename_session_to.as_deref(), Some("mars-dev"), "accept did not rename");
         let mut app = App::new(None)?;
         app.session_name = Some("work".into()); // explicit → AI name ignored
         app.agent_tx.send(agent::AgentEvent::SessionName { name: "auto".into() })?;
@@ -3274,7 +3318,63 @@ fn selfcheck() -> Result<()> {
         let before = std::fs::read_to_string(repo.join("index.json"))?;
         assert!(!before.is_empty());
     }
+        // The repo must follow the suite's ISOLATION. A run that isolates its sockets but writes
+        // cards into the user's real ~/.mars/manager is worse than one that isolates nothing —
+        // this suite did exactly that and left a dozen throwaway sessions in a live repo.
+        assert!(manager::repo_dir().is_some_and(|d| d.starts_with(&cfg_dir)),
+                "manager repo escaped the isolated runtime dir: {:?}", manager::repo_dir());
     println!("[selfcheck] manager auto-tick ......... PASS");
+
+    // 29a5. Naming RECOMMENDS, never renames. Auto-applying a generated session name moved the
+    //       session's socket (it is named after the session) out from under the Rover bridge, the
+    //       launchd agent and the manager repo — a helpful rename presenting as an outage.
+    {
+        let mut app = App::new(None)?;
+        app.session_name = Some("0".into());
+        let tab_id = app.tab().id;
+
+        // A generated name arrives → it is a SUGGESTION; nothing is renamed.
+        app.agent_tx.send(agent::AgentEvent::SessionName { name: "sweep-tuning".into() })?;
+        app.agent_tx.send(agent::AgentEvent::AutoName { tab_id, name: "trainer".into() })?;
+        app.tick();
+        assert_eq!(app.session_name.as_deref(), Some("0"), "session was renamed automatically");
+        assert!(app.rename_session_to.is_none(), "a rename was queued without being accepted");
+        assert_eq!(app.session_name_suggestion.as_deref(), Some("sweep-tuning"));
+        assert_eq!(app.tab_name_suggestion.get(&tab_id).map(String::as_str), Some("trainer"));
+        assert!(app.tabs.iter().all(|t| t.name.chars().all(|c| c.is_ascii_digit())),
+                "tab was renamed automatically");
+
+        // …and it is offered at the TOP of the command bar.
+        app.handle_key(kc(KeyCode::Char(' ')))?; // open the bar
+        let rows = app.bar_rows();
+        assert!(rows.len() >= 2, "suggestions not surfaced: {}", rows.len());
+        assert!(rows[0].label.contains("sweep-tuning"), "session suggestion not first: {}", rows[0].label);
+        assert!(rows[1].label.contains("trainer"), "tab suggestion not second: {}", rows[1].label);
+        assert!(matches!(rows[0].kind, palette::ItemKind::Run(palette::Action::AcceptSessionName)));
+
+        // A suggestion must never shoulder aside what the user typed.
+        typ(&mut app, "spl")?;
+        assert!(!app.bar_rows().first().is_some_and(|r| r.label.contains("sweep-tuning")),
+                "suggestion outranked a typed query");
+        app.handle_key(k(KeyCode::Esc))?;
+        app.handle_key(k(KeyCode::Esc))?; // clear the query, then close
+
+        // Accepting is what renames — and it consumes the suggestion.
+        app.run_action(palette::Action::AcceptSessionName);
+        assert_eq!(app.rename_session_to.as_deref(), Some("sweep-tuning"), "accept did not rename");
+        assert!(app.session_name_suggestion.is_none(), "suggestion survived being accepted");
+        app.run_action(palette::Action::AcceptTabName);
+        assert_eq!(app.tab().name, "trainer", "accept did not rename the tab");
+        assert!(app.tab_name_suggestion.is_empty(), "tab suggestion survived");
+
+        // A name the user chose is never second-guessed.
+        let mut app2 = App::new(None)?;
+        app2.session_name = Some("my-session".into());
+        app2.agent_tx.send(agent::AgentEvent::SessionName { name: "guessed".into() })?;
+        app2.tick();
+        assert!(app2.session_name_suggestion.is_none(), "suggested a name over a user's own");
+    }
+    println!("[selfcheck] naming recommends only ... PASS");
 
     // 29b. Cascade: one-tier-up escalation + same-tier rotation targets (pure
     //      logic, no network — the HTTP paths are exercised by the live eval).
