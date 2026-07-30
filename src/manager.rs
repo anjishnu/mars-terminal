@@ -1756,6 +1756,76 @@ pub fn snapshot_main(repo: Option<String>) -> Result<()> {
 // board that happened to change, an elapsed floor, a free lock and an idle pane — five gates
 // between an edit and an observation. Policy stays in `agent_tick`; the mechanism lives here.
 
+/// Ask a RUNNING daemon for each pane's screen and recent log, over the socket it already serves.
+///
+/// The tick reads `app.terms` directly, but `mars manager run` is a separate process and cannot.
+/// Without this the CLI could only ever produce output-less snapshots — so the one command built
+/// for iterating on the agent was the one command that could not feed it. Uses frames the daemon
+/// has spoken since long before today, so it works against whatever is already running: no
+/// restart, and no interrupting a session someone is working in.
+fn pane_output_of(session: &str, panes: &[String]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    let Ok(path) = crate::session::socket_path(session) else { return serde_json::Value::Object(out) };
+    let Ok(stream) = crate::sys::control::connect(&path) else { return serde_json::Value::Object(out) };
+    let Ok(mut w) = stream.try_clone() else { return serde_json::Value::Object(out) };
+    let Ok(read) = stream.try_clone() else { return serde_json::Value::Object(out) };
+    let _ = read.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let mut r = BufReader::new(read);
+    // Screens are pushed to SUBSCRIBERS only, so subscribe before watching — otherwise WatchPane
+    // is accepted and nothing is ever sent back.
+    let _ = crate::session::write_frame(&mut w, &crate::session::ClientFrame::Subscribe);
+
+    for p in panes {
+        let Ok(id) = p.parse::<usize>() else { continue };
+        // Watch briefly to get one screen frame, then the log tail for what scrolled past.
+        let _ = crate::session::write_frame(&mut w, &crate::session::ClientFrame::WatchPane {
+            pane: Some(id), cols: Some(200), rows: Some(60), raw: false,
+        });
+        let _ = crate::session::write_frame(&mut w, &crate::session::ClientFrame::PaneLines {
+            pane: id, from: 0, to: 0,
+        });
+        let (mut tail, mut delta) = (Vec::new(), Vec::new());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut buf = String::new();
+        while std::time::Instant::now() < deadline && (tail.is_empty() || delta.is_empty()) {
+            let _ = r.read_line(&mut buf);
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                match serde_json::from_str::<crate::session::ServerFrame>(line.trim()) {
+                    Ok(crate::session::ServerFrame::PaneScreen { json }) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                            if v["pane"].as_str() == Some(p.as_str()) {
+                                tail = v["text"].as_str().unwrap_or("").lines()
+                                    .map(|l| plain(l.as_bytes()))
+                                    .filter(|l| !l.trim().is_empty())
+                                    .collect::<Vec<_>>();
+                                let n = tail.len().saturating_sub(20);
+                                tail.drain(..n);
+                            }
+                        }
+                    }
+                    Ok(crate::session::ServerFrame::PaneLines { pane, rows, .. }) if pane == id => {
+                        delta = rows.iter().rev().take(200).rev()
+                            .map(|b| plain(b.as_bytes()))
+                            .filter(|l| !l.trim().is_empty())
+                            .collect();
+                        if delta.is_empty() {
+                            delta.push(String::new()); // answered, just nothing in the log
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        delta.retain(|l| !l.is_empty());
+        out.insert(p.clone(), serde_json::json!({ "tail": tail, "delta": delta }));
+    }
+    let _ = crate::session::write_frame(&mut w, &crate::session::ClientFrame::WatchPane {
+        pane: None, cols: None, rows: None, raw: false,
+    });
+    serde_json::Value::Object(out)
+}
+
 /// Snapshot every live session right now, whatever the fingerprint says.
 ///
 /// The tick deliberately writes nothing when nothing changed, which is correct in production and
@@ -1765,7 +1835,9 @@ pub fn force_snapshot(ts: u64) -> Result<usize> {
     let mut n = 0;
     for name in live_session_names() {
         let Some(snap) = board_of(&name) else { continue };
-        emit(&repo, &host_name(), std::slice::from_ref(&snap), ts, 2700, &serde_json::Value::Null)?;
+        let panes: Vec<String> = snap.panes.iter().map(|p| p.pane_id.clone()).collect();
+        let output = pane_output_of(&name, &panes);
+        emit(&repo, &host_name(), std::slice::from_ref(&snap), ts, 2700, &output)?;
         n += 1;
     }
     Ok(n)
@@ -1856,7 +1928,10 @@ pub fn status_report(ts: u64) -> Result<String> {
 /// Strip ANSI so the agent reads text rather than escape codes. Rows arrive formatted because the
 /// same log feeds the phone's scrollback, which does want them.
 pub fn plain(row: &[u8]) -> String {
-    let mut out = String::with_capacity(row.len());
+    // Collect BYTES and decode once at the end. Casting each byte to a char treats UTF-8 as
+    // latin-1, so every box-drawing glyph and arrow in a terminal turns into mojibake — which is
+    // what the agent would then have been asked to read.
+    let mut out: Vec<u8> = Vec::with_capacity(row.len());
     let mut i = 0;
     while i < row.len() {
         if row[i] == 0x1b {
@@ -1870,10 +1945,10 @@ pub fn plain(row: &[u8]) -> String {
             i += 1;
             continue;
         }
-        out.push(row[i] as char);
+        out.push(row[i]);
         i += 1;
     }
-    out.trim_end().to_string()
+    String::from_utf8_lossy(&out).trim_end().to_string()
 }
 
 /// What is worth acting on, pulled out of the text by pattern rather than by judgement.
