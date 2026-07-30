@@ -17,6 +17,7 @@ mod fleet;
 mod health;
 mod layout;
 mod llm_log;
+mod manager;
 mod mode;
 mod osc133;
 mod palette;
@@ -258,6 +259,12 @@ fn main() -> Result<()> {
         }
         // Headless self-check (no TTY needed) — render, bar, PTY, and sessions.
         Some("--selfcheck") => return selfcheck(),
+        // Deterministic manager pass: stimulus + reflex cards + briefing + timeline. No model.
+        Some("snapshot") => {
+            let flags: Vec<String> = args.collect();
+            let repo = flags.iter().position(|a| a == "--repo").and_then(|i| flags.get(i + 1)).cloned();
+            return manager::snapshot_main(repo);
+        }
         // LLM observability: profile the debug log to right-size models per call.
         Some("llm-stats") => {
             let flags: Vec<String> = args.collect();
@@ -3119,6 +3126,105 @@ fn selfcheck() -> Result<()> {
         std::env::remove_var("MARS_LLM_DEBUG"); // back off; the later block enables its own
     }
     println!("[selfcheck] llm log integrity ......... PASS");
+
+    // 29a3. The deterministic manager pass: reflex cards, briefing, timeline, index. No model,
+    //       so every assertion here is about plumbing — which is exactly why this ships before
+    //       any agent does: a bug found here can only be a plumbing bug.
+    {
+        use manager::{PaneRow, SessionSnap};
+        let repo = cfg_dir.join("mgr");
+        let pane = |pane_id: &str, name: &str, verdict: &str, why: &str, age: u64| PaneRow {
+            id: pane_id.into(), pane_id: pane_id.into(), name: name.into(),
+            verdict: verdict.into(), kind: "terminal".into(), why: why.into(),
+            age_secs: age, blocked_prompt: (verdict == "blocked").then(|| why.to_string()),
+        };
+        let snap = |panes: Vec<PaneRow>| vec![SessionSnap {
+            name: "0".into(), health: "up 3h · load 2.1".into(), panes,
+        }];
+
+        // T1 — a blocked pane and a failed pane each produce exactly one card.
+        let s1 = snap(vec![
+            pane("4", "claude", "blocked", "Edit src/session.rs? [y/N]", 20_400),
+            pane("3", "sweep", "failed", "torchrun exited 1", 120),
+            pane("9", "notes", "idle", "", 5),
+        ]);
+        let ev = manager::emit(&repo, "testbox", &s1, 1_000_000)?;
+        assert_eq!(ev.len(), 2, "expected one event per needing-attention pane: {ev:?}");
+        let feed = repo.join("feed");
+        let cards = || -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(&feed).unwrap().flatten()
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .filter(|n| n.starts_with("card-")).collect();
+            v.sort(); v
+        };
+        assert_eq!(cards().len(), 2, "wrong card count: {:?}", cards());
+
+        // The card must be a READABLE document even before it is a parsed one.
+        let blocked_file = cards().into_iter().find(|n| n.contains("blocked")).expect("no blocked card");
+        let body = std::fs::read_to_string(feed.join(&blocked_file))?;
+        let (front, md) = manager::split_front(&body).expect("card has no frontmatter block");
+        assert!(front.contains("severity: block"), "blocked card is not severity block");
+        assert!(front.contains("source: reflex"), "card does not declare its provenance");
+        assert!(front.contains("keys: \"y\\r\""), "blocked card carries no answer action: {front}");
+        assert!(md.contains("Edit src/session.rs?"), "card body lost the prompt: {md}");
+
+        // T2 — the SAME state again must not produce a second card. A pane blocked for six hours
+        //      is one card, not one per tick; duplicate cards are the bug this project keeps
+        //      re-learning one layer down.
+        let ev2 = manager::emit(&repo, "testbox", &s1, 1_000_060)?;
+        assert!(ev2.is_empty(), "re-emitted cards for unchanged state: {ev2:?}");
+        assert_eq!(cards().len(), 2, "duplicate card written: {:?}", cards());
+
+        // T3 — when the world moves on, the card expires. Declarative staleness: nothing
+        //      re-examined the card, the condition simply stopped holding.
+        let s2 = snap(vec![pane("4", "claude", "running", "", 3), pane("3", "sweep", "done", "", 9)]);
+        let ev3 = manager::emit(&repo, "testbox", &s2, 1_000_120)?;
+        assert_eq!(ev3.len(), 2, "expected two resolutions: {ev3:?}");
+        for f in cards() {
+            let t = std::fs::read_to_string(feed.join(&f))?;
+            assert!(t.contains("expired: true"), "{f} did not expire when its pane moved on");
+        }
+
+        // T4 — the index is regenerated from the directory and ranks block above warn.
+        let idx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(feed.join("index.json"))?)?;
+        assert_eq!(idx["cards"].as_array().map(|a| a.len()), Some(2), "index disagrees with disk");
+        // The briefing rides INLINE in the index — Rover reads one file, not N (single fs slot).
+        let brief_inline = idx["briefing"].as_str().unwrap_or_default();
+        assert!(brief_inline.contains("Workspaces"), "briefing body not inlined into the index");
+        let first = idx["cards"][0].as_object().expect("card entry");
+        assert!(first.contains_key("body"), "card body not inlined: {first:?}");
+        let s3 = snap(vec![
+            pane("3", "sweep", "failed", "exited 1", 30),
+            pane("4", "claude", "blocked", "continue? [y/N]", 90),
+        ]);
+        manager::emit(&repo, "testbox", &s3, 1_000_180)?;
+        let idx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(feed.join("index.json"))?)?;
+        let live: Vec<&serde_json::Value> = idx["cards"].as_array().unwrap().iter()
+            .filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
+        assert_eq!(live[0]["severity"], "block", "index does not rank block first: {idx}");
+
+        // T5 — the briefing is markdown a human can read, and says the useful thing first.
+        let brief = std::fs::read_to_string(feed.join("briefing.md"))?;
+        assert!(manager::split_front(&brief).is_some(), "briefing has no frontmatter");
+        assert!(brief.contains("2 need you"), "briefing does not lead with what needs attention: {brief}");
+        assert!(brief.contains("| pane | state | age |"), "briefing lost its per-session table");
+
+        // …and when nothing is wrong it says so, rather than padding.
+        manager::emit(&repo, "testbox", &snap(vec![pane("9", "notes", "idle", "", 5)]), 1_000_240)?;
+        let calm = std::fs::read_to_string(feed.join("briefing.md"))?;
+        assert!(calm.contains("Nothing needs you"), "quiet briefing is not calm: {calm}");
+
+        // T6 — the timeline is append-only, date-ordered and readable with no tooling.
+        let tl = std::fs::read_to_string(repo.join("timeline.md"))?;
+        let stamps: Vec<&str> = tl.lines().filter(|l| l.starts_with("- `"))
+            .filter_map(|l| l.split('`').nth(1)).collect();
+        assert!(stamps.len() >= 4, "timeline too short: {tl}");
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "timeline is not date-ordered: {stamps:?}");
+        assert!(tl.starts_with("# Timeline"), "timeline has no header");
+    }
+    println!("[selfcheck] manager reflex pass ....... PASS");
 
     // 29b. Cascade: one-tier-up escalation + same-tier rotation targets (pure
     //      logic, no network — the HTTP paths are exercised by the live eval).
