@@ -549,6 +549,26 @@ fn strip_markup(text: &str) -> String {
         .join("\n")
 }
 
+/// Join lines the author hard-wrapped, keeping blank lines as paragraph breaks.
+///
+/// The briefing is written into a file, and anything writing prose into a file wraps it at some
+/// column. The phone renders it as prose, where those wraps are meaningless — and they arrive as
+/// real newlines, so a sentence breaks in the middle for no reason the reader can see. A blank
+/// line is a paragraph and is preserved; a single newline is an artifact of the file and is not.
+fn unwrap_prose(text: &str) -> String {
+    text.split("\n\n")
+        .map(|para| {
+            para.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|p: &String| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64, plain_only: bool) -> Option<String> {
     let age = ts.saturating_sub(mtime_secs(path));
     if age > stale_secs {
@@ -573,7 +593,7 @@ fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64, plain_only: bool) -> 
     // Only the briefing must be plain: it renders as markdown on a glance surface, where a
     // stray backtick swallows a line. A workspace note is read deliberately, and its bullets and
     // bolded recommendation are the point.
-    let body = if plain_only { strip_markup(body.trim()) } else { body.trim().to_string() };
+    let body = if plain_only { unwrap_prose(&strip_markup(body.trim())) } else { body.trim().to_string() };
     let body = body.trim();
     (!body.is_empty()).then(|| body.to_string())
 }

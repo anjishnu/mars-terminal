@@ -6372,6 +6372,16 @@ fn selfcheck() -> Result<()> {
             }
             assert!(narrative.contains("cargo test") && narrative.contains("failed"),
                 "stripping markup ate the content: {narrative}");
+
+            // Hard wraps from the file must not survive as line breaks in the prose.
+            std::fs::write(unsigned.join("mission_briefing.md"),
+                "---\nsource: agent\n---\nEvening, captain. The sweep finished at its\nbest accuracy yet.\n\nNothing is blocked.\n")?;
+            let n2 = manager::view(&repo, 7_000_400, 2700)["sessions"].as_array().unwrap()
+                .iter().find(|s| s["name"] == "9")
+                .and_then(|s| s["narrative"].as_str().map(String::from)).unwrap_or_default();
+            assert!(n2.contains("finished at its best accuracy yet"),
+                "a hard wrap survived as a line break: {n2:?}");
+            assert_eq!(n2.matches("\n\n").count(), 1, "paragraph breaks were lost: {n2:?}");
         }
         println!("[selfcheck] manager: provenance comes from receipts, not mtime ... PASS");
 
