@@ -1125,9 +1125,11 @@ pub fn agent_tick(
         return None;
     }
     // Only now do we touch the inbox: no pending snapshots means no turn, whatever the clock says.
-    let batch = compose_batch(&repo, &sessions, ts).ok().flatten()?;
-    let name = batch.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    Some(format!("Warm-up run — process inbox/{name} per AGENTS.md ({reason})"))
+    // Compose the batch, but return only WHY we are waking. The turn's instruction lives in
+    // prompt.md and is read by the shell at delivery — the one thing we most want to iterate on
+    // should not need a recompile, and there is only ever one open batch to find.
+    compose_batch(&repo, &sessions, ts).ok().flatten()?;
+    Some(reason.to_string())
 }
 
 /// Write a file only if it is absent. `AGENTS.md`, `docs/**`, `policy.md` and the memory seeds
@@ -1168,6 +1170,7 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("docs/cards.md"), include_str!("manager_docs/cards.md"))?;
     seed(&repo.join("docs/memos.md"), include_str!("manager_docs/memos.md"))?;
     seed(&repo.join("docs/receipts.md"), include_str!("manager_docs/receipts.md"))?;
+    seed(&repo.join("prompt.md"), include_str!("manager_docs/prompt.md"))?;
     seed(&repo.join("docs/memory.md"), include_str!("manager_docs/memory.md"))?;
     seed(&repo.join("docs/tools.md"), include_str!("manager_docs/tools.md"))?;
     seed(&repo.join("policy.md"), include_str!("manager_docs/policy.md"))?;

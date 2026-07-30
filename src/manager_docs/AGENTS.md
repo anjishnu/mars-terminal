@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 2 -->
+<!-- mars-doc-version: 3 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -19,7 +19,7 @@ rather than as six disconnected wake-ups.
 
 ## Each run
 
-You are woken with a line naming the batch. Work it in this order, and **write each file as you
+You are woken with the contents of `prompt.md`, which is edited freely and may change between runs; find the batch by listing `inbox/`. Work it in this order, and **write each file as you
 finish it** rather than composing everything and dumping it at the end — a run that dies halfway
 should leave real work behind, not nothing.
 

@@ -6089,6 +6089,98 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] mouse: drag to resize ... PASS");
     }
 
+    // ── Run scoring: the agent's ACCOUNT versus the filesystem ──────────────────────────
+    // The design deliberately does not assert "these files exist" — a rule that demands a file
+    // per workspace reliably produces one per workspace, including the unchanged ones. It audits
+    // the receipt instead, so this checks the three faults that audit can raise.
+    {
+        let repo = manager::repo_dir().expect("no manager repo");
+        let sdir = manager::session_dir("0", "testbox", 7_000_000).expect("no session dir");
+        std::fs::create_dir_all(repo.join("inbox/done"))?;
+        std::fs::create_dir_all(repo.join("runs"))?;
+        std::fs::create_dir_all(&sdir)?;
+
+        let score = |batch: &str, receipt: serde_json::Value, opened: u64, wrote_briefing: bool| -> serde_json::Value {
+            let _ = std::fs::remove_file(repo.join("memory/runs.jsonl"));
+            std::fs::write(repo.join("inbox/done").join(batch), serde_json::json!({
+                "opened_ts": opened,
+                "sessions": [{ "id": "0", "name": "0", "dir": sdir.display().to_string(),
+                               "snapshots": ["a.json", "b.json"] }],
+            }).to_string()).unwrap();
+            std::fs::write(repo.join("runs").join(batch), receipt.to_string()).unwrap();
+            if wrote_briefing {
+                std::fs::write(sdir.join("mission_briefing.md"), "quiet\n").unwrap();
+            } else {
+                let _ = std::fs::remove_file(sdir.join("mission_briefing.md"));
+            }
+            // emit -> write_index -> score_runs
+            manager::emit(&repo, "testbox", &[], 7_000_100, 2700).expect("emit");
+            // Select by batch NAME, never by position: clearing runs.jsonl makes score_runs
+            // re-score every batch still sitting in done/, and the last line is then whichever
+            // sorts last — not the one this call added.
+            let log = std::fs::read_to_string(repo.join("memory/runs.jsonl")).unwrap_or_default();
+            log.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .find(|v| v["batch"].as_str() == Some(batch))
+                .unwrap_or_else(|| serde_json::json!({}))
+        };
+        let kinds = |v: &serde_json::Value| -> Vec<String> {
+            v["faults"].as_array().map(|a| a.iter()
+                .filter_map(|f| f["kind"].as_str().map(String::from)).collect()).unwrap_or_default()
+        };
+
+        // A clean run: one real file, and the other session work explicitly skipped WITH a reason.
+        let brief = sdir.join("mission_briefing.md").display().to_string();
+        let ok = score("batch-ok.json", serde_json::json!({
+            "wrote": [brief], "skipped": [], "cursor": { "0": "b.json" },
+        }), 7_000_000, true);
+        assert!(ok["ok"].as_bool().unwrap_or(false), "a clean run scored as a fault: {ok}");
+
+        // Claimed a file it never wrote — the run that reports success and did nothing.
+        let lying = score("batch-lie.json", serde_json::json!({
+            "wrote": [sdir.join("never-written.md").display().to_string()],
+            "skipped": [], "cursor": { "0": "b.json" },
+        }), 7_000_000, false);
+        assert!(kinds(&lying).iter().any(|k| k == "claimed-not-written"),
+            "a file claimed but never written did not raise a fault: {lying}");
+
+        // Silence: neither written about nor skipped with a reason.
+        let silent = score("batch-silent.json", serde_json::json!({
+            "wrote": [], "skipped": [], "cursor": { "0": "b.json" },
+        }), 7_000_000, false);
+        assert!(kinds(&silent).iter().any(|k| k == "unaccounted"),
+            "an unaccounted session did not raise a fault: {silent}");
+
+        // A REASONED skip is a clean outcome — this is the whole point of the design.
+        let skipped = score("batch-skip.json", serde_json::json!({
+            "wrote": [], "skipped": [{"session": "0", "why": "nothing moved"}],
+            "cursor": { "0": "b.json" },
+        }), 7_000_000, false);
+        assert!(skipped["ok"].as_bool().unwrap_or(false),
+            "a reasoned skip was scored as a failure — writing nothing must stay a success: {skipped}");
+
+        // Cursor past what the batch offered: marking snapshots read that nobody read.
+        let overrun = score("batch-overrun.json", serde_json::json!({
+            "wrote": [brief], "skipped": [], "cursor": { "0": "z.json" },
+        }), 7_000_000, true);
+        assert!(kinds(&overrun).iter().any(|k| k == "cursor-overrun"),
+            "a cursor past the batch did not raise a fault: {overrun}");
+
+        // No receipt at all.
+        let _ = std::fs::remove_file(repo.join("runs/batch-none.json"));
+        std::fs::write(repo.join("inbox/done/batch-none.json"), serde_json::json!({
+            "opened_ts": 7_000_000u64,
+            "sessions": [{ "id": "0", "name": "0", "dir": sdir.display().to_string(),
+                           "snapshots": ["a.json"] }],
+        }).to_string())?;
+        let _ = std::fs::remove_file(repo.join("memory/runs.jsonl"));
+        manager::emit(&repo, "testbox", &[], 7_000_200, 2700)?;
+        let log = std::fs::read_to_string(repo.join("memory/runs.jsonl")).unwrap_or_default();
+        assert!(log.contains("no-receipt"), "a run with no receipt scored clean: {log}");
+
+        println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
+    }
+
     // ── The manager's hidden tab ────────────────────────────────────────────────────────
     // Driven by flipping `hidden` directly rather than by calling `manager_pane()`: that spawns
     // a real PTY and types `claude` into it, which a headless check must not do. What needs

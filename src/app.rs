@@ -5167,11 +5167,19 @@ impl App {
         // its trust prompt and its turn state all detected from the outside; a shell is idle at a
         // prompt and runs what it is given. The agent's memory lives on disk by design, so
         // nothing is lost by each turn being a fresh process.
+        //
+        // The instruction comes from prompt.md, read by the SHELL at delivery. That is the whole
+        // point: the one thing we most want to iterate on is then editable in place — change the
+        // file, drop memory/last_run, and the next turn uses it with no rebuild. The `||` arm
+        // means a deleted prompt.md degrades to a working turn rather than an empty one.
+        let prompt_file = crate::manager::repo_dir()
+            .map(|r| r.join("prompt.md").to_string_lossy().to_string())
+            .unwrap_or_default();
         let cmd = format!(
-            "{} -p '{}'",
-            self.tuning.manager_agent_command,
-            line.replace('\'', "")
+            "{} -p \"$(cat {} 2>/dev/null || echo 'Warm-up run — process the open batch in inbox/ per AGENTS.md')\"",
+            self.tuning.manager_agent_command, prompt_file,
         );
+        self.status_msg = Some(format!("Manager: turn delivered ({line})"));
         if let Some(t) = self.terms.get_mut(&tid) {
             t.send_bytes(cmd.as_bytes());
             t.send_bytes(b"\r");
