@@ -1,33 +1,35 @@
 # Layout
 
 ```
-~/.mars/manager/
-├── AGENTS.md                    how to be the manager (start here)
-├── docs/                        this guide
-│   ├── layout.md                you are here
-│   ├── cards.md                 the output format
-│   ├── memory.md                what to remember, and where
-│   └── tools.md                 how to look at the world
-├── policy.md                    autonomy grants — HUMAN-EDITED ONLY
+~/.mars/
+├── manager/                     THE REPO — guide, memory, aggregate index
+│   ├── AGENTS.md                how to be the manager (start here)
+│   ├── docs/                    this guide
+│   ├── policy.md                autonomy grants — HUMAN-EDITED ONLY
+│   ├── index.md                 status of everything, human-readable   <- generated
+│   ├── index.json               the same, for Rover — one read         <- generated
+│   ├── timeline.md              append-only event log, oldest first    <- generated
+│   ├── inbox/                   stimuli waiting to be processed
+│   └── memory/                  YOURS. Nothing else writes here.
+│       ├── beliefs.md           working memory, <=200 lines, REWRITTEN
+│       ├── projects.md          what each project is
+│       └── cursor.json          how far you have read, per workspace
 │
-├── index.md                     status of everything, human-readable   ← generated
-├── index.json                   the same, for Rover — one read         ← generated
-├── timeline.md                  append-only event log, oldest first    ← generated
-│
-├── inbox/                       stimuli waiting to be processed
-│   └── done/                    processed, kept briefly
-│
-├── sessions/<name>/
-│   ├── mission_briefing.md      this session's summary                 ← generated
-│   ├── cards/                   YOUR output for this session
-│   │   └── card-*.md
-│   └── snapshots/               raw stimuli, gitignored                ← generated
-│
-└── memory/                      YOURS. Nothing else writes here.
-    ├── beliefs.md               working memory, ≤200 lines, REWRITTEN
-    ├── projects.md              what each project is
-    └── cursor.json              how far you have read, per workspace
+└── sessions/<session-id>/       ONE DIRECTORY PER SESSION
+    ├── meta.json                id, CURRENT name, instance_id, timestamps
+    ├── mission_briefing.md      this session's summary                 <- generated
+    ├── workspaces/<pane>.md     one document per workspace             <- generated
+    ├── cards/card-*.md          YOUR output for this session
+    ├── snapshots/               raw stimuli, pruned                    <- generated
+    └── timeline.md              this session's events                  <- generated
 ```
+
+## Why the directory is an id, not a name
+
+A session can be renamed. The directory is keyed by an immutable **id** and the current name lives
+in `meta.json`, so a rename rewrites one field. Keying directories by name meant four renames of one
+daemon produced four directories — a real repo reached 118 of them, nearly all phantoms of the same
+session. **Resolve a session by reading `meta.json`, never by trusting a directory name.**
 
 ## The hierarchy
 

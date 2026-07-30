@@ -3194,7 +3194,9 @@ fn selfcheck() -> Result<()> {
         ]);
         let ev = manager::emit(&repo, "testbox", &s1, 1_000_000)?;
         assert_eq!(ev.len(), 2, "expected one event per needing-attention pane: {ev:?}");
-        let feed = repo.join("sessions").join("0").join("cards");
+        // Session artifacts are id-keyed under sessions_root(), not under the manager repo.
+        let sdir = manager::session_dir("0", "testbox", 1_000_000).expect("no session dir");
+        let feed = sdir.join("cards");
         let cards = || -> Vec<String> {
             let mut v: Vec<String> = std::fs::read_dir(&feed).unwrap().flatten()
                 .filter_map(|e| e.file_name().to_str().map(String::from))
@@ -3250,7 +3252,7 @@ fn selfcheck() -> Result<()> {
         assert_eq!(live[0]["severity"], "block", "index does not rank block first: {idx}");
 
         // T5 — session → workspaces → summary, as markdown a human can read.
-        let bpath = repo.join("sessions").join("0").join("mission_briefing.md");
+        let bpath = sdir.join("mission_briefing.md");
         let brief = std::fs::read_to_string(&bpath)?;
         assert!(brief.contains("2 need you"), "briefing does not lead with what needs attention: {brief}");
         assert!(brief.contains("| workspace | state | age |"), "briefing lost its workspace table");
@@ -3272,11 +3274,19 @@ fn selfcheck() -> Result<()> {
                    "memory/ was clobbered — the AGENT owns it");
         // The human-readable status index exists and points into the hierarchy.
         let status = std::fs::read_to_string(repo.join("index.md"))?;
-        assert!(status.contains("sessions/0/mission_briefing.md"), "index.md does not link the tree: {status}");
+        assert!(status.contains("**0**"), "index.md does not list the session: {status}");
 
         // T6 — the timeline is append-only, date-ordered and readable with no tooling.
         let tl = std::fs::read_to_string(repo.join("timeline.md"))?;
-        assert!(repo.join("sessions/0/timeline.md").exists(), "no per-session timeline");
+        assert!(sdir.join("timeline.md").exists(), "no per-session timeline");
+        // meta.json is the indirection that makes a rename cheap: the id is the directory, the
+        // name is data.
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(sdir.join("meta.json"))?)?;
+        assert_eq!(meta["name"], "0", "meta.json lost the session name");
+        assert!(meta["id"].as_str().is_some_and(|i| !i.is_empty()), "no session id minted");
+        assert!(manager::sessions_root().is_some_and(|r| r.starts_with(&cfg_dir)),
+                "sessions root escaped the isolated runtime dir");
         let stamps: Vec<&str> = tl.lines().filter(|l| l.starts_with("- `"))
             .filter_map(|l| l.split('`').nth(1)).collect();
         assert!(stamps.len() >= 4, "timeline too short: {tl}");
@@ -3299,7 +3309,7 @@ fn selfcheck() -> Result<()> {
         for i in 0..4u64 {
             manager::tick_session(&repo, "testbox", &board, 2_000_000 + i * 60, 2)?;
         }
-        let sdir = repo.join("sessions").join("auto");
+        let sdir = manager::session_dir("auto", "testbox", 2_000_000).expect("no session dir");
         assert!(sdir.join("mission_briefing.md").exists(), "daemon tick wrote no briefing");
         assert!(repo.join("index.json").exists(), "daemon tick wrote no index");
         assert!(repo.join("AGENTS.md").exists(), "daemon tick did not scaffold the guide");
@@ -3323,6 +3333,29 @@ fn selfcheck() -> Result<()> {
         // this suite did exactly that and left a dozen throwaway sessions in a live repo.
         assert!(manager::repo_dir().is_some_and(|d| d.starts_with(&cfg_dir)),
                 "manager repo escaped the isolated runtime dir: {:?}", manager::repo_dir());
+        // A RENAME must not fork a directory. This is the entire reason the tree is id-keyed:
+        // four renames of one daemon previously produced four session directories, and a real
+        // repo ended up with 118 of them.
+        {
+            let a = manager::session_dir("renametest", "testbox", 3_000_000).expect("dir");
+            let before = std::fs::read_dir(manager::sessions_root().unwrap())?.flatten().count();
+            // Same session, new name — as the daemon reports it after a rename.
+            std::fs::write(
+                a.join("meta.json"),
+                serde_json::to_string(&serde_json::json!({
+                    "id": a.file_name().unwrap().to_str().unwrap(),
+                    "name": "renamed-later", "instance_id": "testbox",
+                    "created_ts": 3_000_000u64,
+                }))?,
+            )?;
+            let b = manager::session_dir("renamed-later", "testbox", 3_000_060).expect("dir");
+            assert_eq!(a, b, "a rename forked a new session directory");
+            let after = std::fs::read_dir(manager::sessions_root().unwrap())?.flatten().count();
+            assert_eq!(before, after, "session directory count grew across a rename");
+            let meta: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(a.join("meta.json"))?)?;
+            assert_eq!(meta["name"], "renamed-later", "meta.json did not follow the rename");
+        }
     println!("[selfcheck] manager auto-tick ......... PASS");
 
     // 29a5. Naming RECOMMENDS, never renames. Auto-applying a generated session name moved the
