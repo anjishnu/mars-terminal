@@ -35,6 +35,7 @@ pub enum Action {
     // files / buffers
     Save,
     ToggleFileTree,
+    ManagerPane,
     ToggleMarkdown,
     /// Toggle code syntax highlighting for this session (off by default).
     ToggleSyntaxHighlight,
@@ -128,6 +129,7 @@ impl Action {
             Action::TabMode            => "space warp (tabs/panes)",
             Action::Save               => "save",
             Action::ToggleFileTree     => "navigator (browse & jump to files)",
+            Action::ManagerPane        => "manager agent pane",
             Action::ToggleMarkdown     => "markdown view",
             Action::ToggleSyntaxHighlight => "syntax highlighting",
             Action::RefreshIndex       => "refresh file index",
@@ -258,6 +260,7 @@ fn root_menu() -> Vec<MenuItem> {
     vec![
         MenuItem::run_desc("Save",          Action::Save,           "Save the current buffer"),
         MenuItem::run_desc("Navigator — browse & jump to files", Action::ToggleFileTree, "Open the file sidebar; type to filter, Enter to jump (also @)"),
+        MenuItem::run_desc("Manager — the agent that writes your feed", Action::ManagerPane, "Reveal the hidden pane where the manager agent runs; read what it decided and why"),
         MenuItem::run_desc("Markdown view", Action::ToggleMarkdown, "Toggle a richly-rendered read-only view of this Markdown buffer"),
         MenuItem::run_desc("Syntax highlighting", Action::ToggleSyntaxHighlight, "Toggle code coloring for the focused buffer — off by default; follows the active theme"),
         MenuItem::run_desc("Search",        Action::Search,       "Incremental search in this buffer"),

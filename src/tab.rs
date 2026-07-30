@@ -13,6 +13,11 @@ pub struct Tab {
     /// exploring swaps the file in place instead of piling up tabs. The first edit
     /// pins it (`preview = false`) so the next click starts a fresh preview.
     pub preview: bool,
+    /// Absent from the tab bar and skipped by next/prev rotation. The manager agent lives in one:
+    /// it should cost the engineer neither a keystroke nor a glance, but it is a real pane rather
+    /// than a headless process, because when the feed says something wrong the first question is
+    /// *why did it think that* — and a visible pane answers that by scrolling up.
+    pub hidden: bool,
 }
 
 impl Tab {
@@ -24,6 +29,7 @@ impl Tab {
             focused_pane: root_pane,
             zoomed: None,
             preview: false,
+            hidden: false,
         }
     }
 }

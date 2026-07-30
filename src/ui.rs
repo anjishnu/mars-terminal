@@ -330,6 +330,12 @@ fn render_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
     // Running x so each tab can register the cells it actually occupies.
     let mut x = area.x;
     for (i, tab) in app.tabs.iter().enumerate() {
+        // A hidden tab (the manager agent) claims no cells and registers no hit — it must cost
+        // the engineer nothing to look at. `i` still indexes `app.tabs`, so the hit targets of
+        // the tabs after it stay correct.
+        if tab.hidden {
+            continue;
+        }
         // Every tab: a status BUBBLE in the same position (colored by the worst-pane
         // verdict; grey = idle) then the name. Consistent shape + position, colour the
         // only varying dimension.

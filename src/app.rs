@@ -406,6 +406,8 @@ pub struct App {
     pub panes: HashMap<PaneId, Pane>,
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
+    /// The hidden tab the manager agent runs in, once it has been started.
+    pub manager_tab: Option<TabId>,
     pub mode: Mode,
     pub palette: Option<Palette>,
     pub status_msg: Option<String>,
@@ -676,6 +678,7 @@ impl App {
             panes: HashMap::new(),
             tabs: vec![],
             active_tab: 0,
+            manager_tab: None,
             mode: Mode::Edit,
             palette: None,
             status_msg: None,
@@ -994,6 +997,12 @@ impl App {
         let now = self.frame_tick;
         let mut ranked: Vec<(u8, usize, PaletteRow)> = Vec::new();
         for (ti, tab) in self.tabs.iter().enumerate() {
+            // The manager's hidden tab is not a workspace. It must not reach the command bar or
+            // the phone's board — the agent watching the board is not a thing on the board, and
+            // listing it would also feed its own output back to it as a workspace to summarise.
+            if tab.hidden {
+                continue;
+            }
             // The informative workspace name (falls back to a numbered terminal /
             // filename for unnamed or numeric tabs), so it reads "terminal 2" /
             // "main.rs", never a bare "1".
@@ -2676,19 +2685,28 @@ impl App {
         }
     }
 
+    /// Rotate to the next visible tab. Hidden tabs (the manager) are skipped, so revealing one is
+    /// always a deliberate act and never something you land on by cycling. Falls back to plain
+    /// rotation if every tab is hidden, which cannot happen but would otherwise spin forever.
     pub fn next_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active_tab = (self.active_tab + 1) % self.tabs.len();
-        }
+        self.rotate_tab(1);
     }
 
     pub fn prev_tab(&mut self) {
-        if !self.tabs.is_empty() {
-            self.active_tab = if self.active_tab == 0 {
-                self.tabs.len() - 1
-            } else {
-                self.active_tab - 1
-            };
+        self.rotate_tab(-1);
+    }
+
+    fn rotate_tab(&mut self, delta: i32) {
+        let n = self.tabs.len();
+        if n == 0 {
+            return;
+        }
+        for step in 1..=n {
+            let i = (self.active_tab as i32 + delta * step as i32).rem_euclid(n as i32) as usize;
+            if !self.tabs[i].hidden {
+                self.active_tab = i;
+                return;
+            }
         }
     }
 
@@ -4891,6 +4909,7 @@ impl App {
             Action::TabMode            => self.mode = Mode::Tab,
             Action::Save               => self.do_save(),
             Action::ToggleFileTree     => self.toggle_file_tree(),
+            Action::ManagerPane        => self.manager_pane(),
             Action::ToggleMarkdown     => self.toggle_markdown(),
             Action::ToggleSyntaxHighlight => self.toggle_syntax_highlight(),
             Action::SetTheme(name)     => self.set_theme_live(&name),
@@ -5105,6 +5124,62 @@ impl App {
             Err(e) => {
                 self.status_msg = Some(format!("Terminal failed: {}", e));
             }
+        }
+    }
+
+    /// Reveal the manager agent's pane, creating it on first use. It is a hidden tab holding one
+    /// terminal whose cwd is the manager repo — where `AGENTS.md` already is, so the agent reads
+    /// its own contract on entry with nothing passed on the command line.
+    ///
+    /// The shell is spawned and `claude` typed into it rather than exec'd directly: if the agent
+    /// exits, the pane is still a usable shell in the right directory instead of a dead tab.
+    pub fn manager_pane(&mut self) {
+        if let Some(i) = self.tabs.iter().position(|t| Some(t.id) == self.manager_tab) {
+            self.active_tab = i;
+            self.mode = self.mode_for_focused_pane();
+            self.status_msg = Some("Manager — the agent that writes your feed".into());
+            return;
+        }
+        let Some(repo) = crate::manager::repo_dir() else {
+            self.status_msg = Some("Manager unavailable: no manager repo".into());
+            return;
+        };
+        let id = self.next_term_id;
+        self.next_term_id += 1;
+        match terminal::spawn(
+            id,
+            self.tuning.terminal_default_rows,
+            self.tuning.terminal_default_cols,
+            self.tuning.terminal_scrollback_lines,
+            self.tuning.terminal_line_log_bytes,
+            Some(repo),
+            self.session_name.as_deref(),
+            self.session_instance_id.as_deref(),
+            std::time::Duration::from_millis(self.tuning.terminal_startup_probe_ms),
+            self.term_tx.clone(),
+        ) {
+            Ok(term) => {
+                self.terms.insert(id, term);
+                let buf_id = self.new_scratch();
+                let pane_id = self.alloc_pane(buf_id);
+                if let Some(p) = self.panes.get_mut(&pane_id) {
+                    p.content = PaneContent::Terminal(id);
+                }
+                let tab_id = self.alloc_tab_id();
+                let mut tab = Tab::new(tab_id, "manager".into(), pane_id);
+                tab.hidden = true;
+                self.tabs.push(tab);
+                self.manager_tab = Some(tab_id);
+                self.active_tab = self.tabs.len() - 1;
+                self.mode = Mode::Terminal;
+                // The PTY buffers input until the shell reads it, so typing straight after
+                // spawn is safe; if it ever misses, the pane is still a shell in the right dir.
+                if let Some(t) = self.terms.get_mut(&id) {
+                    t.send_bytes(b"claude\r");
+                }
+                self.status_msg = Some("Manager started — Ctrl+g back to editor".into());
+            }
+            Err(e) => self.status_msg = Some(format!("Manager failed: {e}")),
         }
     }
 

@@ -6084,6 +6084,57 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] mouse: drag to resize ... PASS");
     }
 
+    // ── The manager's hidden tab ────────────────────────────────────────────────────────
+    // Driven by flipping `hidden` directly rather than by calling `manager_pane()`: that spawns
+    // a real PTY and types `claude` into it, which a headless check must not do. What needs
+    // proving is the containment — that a hidden tab is invisible to rotation, to the command
+    // bar, and to the phone.
+    {
+        let mut app = App::new(None)?;
+        app.new_tab();
+        app.new_tab();
+        assert_eq!(app.tabs.len(), 3, "expected three tabs to start");
+        let visible_rows = app.bar_workspace_rows().len();
+
+        // Hide the last one, as `manager_pane()` does.
+        let hidden_id = app.tabs[2].id;
+        app.tabs[2].hidden = true;
+        // Name it as `manager_pane()` does, or the board assertion below is vacuous — a tab
+        // called "3" is absent from the board whether the guard is there or not.
+        app.tabs[2].name = "manager".into();
+        app.manager_tab = Some(hidden_id);
+
+        // Rotation must never land on it, from either direction or any starting point.
+        for start in 0..2 {
+            app.active_tab = start;
+            for _ in 0..6 {
+                app.next_tab();
+                assert!(!app.tabs[app.active_tab].hidden, "next_tab landed on the hidden tab");
+            }
+            app.active_tab = start;
+            for _ in 0..6 {
+                app.prev_tab();
+                assert!(!app.tabs[app.active_tab].hidden, "prev_tab landed on the hidden tab");
+            }
+        }
+
+        // It is not a workspace: absent from the command bar and from the board the phone reads.
+        assert_eq!(app.bar_workspace_rows().len(), visible_rows - 1,
+            "the hidden tab still shows up as a workspace row");
+        let board = app.mobile_board_json();
+        assert!(!board.contains("manager"),
+            "the hidden manager tab leaked into the phone's board: {board}");
+
+        // …and it claims no cells in the tab bar.
+        let mut term = Terminal::new(TestBackend::new(80, 24))?;
+        app.active_tab = 0;
+        term.draw(|f| ui::render(f, &mut app))?;
+        let bar_hits = app.hits.borrow().iter().filter(|h| matches!(&h.target,
+            app::HitTarget::Row(app::RowKind::Tab, _))).count();
+        assert_eq!(bar_hits, 2, "the hidden tab registered a clickable tab-bar chip");
+        println!("[selfcheck] manager: hidden tab is invisible to rotation, bar and board ... PASS");
+    }
+
     let _ = std::fs::remove_file(&worklog_default);
     std::env::remove_var("MARS_WORKLOG");
 
