@@ -421,6 +421,27 @@ fn write_index(
     sessions: &[SessionSnap],
     ts: u64,
 ) -> Result<()> {
+    // Scan the TREE, not just the sessions this process just wrote: each session's daemon owns
+    // its own subtree, so an index built from one process's view would omit the others. The
+    // directory is the truth; this is a cache of it.
+    let mut names: Vec<String> = std::fs::read_dir(repo.join("sessions"))
+        .map(|rd| rd.flatten().filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().to_str().map(String::from)).collect())
+        .unwrap_or_default();
+    names.sort();
+    let mut all: Vec<(String, String)> = names
+        .into_iter()
+        .map(|n| {
+            let b = briefs.iter().find(|(bn, _)| *bn == n).map(|(_, b)| b.clone()).or_else(|| {
+                std::fs::read_to_string(repo.join("sessions").join(&n).join("mission_briefing.md")).ok()
+            });
+            (n, b.unwrap_or_default())
+        })
+        .collect();
+    if all.is_empty() {
+        all = briefs.to_vec();
+    }
+    let briefs: &[(String, String)] = &all;
     let mut cards: Vec<serde_json::Value> = Vec::new();
     for (name, _) in briefs {
         let dir = repo.join("sessions").join(name).join("cards");
@@ -456,7 +477,13 @@ fn write_index(
             serde_json::json!({
                 "name": n,
                 "briefing": b,
-                "narrative": snap.map(session_narrative).unwrap_or_default(),
+                "narrative": snap.map(session_narrative).unwrap_or_else(|| {
+                    // A session another daemon owns: reuse the prose already in its briefing
+                    // rather than inventing a second source of truth.
+                    b.lines().find(|l| l.contains("need") || l.contains("Nothing needs"))
+                        .map(|l| l.replace("**", "").trim().to_string())
+                        .unwrap_or_default()
+                }),
                 "path": format!("sessions/{n}/mission_briefing.md"),
                 "workspaces": snap.map(|s| s.panes.iter().map(|p| serde_json::json!({
                     "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
@@ -466,7 +493,12 @@ fn write_index(
         }).collect::<Vec<_>>(),
         "cards": cards,
     });
-    std::fs::write(repo.join("index.json"), serde_json::to_string_pretty(&index)?)?;
+    // Temp + rename: atomic on POSIX, so a reader never sees half an index even when two
+    // daemons refresh it in the same instant. Last writer wins, and both are correct because
+    // the index is derived from the tree.
+    let tmp = repo.join("index.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&index)?)?;
+    std::fs::rename(&tmp, repo.join("index.json"))?;
 
     // …and the same thing as a document, because a human should be able to read the status of
     // everything without a JSON viewer. This is the file to open first.
@@ -686,6 +718,43 @@ fn host_name() -> String {
 #[cfg(not(feature = "ssh"))]
 fn host_name() -> String {
     "local".into()
+}
+
+
+/// Write ONE session's subtree, from the daemon's own state. Called on a timer by the session
+/// daemon, so cards exist before anyone looks — the point of an ambient layer is that nobody has
+/// to ask for it.
+///
+/// The daemon that owns a session is the only process that writes `sessions/<name>/`, so the
+/// "one writer per path" rule is enforced by process boundaries rather than by convention.
+pub fn tick_session(repo: &Path, origin: &str, board_json: &str, ts: u64, keep: usize) -> Result<()> {
+    let Some(snap) = parse_board(board_json) else { return Ok(()) };
+    if snap.name.is_empty() {
+        return Ok(());
+    }
+    scaffold_docs(repo)?;
+    emit(repo, origin, std::slice::from_ref(&snap), ts)?;
+    prune_snapshots(&repo.join("sessions").join(&snap.name).join("snapshots"), keep)?;
+    Ok(())
+}
+
+/// Keep the newest `keep` stimuli per session. Written every tick forever otherwise, and a
+/// directory that only grows is a directory someone eventually has to explain.
+fn prune_snapshots(dir: &Path, keep: usize) -> Result<()> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Ok(()) };
+    let mut files: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+        .collect();
+    if files.len() <= keep {
+        return Ok(());
+    }
+    files.sort(); // ISO names sort chronologically
+    for p in files.iter().take(files.len() - keep) {
+        let _ = std::fs::remove_file(p);
+    }
+    Ok(())
 }
 
 /// CLI: `mars snapshot [--repo DIR]`.

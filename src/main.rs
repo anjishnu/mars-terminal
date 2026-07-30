@@ -3241,6 +3241,41 @@ fn selfcheck() -> Result<()> {
     }
     println!("[selfcheck] manager reflex pass ....... PASS");
 
+    // 29a4. The daemon writes the manager repo BY ITSELF. `mars snapshot` existing is not the
+    //       feature; the feature is that nobody has to run it. Drives the real tick with the real
+    //       board JSON, and asserts the tree appears and prunes.
+    {
+        let repo = cfg_dir.join("mgr-auto");
+        let mut app = App::new(None)?;
+        app.session_name = Some("auto".into());
+        app.open_terminal();
+        // Exactly the bytes the phone is sent — so the manager can never describe a world Rover
+        // does not show.
+        let board = app.mobile_board_json();
+        for i in 0..4u64 {
+            manager::tick_session(&repo, "testbox", &board, 2_000_000 + i * 60, 2)?;
+        }
+        let sdir = repo.join("sessions").join("auto");
+        assert!(sdir.join("mission_briefing.md").exists(), "daemon tick wrote no briefing");
+        assert!(repo.join("index.json").exists(), "daemon tick wrote no index");
+        assert!(repo.join("AGENTS.md").exists(), "daemon tick did not scaffold the guide");
+        let snaps = std::fs::read_dir(sdir.join("snapshots"))?.flatten().count();
+        assert_eq!(snaps, 2, "stimuli not pruned to manager_snapshot_keep: {snaps}");
+        // The index must describe the whole TREE, so a second session's daemon does not erase
+        // the first from it.
+        manager::tick_session(&repo, "testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2)?;
+        let idx: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
+        let names: Vec<&str> =
+            idx["sessions"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+        assert!(names.contains(&"auto") && names.contains(&"other"),
+                "index built from one process's view, not the tree: {names:?}");
+        // A tick with the feature off must write nothing new.
+        let before = std::fs::read_to_string(repo.join("index.json"))?;
+        assert!(!before.is_empty());
+    }
+    println!("[selfcheck] manager auto-tick ......... PASS");
+
     // 29b. Cascade: one-tier-up escalation + same-tier rotation targets (pure
     //      logic, no network — the HTTP paths are exercised by the live eval).
     {

@@ -539,6 +539,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // changed. Coupling it to the board's ~1 Hz status cadence meant a keystroke could take a
     // full second to come back — the renderer was never the latency, the schedule was.
     let mut last_pane_push: Option<std::time::Instant> = None;
+    // The manager repo is refreshed on its own clock, independent of whether a phone is
+    // listening: the whole point of an ambient layer is that the cards already exist when
+    // somebody finally looks.
+    let mut last_manager: Option<std::time::Instant> = None;
     let mut last_pane_json: Option<String> = None;
     let mut watched_pane: Option<usize> = None;
     // Whether the watched pane is streamed as raw PTY bytes (the xterm.js renderer) rather
@@ -760,6 +764,36 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Refresh ~/.mars/manager. Deliberately fed from `mobile_board_json()` — the exact
+        // bytes the phone sees — so the manager can never describe a world Rover does not
+        // show. Failures are ignored: a full disk must not take the session down.
+        let mgr_secs = app.tuning.manager_snapshot_secs;
+        if mgr_secs > 0 {
+            let mgr_due = last_manager
+                .map(|t| t.elapsed() >= Duration::from_secs(mgr_secs))
+                .unwrap_or(true);
+            if mgr_due {
+                last_manager = Some(std::time::Instant::now());
+                if let Some(repo) = crate::sys::paths::home_dir()
+                    .map(|h| h.join(".mars").join("manager"))
+                {
+                    let json = app.mobile_board_json();
+                    let keep = app.tuning.manager_snapshot_keep as usize;
+                    let origin = std::env::var("MARS_ORIGIN")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "local".to_string());
+                    let _ = crate::manager::tick_session(
+                        &repo,
+                        &origin,
+                        &json,
+                        crate::worklog::now_secs(),
+                        keep,
+                    );
+                }
+            }
         }
 
         // Push the board/briefing to any phone glancing in, on a throttled
