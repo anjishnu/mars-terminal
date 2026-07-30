@@ -100,6 +100,12 @@ pub struct OpenCard {
     pub kind: String,
     pub severity: String,
     pub headline: String,
+    /// Stable, meaningful name. `(session, title)` is a memo's identity — a memo often outlives
+    /// the pane that prompted it, which is precisely why it is a memo and not a workspace row.
+    pub title: String,
+    /// 0–100, what should be READ first. Not the same as severity: a block they already know
+    /// about ranks below a warning they have never seen.
+    pub priority: u32,
     pub created: u64,
     pub expired: bool,
 }
@@ -124,12 +130,14 @@ fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
     let mut out = Vec::new();
     for e in rd.flatten() {
         let p = e.path();
-        let is_card = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            n.starts_with("card-") && n.ends_with(".md")
-        });
+        // Any .md in the directory is a memo. The agent names files after their title, so an
+        // allowlist of prefixes would silently drop everything it writes.
+        let is_card = p.file_name().and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".md") && !n.starts_with('.'));
         if !is_card {
             continue;
         }
+        let stem = p.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
         let Some((front, _)) = split_front(&text) else { continue };
         out.push(OpenCard {
@@ -140,6 +148,20 @@ fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
             kind: front_field(front, "kind").unwrap_or_default(),
             severity: front_field(front, "severity").unwrap_or_default(),
             headline: front_field(front, "headline").unwrap_or_default(),
+            title: front_field(front, "title").unwrap_or_else(|| {
+                // Pre-title memos fall back to their filename stem, so an older repo still sorts
+                // and de-duplicates rather than collapsing every memo onto one empty identity.
+                stem.clone()
+            }),
+            priority: front_field(front, "priority")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| match front_field(front, "severity").as_deref() {
+                    Some("block") => 85,
+                    Some("warn") => 60,
+                    Some("info") => 30,
+                    _ => 10,
+                })
+                .min(100),
             created: front_field(front, "created_ts").and_then(|s| s.parse().ok()).unwrap_or(0),
             expired: front_field(front, "expired").as_deref() == Some("true"),
         });
@@ -220,6 +242,20 @@ fn write_if_changed(path: &Path, body: &str) -> Result<bool> {
 
 /// Write a reflex card. Markdown body, YAML-ish frontmatter — structure in the frontmatter,
 /// meaning in the body, so a parse failure degrades to a readable document rather than to nothing.
+/// A stable, filename-safe identifier from a workspace name.
+fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.extend(c.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let t = out.trim_matches('-');
+    if t.is_empty() { "workspace".into() } else { t.to_string() }
+}
+
 fn write_card(
     feed: &Path,
     id: &str,
@@ -258,6 +294,8 @@ fn write_card(
          session: \"{session}\"\n\
          pane: \"{pane_id}\"\n\
          kind: {kind_slug}\n\
+         title: {title}\n\
+         priority: {priority}\n\
          headline: \"{headline}\"\n\
          expired: false\n\
          {actions}\
@@ -267,6 +305,13 @@ fn write_card(
         sev = kind.severity(),
         pane_id = pane.pane_id,
         kind_slug = kind.slug(),
+        // A reflex memo's title names the situation, not the moment, so re-detecting the same
+        // block on a later tick recognises the existing memo instead of adding a second.
+        title = format!("{}-{}", slugify(&pane.name), kind.slug()),
+        priority = match kind {
+            Reflex::Blocked => 85,
+            Reflex::Failed => 65,
+        },
         headline = headline.replace('"', "'"),
     );
     std::fs::write(feed.join(format!("{id}.md")), card)?;
@@ -515,13 +560,14 @@ fn write_index(
     let briefs: &[(String, String)] = &all;
     let mut cards: Vec<serde_json::Value> = Vec::new();
     for (name, dir) in &dirs {
-        let dir = dir.join("cards");
+        let dir = dir.join("memos");
         for c in read_open_cards(&dir) {
             let text = std::fs::read_to_string(&c.file).unwrap_or_default();
             let (front, body) = split_front(&text).unwrap_or(("", ""));
             cards.push(serde_json::json!({
                 "id": c.id,
                 "path": c.file.to_string_lossy(),
+                "title": c.title, "priority": c.priority,
                 "severity": c.severity, "headline": c.headline, "session": c.session,
                 "pane": c.pane, "kind": c.kind, "created_ts": c.created, "expired": c.expired,
                 // Three different times, because they answer three different questions:
@@ -533,13 +579,15 @@ fn write_index(
             }));
         }
     }
-    let rank = |s: &str| match s { "block" => 0, "warn" => 1, "info" => 2, _ => 3 };
+    // Ordered by PRIORITY — what should be read first — not by severity. A block the engineer
+    // already knows about ranks below a warning they have never seen, and only the agent knows
+    // the difference. Expired memos sink regardless; ties break most-recent-first.
     cards.sort_by(|a, b| {
-        let (sa, sb) = (a["severity"].as_str().unwrap_or(""), b["severity"].as_str().unwrap_or(""));
         a["expired"].as_bool().unwrap_or(false).cmp(&b["expired"].as_bool().unwrap_or(false))
-            .then(rank(sa).cmp(&rank(sb)))
+            .then(b["priority"].as_u64().unwrap_or(0).cmp(&a["priority"].as_u64().unwrap_or(0)))
             .then(b["created_ts"].as_u64().unwrap_or(0).cmp(&a["created_ts"].as_u64().unwrap_or(0)))
     });
+    let (runs_ok, runs_total) = score_runs(repo, ts);
     let index = serde_json::json!({
         "generated": iso(ts), "generated_ts": ts,
         "sessions": briefs.iter().map(|(n, b)| {
@@ -587,7 +635,8 @@ fn write_index(
             })
         }).collect::<Vec<_>>(),
         "agentStaleSecs": stale_secs,
-        "cards": cards,
+        "agentRuns": { "ok": runs_ok, "total": runs_total },
+        "memos": cards,
     });
     // Temp + rename: atomic on POSIX, so a reader never sees half an index even when two
     // daemons refresh it in the same instant. Last writer wins, and both are correct because
@@ -619,7 +668,8 @@ fn write_index(
     // everything without a JSON viewer. This is the file to open first.
     let mut md = format!("# Status · {}\n\n", iso(ts));
     let live: Vec<&serde_json::Value> =
-        index["cards"].as_array().unwrap().iter().filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
+        index["memos"].as_array().map(|a| a.as_slice()).unwrap_or(&[])
+            .iter().filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
     if live.is_empty() {
         md.push_str("Nothing needs you.\n\n");
     } else {
@@ -847,6 +897,77 @@ pub fn mark_nudged(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<()>
     Ok(())
 }
 
+/// Score the runs the agent has finished, and record any that produced nothing.
+///
+/// A finished run is a batch file sitting in `inbox/done/`. For each one we ask the only question
+/// that matters: did the sessions it named end up with a briefing written *after* the batch was
+/// opened? A run that consumed its batch and wrote nothing is the dangerous failure — it looks
+/// exactly like a quiet board from the outside, and without this it would never be noticed.
+///
+/// Appends one line per newly-scored run to `memory/runs.jsonl` and returns the rolling tally.
+fn score_runs(repo: &Path, ts: u64) -> (u64, u64) {
+    let done = repo.join("inbox/done");
+    let log = repo.join("memory/runs.jsonl");
+    let seen: std::collections::HashSet<String> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v["batch"].as_str().map(String::from))
+        .collect();
+
+    let mut lines = String::new();
+    if let Ok(rd) = std::fs::read_dir(&done) {
+        let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for path in entries {
+            let name = match path.file_name().map(|n| n.to_string_lossy().to_string()) {
+                Some(n) if n.ends_with(".json") && !seen.contains(&n) => n,
+                _ => continue,
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            let Ok(batch) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let opened = batch["opened_ts"].as_u64().unwrap_or(0);
+            let sessions = batch["sessions"].as_array().cloned().unwrap_or_default();
+            let expected = sessions.len() as u64;
+            let mut wrote = 0u64;
+            let mut missing: Vec<String> = Vec::new();
+            for sess in &sessions {
+                let dir = PathBuf::from(sess["dir"].as_str().unwrap_or_default());
+                // Written *after* the batch opened. An old briefing left in place is not work.
+                if mtime_secs(&dir.join("mission_briefing.md")) >= opened {
+                    wrote += 1;
+                } else {
+                    missing.push(sess["name"].as_str().unwrap_or_default().to_string());
+                }
+            }
+            lines.push_str(&format!(
+                "{}\n",
+                serde_json::json!({
+                    "batch": name, "scored": iso(ts), "scored_ts": ts,
+                    "opened_ts": opened, "expected": expected, "wrote": wrote,
+                    "missing": missing, "ok": expected > 0 && wrote == expected,
+                })
+            ));
+        }
+    }
+    if !lines.is_empty() {
+        let _ = std::fs::create_dir_all(repo.join("memory"));
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+            let _ = f.write_all(lines.as_bytes());
+        }
+    }
+    // Rolling tally over the recent tail — a bad week should not be hidden by a good year.
+    let all: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let tail = all.iter().rev().take(20);
+    let total = tail.clone().count() as u64;
+    let ok = tail.filter(|v| v["ok"].as_bool().unwrap_or(false)).count() as u64;
+    (ok, total)
+}
+
 /// The file whose mtime gates the agent's cadence. Deleting it forces a run on the next tick —
 /// that is its second job, and the reason the gate is a file rather than an in-memory instant:
 /// `rm ~/.mars/manager/memory/last_run` is the whole iteration loop when working on the agent.
@@ -892,6 +1013,14 @@ pub fn agent_tick(
     owner: &str,
 ) -> Option<String> {
     let repo = repo_dir()?;
+    // The switch. Absent → the agent never runs, whatever the cadence says. Opt-in rather than
+    // opt-out because waking it spawns a real `claude` process that spends real tokens: a fresh
+    // install, a test run, or an isolated runtime must never do that by simply existing.
+    //   touch ~/.mars/manager/agent.enabled     # on
+    //   rm    ~/.mars/manager/agent.enabled     # off
+    if !repo.join("agent.enabled").exists() {
+        return None;
+    }
     let snap = parse_board(board_json)?;
     let sessions = [snap];
 
@@ -924,8 +1053,24 @@ pub fn agent_tick(
 /// Write a file only if it is absent. `AGENTS.md`, `docs/**`, `policy.md` and the memory seeds
 /// belong to the human and the agent — scaffolded once, then never touched again, so an edit is
 /// never silently reverted by the next tick.
+/// Our shipped docs carry `<!-- mars-doc-version: N -->`. We replace an on-disk copy whose marker
+/// is older than ours — the agent's contract has to be able to change — but the moment a human
+/// edits the marker away, the file is theirs and we never touch it again. "We maintain our own
+/// docs until you make them yours."
+fn doc_superseded(path: &Path, ours: &str) -> bool {
+    fn version(text: &str) -> Option<u32> {
+        let at = text.find("mars-doc-version:")?;
+        text[at + 17..].trim_start().split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    }
+    let Some(mine) = version(ours) else { return false };
+    match std::fs::read_to_string(path).ok().as_deref().and_then(version) {
+        Some(theirs) => theirs < mine,
+        None => false,
+    }
+}
+
 fn seed(path: &Path, body: &str) -> Result<()> {
-    if path.exists() {
+    if path.exists() && !doc_superseded(path, body) {
         return Ok(());
     }
     if let Some(d) = path.parent() {
@@ -941,6 +1086,7 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("AGENTS.md"), include_str!("manager_docs/AGENTS.md"))?;
     seed(&repo.join("docs/layout.md"), include_str!("manager_docs/layout.md"))?;
     seed(&repo.join("docs/cards.md"), include_str!("manager_docs/cards.md"))?;
+    seed(&repo.join("docs/memos.md"), include_str!("manager_docs/memos.md"))?;
     seed(&repo.join("docs/memory.md"), include_str!("manager_docs/memory.md"))?;
     seed(&repo.join("docs/tools.md"), include_str!("manager_docs/tools.md"))?;
     seed(&repo.join("policy.md"), include_str!("manager_docs/policy.md"))?;
@@ -977,7 +1123,7 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64, stale_
         else {
             continue;
         };
-        let cards = sdir.join("cards");
+        let cards = sdir.join("memos");
         let snaps = sdir.join("snapshots");
         std::fs::create_dir_all(&cards)?;
         std::fs::create_dir_all(&snaps)?;

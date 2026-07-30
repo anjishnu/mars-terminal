@@ -3196,7 +3196,7 @@ fn selfcheck() -> Result<()> {
         assert_eq!(ev.len(), 2, "expected one event per needing-attention pane: {ev:?}");
         // Session artifacts are id-keyed under sessions_root(), not under the manager repo.
         let sdir = manager::session_dir("0", "testbox", 1_000_000).expect("no session dir");
-        let feed = sdir.join("cards");
+        let feed = sdir.join("memos");
         let cards = || -> Vec<String> {
             let mut v: Vec<String> = std::fs::read_dir(&feed).unwrap().flatten()
                 .filter_map(|e| e.file_name().to_str().map(String::from))
@@ -3234,11 +3234,11 @@ fn selfcheck() -> Result<()> {
         // T4 — the index is regenerated from the directory and ranks block above warn.
         let idx: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
-        assert_eq!(idx["cards"].as_array().map(|a| a.len()), Some(2), "index disagrees with disk");
+        assert_eq!(idx["memos"].as_array().map(|a| a.len()), Some(2), "index disagrees with disk");
         // The briefing rides INLINE per session — Rover reads one file, not N (single fs slot).
         let brief_inline = idx["sessions"][0]["briefing"].as_str().unwrap_or_default();
         assert!(brief_inline.contains("mission briefing"), "briefing not inlined per session: {idx}");
-        let first = idx["cards"][0].as_object().expect("card entry");
+        let first = idx["memos"][0].as_object().expect("memo entry");
         assert!(first.contains_key("body"), "card body not inlined: {first:?}");
         let s3 = snap(vec![
             pane("3", "sweep", "failed", "exited 1", 30),
@@ -3247,7 +3247,7 @@ fn selfcheck() -> Result<()> {
         manager::emit(&repo, "testbox", &s3, 1_000_180, 2700)?;
         let idx: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
-        let live: Vec<&serde_json::Value> = idx["cards"].as_array().unwrap().iter()
+        let live: Vec<&serde_json::Value> = idx["memos"].as_array().unwrap().iter()
             .filter(|c| !c["expired"].as_bool().unwrap_or(false)).collect();
         assert_eq!(live[0]["severity"], "block", "index does not rank block first: {idx}");
 
