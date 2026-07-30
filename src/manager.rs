@@ -1254,13 +1254,18 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("policy.md"), include_str!("manager_docs/policy.md"))?;
     seed(
         &repo.join("memory/beliefs.md"),
-        "# Beliefs\n\nWorking memory. Rewritten, not appended. Keep under 200 lines.\n\n\
-         Nothing believed yet.\n",
+        "# Beliefs\n\nRead this first. Revised, never appended. Under 200 lines.\n\n\
+         ## Where things are\n\n\
+         - [projects.md](projects.md) — projects and workstreams, with their workspaces nested.\n\n\
+         ## Cross-cutting\n\n\
+         _Beliefs belonging to no single project. Nothing yet._\n\n\
+         See [docs/memory.md](../docs/memory.md).\n",
     )?;
     seed(
         &repo.join("memory/projects.md"),
-        "# Projects\n\nWhat each project IS — stable context the snapshot cannot know.\n\n\
-         _Add a section per project._\n",
+        "# Projects\n\nOne section per project. `Purpose:` is durable; `State:` and `Next:` are\n\
+         today. Workspaces nest underneath the project they serve.\n\n\
+         _Nothing observed yet._\n",
     )?;
     seed(&repo.join("memory/cursor.json"), "{}\n")?;
     seed(
@@ -1272,7 +1277,14 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
 
 /// The whole deterministic pass. Pure once `sessions` is in hand, so `--selfcheck` drives it
 /// directly with synthetic boards and never needs a live daemon.
-pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64, stale_secs: u64) -> Result<Vec<String>> {
+pub fn emit(
+    repo: &Path,
+    origin: &str,
+    sessions: &[SessionSnap],
+    ts: u64,
+    stale_secs: u64,
+    output: &serde_json::Value,
+) -> Result<Vec<String>> {
     scaffold_docs(repo)?;
     score_runs(repo, ts);
     let mut events: Vec<String> = Vec::new();
@@ -1295,11 +1307,22 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64, stale_
         let stim = serde_json::json!({
             "at": iso(ts), "at_ts": ts, "origin": origin, "session": s.name,
             "health": s.health,
-            "workspaces": s.panes.iter().map(|p| serde_json::json!({
-                "id": p.id, "paneId": p.pane_id, "name": p.name, "verdict": p.verdict,
-                "kind": p.kind, "why": p.why, "ageSecs": p.age_secs,
-                "blockedPrompt": p.blocked_prompt,
-            })).collect::<Vec<_>>(),
+            "goals": goals_json(),
+            "workspaces": s.panes.iter().map(|p| {
+                // tail = where it landed, delta = what changed, signals = what to act on.
+                let o = &output[&p.pane_id];
+                let tail: Vec<String> = o["tail"].as_array().map(|a| a.iter()
+                    .filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                let delta: Vec<String> = o["delta"].as_array().map(|a| a.iter()
+                    .filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+                let sig = signals(&tail, &delta);
+                serde_json::json!({
+                    "id": p.id, "paneId": p.pane_id, "name": p.name, "verdict": p.verdict,
+                    "kind": p.kind, "why": p.why, "ageSecs": p.age_secs,
+                    "blockedPrompt": p.blocked_prompt,
+                    "output": { "tail": tail, "delta": delta, "signals": sig },
+                })
+            }).collect::<Vec<_>>(),
         });
         std::fs::write(
             snaps.join(format!("{}.json", iso(ts).replace(':', "-"))),
@@ -1615,6 +1638,7 @@ pub fn tick_session(
     keep: usize,
     detail_min_secs: u64,
     stale_secs: u64,
+    output: &serde_json::Value,
 ) -> Result<()> {
     let Some(repo) = repo_dir() else { return Ok(()) };
     let repo = repo.as_path();
@@ -1655,7 +1679,7 @@ pub fn tick_session(
         }
     }
     scaffold_docs(repo)?;
-    emit(repo, origin, std::slice::from_ref(&snap), ts, stale_secs)?;
+    emit(repo, origin, std::slice::from_ref(&snap), ts, stale_secs, output)?;
     if let Some(d) = existing_session_dir(&snap.name) {
         prune_snapshots(&d.join("snapshots"), keep)?;
     }
@@ -1696,7 +1720,7 @@ pub fn snapshot_main(repo: Option<String>) -> Result<()> {
         .filter_map(|(name, _, _)| board_of(&name))
         .collect();
     let ts = now_secs();
-    let events = emit(&repo, &origin, &sessions, ts, 2700)?;
+    let events = emit(&repo, &origin, &sessions, ts, 2700, &serde_json::Value::Null)?;
     println!(
         "snapshot {} · {} session(s) · {} event(s) → {}",
         iso(ts),
@@ -1726,7 +1750,7 @@ pub fn force_snapshot(ts: u64) -> Result<usize> {
     let mut n = 0;
     for name in live_session_names() {
         let Some(snap) = board_of(&name) else { continue };
-        emit(&repo, &host_name(), std::slice::from_ref(&snap), ts, 2700)?;
+        emit(&repo, &host_name(), std::slice::from_ref(&snap), ts, 2700, &serde_json::Value::Null)?;
         n += 1;
     }
     Ok(n)
@@ -1806,4 +1830,132 @@ pub fn status_report(ts: u64) -> Result<String> {
     s.push_str(&format!("lock          {}\n", if repo.join("agent.lock").exists() { "held" } else { "free" }));
     s.push_str(&format!("runs          {ok}/{total} clean · {timing}\n"));
     Ok(s)
+}
+
+// ── Pane output: what the agent was starved of ───────────────────────────────────────────
+//
+// A snapshot used to carry a pane's name, verdict and age, and nothing else — so a briefing could
+// only restate the status LED, and the deterministic sentence did that better for free. These
+// give the model something a model is actually good at: reading output and deciding what matters.
+
+/// Strip ANSI so the agent reads text rather than escape codes. Rows arrive formatted because the
+/// same log feeds the phone's scrollback, which does want them.
+pub fn plain(row: &[u8]) -> String {
+    let mut out = String::with_capacity(row.len());
+    let mut i = 0;
+    while i < row.len() {
+        if row[i] == 0x1b {
+            i += 1;
+            if i < row.len() && row[i] == b'[' {
+                i += 1;
+                while i < row.len() && !row[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        out.push(row[i] as char);
+        i += 1;
+    }
+    out.trim_end().to_string()
+}
+
+/// What is worth acting on, pulled out of the text by pattern rather than by judgement.
+///
+/// Everything here is arithmetic: a shell prompt, an exit code, a `[y/N]`, a compiler error, a
+/// test tally. Pushing it below the model is the same move that made the deterministic floor
+/// work, one level up — and it makes citations precise, because a claim can point at an extracted
+/// signal instead of a line number in a blob.
+/// The number immediately preceding `word`, e.g. `3` in "3 failed".
+///
+/// Must be ADJACENT, and the last such match wins. Splitting on the word and taking the trailing
+/// digits of whatever came before matched the wrong thing on the common line
+/// `test result: FAILED. 118 passed; 3 failed` — the first " failed" there is part of the verdict,
+/// with no number in front of it at all.
+fn count_before(line: &str, word: &str) -> Option<u64> {
+    let mut found = None;
+    let mut from = 0;
+    while let Some(at) = line[from..].find(word) {
+        let end = from + at;
+        let digits: String = line[..end].chars().rev().take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>().into_iter().rev().collect();
+        if let Ok(n) = digits.parse() {
+            found = Some(n);
+        }
+        from = end + word.len();
+    }
+    found
+}
+
+pub fn signals(tail: &[String], delta: &[String]) -> serde_json::Value {
+    let all: Vec<&String> = delta.iter().chain(tail.iter()).collect();
+    let mut errors: Vec<String> = Vec::new();
+    let mut prompt: Option<String> = None;
+    let mut passed: Option<u64> = None;
+    let mut failed: Option<u64> = None;
+    let mut exit: Option<i64> = None;
+
+    for line in &all {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        let low = l.to_ascii_lowercase();
+        if errors.len() < 5
+            && (low.starts_with("error") || low.contains("error[") || low.starts_with("panicked at")
+                || low.starts_with("fatal:") || low.contains("failed to compile"))
+        {
+            errors.push(l.chars().take(160).collect());
+        }
+        // A question the engineer has to answer is the single most actionable thing on a board.
+        if prompt.is_none() && (l.contains("[y/N]") || l.contains("[Y/n]") || l.contains("(y/n)")) {
+            prompt = Some(l.chars().take(160).collect());
+        }
+        if let Some(n) = count_before(&low, " passed") {
+            passed = Some(n);
+        }
+        if let Some(n) = count_before(&low, " failed") {
+            failed = Some(n);
+        }
+        if let Some(rest) = low.strip_prefix("exit code ").or_else(|| low.strip_prefix("exit status ")) {
+            exit = rest.trim().parse().ok();
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    if !errors.is_empty() {
+        out.insert("errors".into(), serde_json::json!(errors));
+    }
+    if let Some(p) = prompt {
+        out.insert("prompt".into(), serde_json::json!(p));
+    }
+    if let Some(e) = exit {
+        out.insert("exit".into(), serde_json::json!(e));
+    }
+    if passed.is_some() || failed.is_some() {
+        out.insert("counts".into(), serde_json::json!({ "passed": passed, "failed": failed }));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Declared intent. `goals.json` and `mission.json` have existed unread this whole time, which is
+/// why memo priority has been a guess: importance is relative to a goal, and the agent had none.
+pub fn goals_json() -> serde_json::Value {
+    let Some(home) = dirs_home() else { return serde_json::Value::Null };
+    let read = |n: &str| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(home.join(".mars").join(n)).ok()?).ok()
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(g) = read("goals.json") {
+        out.insert("goals".into(), g);
+    }
+    if let Some(m) = read("mission.json") {
+        out.insert("mission".into(), m);
+    }
+    if out.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(out) }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }

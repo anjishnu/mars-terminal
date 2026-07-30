@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 5 -->
+<!-- mars-doc-version: 6 -->
 # The mission briefing
 
 **Read first. Written last.** It is the only thing many glances ever see: two to five seconds,
@@ -7,6 +7,13 @@ decide whether to stop what they are doing.
 
 You write it last, once every workspace summary and memo is on disk, because it is the summary of
 those. And because it is read first, it may assume nothing: it stands alone.
+
+Read the **workspace summaries you just wrote**, plus `memory/` and `goals`. **Do not re-read raw
+pane output here** — you already distilled it one level down, and re-reading is what makes a
+briefing cost grow with how noisy the terminals were.
+
+`memory/` is what makes this rankable. Without it every true statement weighs the same; with it
+you can say which failure blocks the thing they are actually trying to do.
 
 ## Shape
 

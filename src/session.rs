@@ -624,6 +624,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // listening: the whole point of an ambient layer is that the cards already exist when
     // somebody finally looks.
     let mut last_manager: Option<std::time::Instant> = None;
+    // Per-pane read cursor into the terminal's line log, so each snapshot carries what is NEW.
+    // In memory deliberately: a daemon restart just means the first snapshot has a tail and no
+    // delta, which is the honest answer — we genuinely did not watch that stretch.
+    let mut pane_cursors: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
     let mut last_pane_json: Option<String> = None;
     let mut watched_pane: Option<usize> = None;
     // Whether the watched pane is streamed as raw PTY bytes (the xterm.js renderer) rather
@@ -866,6 +870,26 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // No repo path passed: `tick_session` derives it, so this call site cannot send
                 // writes somewhere the runtime isolation does not cover.
                 let now = crate::worklog::now_secs();
+                // What each pane has printed: the last 20 lines for where it landed, and
+                // everything since we last looked for what changed. Capped, because one runaway
+                // logger must not become the whole prompt.
+                let mut out = serde_json::Map::new();
+                for (pid, pane) in app.panes.iter() {
+                    let crate::pane::PaneContent::Terminal(tid) = pane.content else { continue };
+                    let Some(term) = app.terms.get(&tid) else { continue };
+                    let (_, _, total, _) = term.lines(0, 0);
+                    let cursor = pane_cursors.get(&tid).copied().unwrap_or(total);
+                    let take = |from: u64, to: u64| -> Vec<String> {
+                        let (_, _, _, rows) = term.lines(from, to);
+                        rows.iter().map(|r| crate::manager::plain(r))
+                            .filter(|l| !l.trim().is_empty()).collect()
+                    };
+                    let delta = take(total.saturating_sub(MANAGER_DELTA_CAP).max(cursor), total);
+                    let tail = take(total.saturating_sub(MANAGER_TAIL), total);
+                    pane_cursors.insert(tid, total);
+                    out.insert(pid.to_string(), serde_json::json!({ "tail": tail, "delta": delta }));
+                }
+                let output = serde_json::Value::Object(out);
                 let _ = crate::manager::tick_session(
                     &origin,
                     &json,
@@ -873,6 +897,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     keep,
                     app.tuning.manager_detail_min_secs,
                     app.tuning.manager_agent_stale_secs,
+                    &output,
                 );
                 // …and, far more rarely, wake the agent. `agent_tick` owns every gate — the
                 // cross-daemon lock, the cadence flag file, the floor, and whether there is any
@@ -1369,6 +1394,11 @@ fn state_dir() -> Option<PathBuf> {
 }
 
 /// `mars --session <name>`: attach if alive, else spawn the daemon and attach.
+/// Lines of scrollback a snapshot carries for context, and the ceiling on how much NEW output one
+/// tick may carry. The cap is what keeps a noisy pane from becoming the entire prompt.
+const MANAGER_TAIL: u64 = 20;
+const MANAGER_DELTA_CAP: u64 = 200;
+
 pub fn session_main(name: &str, file: Option<String>) -> Result<()> {
     crate::broker::ensure_broker(); // auto-start the key broker so every session reaches the LLM
     let path = socket_path(name)?;

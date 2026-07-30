@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 5 -->
+<!-- mars-doc-version: 6 -->
 # Workspace summaries
 
 **Read second**, after the briefing and only when a row is tapped. One file per workspace at
@@ -8,6 +8,10 @@ By the time this is read, the engineer has already read the briefing and is look
 shows the name, the state and the age. So this line answers exactly one question they still have:
 
 > **Should I care about this one?**
+
+Read **only that pane's `output`** — its tail, its delta, its signals. Not the other panes, not
+the briefing you have not written yet. The signals are the shortcut: an exit code or a `[y/N]`
+already tells you the interesting thing without reading the text around it.
 
 ## Shape
 
