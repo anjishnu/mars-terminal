@@ -179,6 +179,18 @@ fn parse_actions(front: &str) -> Vec<serde_json::Value> {
     out
 }
 
+/// Filesystem mtime in epoch seconds. Cards carry `created` in their frontmatter, but "when was
+/// this file last touched" is the filesystem's job and is the honest answer for staleness — a
+/// card that was expired in place has a newer mtime than its `created`.
+fn mtime_secs(p: &Path) -> u64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn human_age(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
@@ -245,12 +257,17 @@ fn write_card(
 
 /// Mark a card expired in place. Cards are otherwise append-only; this flips one field so the
 /// renderer can grey it without the file being rewritten or deleted.
-fn expire_card(c: &OpenCard) -> Result<()> {
+fn expire_card(c: &OpenCard, ts: u64) -> Result<()> {
     let text = std::fs::read_to_string(&c.file)?;
     if text.contains("\nexpired: true\n") {
         return Ok(());
     }
-    std::fs::write(&c.file, text.replacen("\nexpired: false\n", "\nexpired: true\n", 1))?;
+    let flipped = text.replacen(
+        "\nexpired: false\n",
+        &format!("\nexpired: true\nupdated: {}\nupdated_ts: {ts}\n", iso(ts)),
+        1,
+    );
+    std::fs::write(&c.file, flipped)?;
     Ok(())
 }
 
@@ -259,6 +276,71 @@ fn expire_card(c: &OpenCard) -> Result<()> {
 /// Deliberately NOT a model's job. Counting panes by verdict, naming what is blocked and for how
 /// long, and saying "nothing needs you" when nothing does are all things arithmetic does better,
 /// faster, and without a plan window.
+
+/// A one-line status for a workspace. Deterministic: verdict, age, and the board's own
+/// description. This is what replaces a per-pane LLM summary call — counting and naming are not
+/// judgement, and a model adds latency and cost to produce the same sentence.
+fn workspace_summary(p: &PaneRow) -> String {
+    let why = p.why.trim();
+    match p.verdict.as_str() {
+        "blocked" => format!("waiting on input · {}{}", human_age(p.age_secs),
+                             if why.is_empty() { String::new() } else { format!(" · {why}") }),
+        "failed" => format!("failed · {}{}", human_age(p.age_secs),
+                            if why.is_empty() { String::new() } else { format!(" · {why}") }),
+        "running" => format!("running · {}{}", human_age(p.age_secs),
+                             if why.is_empty() { String::new() } else { format!(" · {why}") }),
+        "done" => format!("finished · {}", human_age(p.age_secs)),
+        _ if !why.is_empty() => format!("{why} · idle {}", human_age(p.age_secs)),
+        _ => format!("idle · {}", human_age(p.age_secs)),
+    }
+}
+
+/// Prose for the phone's briefing typewriter. Purpose-built and plain — a markdown table typed
+/// out one character at a time reads as a bug, so the narrative and the document are separate
+/// renderings of the same facts rather than one being derived from the other.
+fn session_narrative(s: &SessionSnap) -> String {
+    let blocked: Vec<&PaneRow> = s.panes.iter().filter(|p| p.verdict == "blocked").collect();
+    let failed: Vec<&PaneRow> = s.panes.iter().filter(|p| p.verdict == "failed").collect();
+    let running = s.panes.iter().filter(|p| p.verdict == "running").count();
+    let done = s.panes.iter().filter(|p| p.verdict == "done").count();
+    let names = |v: &[&PaneRow]| -> String {
+        let n: Vec<&str> = v.iter().map(|p| p.name.as_str()).collect();
+        match n.len() {
+            0 => String::new(),
+            1 => n[0].to_string(),
+            2 => format!("{} and {}", n[0], n[1]),
+            _ => format!("{} and {} others", n[0], n.len() - 1),
+        }
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if !blocked.is_empty() {
+        let oldest = blocked.iter().map(|p| p.age_secs).max().unwrap_or(0);
+        parts.push(format!(
+            "{} {} waiting on you — {} now.",
+            names(&blocked),
+            if blocked.len() == 1 { "is" } else { "are" },
+            human_age(oldest)
+        ));
+    }
+    if !failed.is_empty() {
+        parts.push(format!(
+            "{} {} failed.",
+            names(&failed),
+            if failed.len() == 1 { "has" } else { "have" }
+        ));
+    }
+    if running > 0 {
+        parts.push(format!("{running} still running."));
+    }
+    if done > 0 {
+        parts.push(format!("{done} finished clean."));
+    }
+    if parts.is_empty() {
+        return "The board is quiet — nothing running, nothing waiting on you.".into();
+    }
+    parts.join(" ")
+}
+
 fn session_briefing(s: &SessionSnap, ts: u64) -> String {
     let mut needs: Vec<&PaneRow> = s
         .panes
@@ -333,7 +415,12 @@ fn append_timeline(repo: &Path, ts: u64, lines: &[String]) -> Result<()> {
 ///
 /// Bodies and actions are INLINED. Rover reads through a single-slot `fs.read`, so a screenful of
 /// cards must be one round trip, not one per card.
-fn write_index(repo: &Path, briefs: &[(String, String)], ts: u64) -> Result<()> {
+fn write_index(
+    repo: &Path,
+    briefs: &[(String, String)],
+    sessions: &[SessionSnap],
+    ts: u64,
+) -> Result<()> {
     let mut cards: Vec<serde_json::Value> = Vec::new();
     for (name, _) in briefs {
         let dir = repo.join("sessions").join(name).join("cards");
@@ -346,6 +433,11 @@ fn write_index(repo: &Path, briefs: &[(String, String)], ts: u64) -> Result<()> 
                                 c.file.file_name().and_then(|n| n.to_str()).unwrap_or_default()),
                 "severity": c.severity, "headline": c.headline, "session": c.session,
                 "pane": c.pane, "kind": c.kind, "created_ts": c.created, "expired": c.expired,
+                // Three different times, because they answer three different questions:
+                // created = when the judgement was made, updated = when it last changed,
+                // mtime = what the filesystem says, which is the one that cannot be forged.
+                "updated_ts": front_field(front, "updated_ts").and_then(|s| s.parse::<u64>().ok()),
+                "mtime": mtime_secs(&c.file),
                 "body": body.trim(), "actions": parse_actions(front),
             }));
         }
@@ -359,10 +451,19 @@ fn write_index(repo: &Path, briefs: &[(String, String)], ts: u64) -> Result<()> 
     });
     let index = serde_json::json!({
         "generated": iso(ts), "generated_ts": ts,
-        "sessions": briefs.iter().map(|(n, b)| serde_json::json!({
-            "name": n, "briefing": b,
-            "path": format!("sessions/{n}/mission_briefing.md"),
-        })).collect::<Vec<_>>(),
+        "sessions": briefs.iter().map(|(n, b)| {
+            let snap = sessions.iter().find(|s| &s.name == n);
+            serde_json::json!({
+                "name": n,
+                "briefing": b,
+                "narrative": snap.map(session_narrative).unwrap_or_default(),
+                "path": format!("sessions/{n}/mission_briefing.md"),
+                "workspaces": snap.map(|s| s.panes.iter().map(|p| serde_json::json!({
+                    "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
+                    "kind": p.kind, "ageSecs": p.age_secs, "summary": workspace_summary(p),
+                })).collect::<Vec<_>>()).unwrap_or_default(),
+            })
+        }).collect::<Vec<_>>(),
         "cards": cards,
     });
     std::fs::write(repo.join("index.json"), serde_json::to_string_pretty(&index)?)?;
@@ -547,7 +648,7 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Res
                 continue;
             }
             if !live.iter().any(|(pid, k)| *pid == c.pane && *k == c.kind) {
-                expire_card(c)?;
+                expire_card(c, ts)?;
                 events.push(format!("`{}` resolved — card `{}` ({})", s.name, c.id, c.headline));
             }
         }
@@ -555,11 +656,25 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Res
         // 4. session → workspaces → summary.
         let brief = session_briefing(s, ts);
         std::fs::write(sdir.join("mission_briefing.md"), &brief)?;
+        // …and one document per workspace, so a single workspace can be read (or later enriched
+        // by an agent) without touching the session summary.
+        let wdir = sdir.join("workspaces");
+        std::fs::create_dir_all(&wdir)?;
+        for p in &s.panes {
+            std::fs::write(
+                wdir.join(format!("{}.md", p.pane_id)),
+                format!(
+                    "# {} · {}\n\n_{}_\n\n{}\n\n- state: {}\n- age: {}\n- kind: {}\n",
+                    p.name, s.name, iso(ts), workspace_summary(p),
+                    p.verdict, human_age(p.age_secs), p.kind
+                ),
+            )?;
+        }
         append_timeline(&sdir, ts, &events)?;
         briefs.push((s.name.clone(), brief));
     }
 
-    write_index(repo, &briefs, ts)?;
+    write_index(repo, &briefs, sessions, ts)?;
     append_timeline(repo, ts, &events)?;
     Ok(events)
 }
