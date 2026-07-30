@@ -158,6 +158,15 @@ pub struct Tuning {
     pub manager_snapshot_secs: u64,
     pub manager_snapshot_keep: u64,
     pub manager_detail_min_secs: u64,
+    /// Seconds between manager-agent turns. This is the ONLY model-touching cadence in the
+    /// manager; everything below it is arithmetic. A newly-blocked workspace bypasses it, since
+    /// that is the state where the engineer is the bottleneck. 0 = the agent never runs.
+    pub manager_agent_secs: u64,
+    /// The command typed into the manager's hidden pane to start the agent.
+    pub manager_agent_command: String,
+    /// Seconds after which agent-written prose is considered stale and the phone stops
+    /// preferring it. Guards against a dead agent silently serving an old world forever.
+    pub manager_agent_stale_secs: u64,
     /// Minimum seconds between Rover MAP calls (the per-workspace summary). One
     /// changed pane is (re)summarized per interval, so a busy board fans out over
     /// several intervals instead of hammering the model. Only active while a phone
@@ -245,6 +254,9 @@ impl Default for Tuning {
             manager_snapshot_secs: 60,
             manager_snapshot_keep: 20,
             manager_detail_min_secs: 300,
+            manager_agent_secs: 1200,
+            manager_agent_command: "claude --model claude-sonnet-5 --effort medium".into(),
+            manager_agent_stale_secs: 2700,
             rover_map_min_secs: 1,
             rover_brief_min_secs: 12,
             palette: Palette::mission_control(),
@@ -489,6 +501,19 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
              A pane running an agent changes its description every time it prints, and rewriting \
              the tree for that would churn the phone continuously. A state change (failed, \
              blocked, a pane appearing) still lands immediately, whatever this is set to.")),
+        ("manager_agent_secs", knob(json!(d.manager_agent_secs),
+            "Seconds between manager-AGENT turns — the only cadence in the manager that spends \
+             tokens. Everything faster than this is arithmetic and free. A newly-blocked \
+             workspace wakes the agent immediately regardless. Delete \
+             ~/.mars/manager/memory/last_run to force a run on the next tick. 0 = agent off.")),
+        ("manager_agent_command", knob(json!(d.manager_agent_command),
+            "The command typed into the manager's hidden pane to start the agent. Sonnet at \
+             medium effort by default: the work is reading prepared files and writing short \
+             prose, which does not need a larger model, and the cadence makes latency invisible.")),
+        ("manager_agent_stale_secs", knob(json!(d.manager_agent_stale_secs),
+            "How old agent-written prose may be before the phone stops trusting it and falls \
+             back. Should comfortably exceed manager_agent_secs, or a healthy agent reads as \
+             stale between its own turns.")),
         ("mobile_pane_interval_ms", knob(json!(d.mobile_pane_interval_ms),
             "How often the watched pane's live screen is pushed to the phone, in ms. Separate \
              from the board's cadence because this one is felt as typing latency. Identical \
@@ -653,6 +678,14 @@ pub fn load() -> Tuning {
             get_u64(&map, "manager_snapshot_keep", t.manager_snapshot_keep).max(1);
         t.manager_detail_min_secs =
             get_u64(&map, "manager_detail_min_secs", t.manager_detail_min_secs);
+        t.manager_agent_secs = get_u64(&map, "manager_agent_secs", t.manager_agent_secs);
+        t.manager_agent_stale_secs =
+            get_u64(&map, "manager_agent_stale_secs", t.manager_agent_stale_secs);
+        if let Some(c) = map.get("manager_agent_command").and_then(|v| v.value.as_str()) {
+            if !c.trim().is_empty() {
+                t.manager_agent_command = c.to_string();
+            }
+        }
         t.terminal_line_log_bytes =
             get_u64(&map, "terminal_line_log_bytes", t.terminal_line_log_bytes as u64).max(64 * 1024) as usize;
         t.rover_map_min_secs = get_u64(&map, "rover_map_min_secs", t.rover_map_min_secs).max(1);

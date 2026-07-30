@@ -446,11 +446,36 @@ fn append_timeline(repo: &Path, ts: u64, lines: &[String]) -> Result<()> {
 ///
 /// Bodies and actions are INLINED. Rover reads through a single-slot `fs.read`, so a screenful of
 /// cards must be one round trip, not one per card.
+/// Agent-written prose, if it is present, non-empty, and still describes the world.
+///
+/// Freshness is part of the preference, not an afterthought: prose older than `stale_secs` loses
+/// to arithmetic, because an eloquent briefing about a board that has since moved is worse than a
+/// blunt sentence about the board as it is. This is also the deterministic check that a dead
+/// agent cannot go unnoticed — it stops being preferred the moment it stops writing.
+fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64) -> Option<String> {
+    let age = ts.saturating_sub(mtime_secs(path));
+    if age > stale_secs {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    // Strip frontmatter if the agent wrote any, and drop a leading markdown heading: the phone
+    // renders this as a sentence, not as a document.
+    let body = split_front(&text).map(|(_, b)| b.to_string()).unwrap_or(text);
+    let body: String = body
+        .lines()
+        .skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
 fn write_index(
     repo: &Path,
     briefs: &[(String, String)],
     sessions: &[SessionSnap],
     ts: u64,
+    stale_secs: u64,
 ) -> Result<()> {
     // Scan the TREE, not just the sessions this process just wrote: each session's daemon owns
     // its own subtree, so an index built from one process's view would omit the others. The
@@ -519,25 +544,49 @@ fn write_index(
         "generated": iso(ts), "generated_ts": ts,
         "sessions": briefs.iter().map(|(n, b)| {
             let snap = sessions.iter().find(|s| &s.name == n);
+            let dir = dirs.iter().find(|(dn, _)| dn == n).map(|(_, d)| d.clone());
+            // Arithmetic first — it is always available and is the floor nothing can fall below.
+            let computed = snap.map(session_narrative).unwrap_or_else(|| {
+                // A session another daemon owns: reuse the prose already in its briefing
+                // rather than inventing a second source of truth.
+                b.lines().find(|l| l.contains("need") || l.contains("Nothing needs"))
+                    .map(|l| l.replace("**", "").trim().to_string())
+                    .unwrap_or_default()
+            });
+            // …then prefer the agent, but only while its prose is FRESHER than the ground truth
+            // it describes. An eloquent briefing about a board that has since moved is worse
+            // than a blunt sentence about the board as it is.
+            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs));
+            let (narrative, narrative_source) = match agent {
+                Some(a) => (a, "agent"),
+                None => (computed, "computed"),
+            };
             serde_json::json!({
                 "name": n,
                 "briefing": b,
-                "narrative": snap.map(session_narrative).unwrap_or_else(|| {
-                    // A session another daemon owns: reuse the prose already in its briefing
-                    // rather than inventing a second source of truth.
-                    b.lines().find(|l| l.contains("need") || l.contains("Nothing needs"))
-                        .map(|l| l.replace("**", "").trim().to_string())
-                        .unwrap_or_default()
-                }),
-                "path": dirs.iter().find(|(dn, _)| dn == n)
-                .map(|(_, d)| d.join("mission_briefing.md").to_string_lossy().to_string())
-                .unwrap_or_default(),
-                "workspaces": snap.map(|s| s.panes.iter().map(|p| serde_json::json!({
-                    "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
-                    "kind": p.kind, "ageSecs": p.age_secs, "summary": workspace_summary(p),
-                })).collect::<Vec<_>>()).unwrap_or_default(),
+                "narrative": narrative,
+                "narrativeSource": narrative_source,
+                "path": dir.as_ref()
+                    .map(|d| d.join("mission_briefing.md").to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                "workspaces": snap.map(|s| s.panes.iter().map(|p| {
+                    // Per FIELD, not per document: a garbled workspace summary costs that one
+                    // workspace its prose and nothing else.
+                    let w = dir.as_ref()
+                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs));
+                    let (summary, source) = match w {
+                        Some(a) => (a, "agent"),
+                        None => (workspace_summary(p), "computed"),
+                    };
+                    serde_json::json!({
+                        "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
+                        "kind": p.kind, "ageSecs": p.age_secs,
+                        "summary": summary, "summarySource": source,
+                    })
+                }).collect::<Vec<_>>()).unwrap_or_default(),
             })
         }).collect::<Vec<_>>(),
+        "agentStaleSecs": stale_secs,
         "cards": cards,
     });
     // Temp + rename: atomic on POSIX, so a reader never sees half an index even when two
@@ -798,6 +847,80 @@ pub fn mark_nudged(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<()>
     Ok(())
 }
 
+/// The file whose mtime gates the agent's cadence. Deleting it forces a run on the next tick —
+/// that is its second job, and the reason the gate is a file rather than an in-memory instant:
+/// `rm ~/.mars/manager/memory/last_run` is the whole iteration loop when working on the agent.
+fn last_run_path(repo: &Path) -> PathBuf {
+    repo.join("memory/last_run")
+}
+
+/// Only one daemon may drive the agent. Every session runs its own tick, so without this each
+/// would spawn its own `claude` in its own hidden pane and they would all write the same files.
+/// The lock is claimable when stale so a killed daemon does not park the manager forever.
+fn claim_agent_lock(repo: &Path, owner: &str, ts: u64, stale_secs: u64) -> bool {
+    let path = repo.join("agent.lock");
+    let held: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let holder = held["owner"].as_str().unwrap_or_default();
+    let at = held["ts"].as_u64().unwrap_or(0);
+    let ours = holder == owner;
+    if !ours && !holder.is_empty() && ts.saturating_sub(at) < stale_secs {
+        return false;
+    }
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::json!({ "owner": owner, "ts": ts, "at": iso(ts) }))
+            .unwrap_or_default(),
+    );
+    true
+}
+
+/// Decide whether to wake the agent, and compose what to type if so.
+///
+/// Returns the prompt line. `None` means "nothing to do" — which is the common case and is a
+/// success: a quiet board costs no tokens at all. The batch is left open when we decline, so
+/// work is never dropped, only deferred into a later, larger turn.
+pub fn agent_tick(
+    board_json: &str,
+    ts: u64,
+    floor_secs: u64,
+    owner: &str,
+) -> Option<String> {
+    let repo = repo_dir()?;
+    let snap = parse_board(board_json)?;
+    let sessions = [snap];
+
+    if !claim_agent_lock(&repo, owner, ts, floor_secs.saturating_mul(3).max(180)) {
+        return None;
+    }
+    // The flag file is the cadence gate. Absent → due now, which is what makes deleting it the
+    // testing lever. A newly-blocked workspace still bypasses the floor entirely.
+    let last = std::fs::metadata(last_run_path(&repo))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let floor_passed = match last {
+        None => true,
+        Some(t) => ts.saturating_sub(t) >= floor_secs,
+    };
+    let reason = nudge_reason(&repo, &sessions, ts, floor_secs)?;
+    if reason != "blocked" && !floor_passed {
+        return None;
+    }
+    // Only now do we touch the inbox: no pending snapshots means no turn, whatever the clock says.
+    let batch = compose_batch(&repo, &sessions, ts).ok().flatten()?;
+    let name = batch.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    mark_nudged(&repo, &sessions, ts).ok()?;
+    let _ = std::fs::write(last_run_path(&repo), format!("{}\n", iso(ts)));
+    Some(format!("Warm-up run — process inbox/{name} per AGENTS.md ({reason})"))
+}
+
 /// Write a file only if it is absent. `AGENTS.md`, `docs/**`, `policy.md` and the memory seeds
 /// belong to the human and the agent — scaffolded once, then never touched again, so an edit is
 /// never silently reverted by the next tick.
@@ -841,7 +964,7 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
 
 /// The whole deterministic pass. Pure once `sessions` is in hand, so `--selfcheck` drives it
 /// directly with synthetic boards and never needs a live daemon.
-pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Result<Vec<String>> {
+pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64, stale_secs: u64) -> Result<Vec<String>> {
     scaffold_docs(repo)?;
     let mut events: Vec<String> = Vec::new();
     let mut briefs: Vec<(String, String)> = Vec::new();
@@ -913,7 +1036,10 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Res
 
         // 4. session → workspaces → summary.
         let brief = session_briefing(s, ts);
-        write_if_changed(&sdir.join("mission_briefing.md"), &brief)?;
+        // NOT mission_briefing.md — that file belongs to the agent now, and rewriting it every
+        // tick would make its work vanish every 60 seconds. The deterministic sentence lives
+        // beside it as the visible floor, and reaches the phone through the index either way.
+        write_if_changed(&sdir.join("mission_briefing.computed.md"), &brief)?;
         // …and one document per workspace, so a single workspace can be read (or later enriched
         // by an agent) without touching the session summary.
         let wdir = sdir.join("workspaces");
@@ -931,7 +1057,7 @@ pub fn emit(repo: &Path, origin: &str, sessions: &[SessionSnap], ts: u64) -> Res
         briefs.push((s.name.clone(), brief));
     }
 
-    write_index(repo, &briefs, sessions, ts)?;
+    write_index(repo, &briefs, sessions, ts, stale_secs)?;
     append_timeline(repo, ts, &events)?;
     Ok(events)
 }
@@ -1119,6 +1245,7 @@ pub fn tick_session(
     ts: u64,
     keep: usize,
     detail_min_secs: u64,
+    stale_secs: u64,
 ) -> Result<()> {
     let Some(repo) = repo_dir() else { return Ok(()) };
     let repo = repo.as_path();
@@ -1146,7 +1273,7 @@ pub fn tick_session(
         }
     }
     scaffold_docs(repo)?;
-    emit(repo, origin, std::slice::from_ref(&snap), ts)?;
+    emit(repo, origin, std::slice::from_ref(&snap), ts, stale_secs)?;
     if let Some(d) = existing_session_dir(&snap.name) {
         prune_snapshots(&d.join("snapshots"), keep)?;
     }
@@ -1187,7 +1314,7 @@ pub fn snapshot_main(repo: Option<String>) -> Result<()> {
         .filter_map(|(name, _, _)| board_of(&name))
         .collect();
     let ts = now_secs();
-    let events = emit(&repo, &origin, &sessions, ts)?;
+    let events = emit(&repo, &origin, &sessions, ts, 2700)?;
     println!(
         "snapshot {} · {} session(s) · {} event(s) → {}",
         iso(ts),

@@ -3192,7 +3192,7 @@ fn selfcheck() -> Result<()> {
             pane("3", "sweep", "failed", "torchrun exited 1", 120),
             pane("9", "notes", "idle", "", 5),
         ]);
-        let ev = manager::emit(&repo, "testbox", &s1, 1_000_000)?;
+        let ev = manager::emit(&repo, "testbox", &s1, 1_000_000, 2700)?;
         assert_eq!(ev.len(), 2, "expected one event per needing-attention pane: {ev:?}");
         // Session artifacts are id-keyed under sessions_root(), not under the manager repo.
         let sdir = manager::session_dir("0", "testbox", 1_000_000).expect("no session dir");
@@ -3217,14 +3217,14 @@ fn selfcheck() -> Result<()> {
         // T2 — the SAME state again must not produce a second card. A pane blocked for six hours
         //      is one card, not one per tick; duplicate cards are the bug this project keeps
         //      re-learning one layer down.
-        let ev2 = manager::emit(&repo, "testbox", &s1, 1_000_060)?;
+        let ev2 = manager::emit(&repo, "testbox", &s1, 1_000_060, 2700)?;
         assert!(ev2.is_empty(), "re-emitted cards for unchanged state: {ev2:?}");
         assert_eq!(cards().len(), 2, "duplicate card written: {:?}", cards());
 
         // T3 — when the world moves on, the card expires. Declarative staleness: nothing
         //      re-examined the card, the condition simply stopped holding.
         let s2 = snap(vec![pane("4", "claude", "running", "", 3), pane("3", "sweep", "done", "", 9)]);
-        let ev3 = manager::emit(&repo, "testbox", &s2, 1_000_120)?;
+        let ev3 = manager::emit(&repo, "testbox", &s2, 1_000_120, 2700)?;
         assert_eq!(ev3.len(), 2, "expected two resolutions: {ev3:?}");
         for f in cards() {
             let t = std::fs::read_to_string(feed.join(&f))?;
@@ -3244,7 +3244,7 @@ fn selfcheck() -> Result<()> {
             pane("3", "sweep", "failed", "exited 1", 30),
             pane("4", "claude", "blocked", "continue? [y/N]", 90),
         ]);
-        manager::emit(&repo, "testbox", &s3, 1_000_180)?;
+        manager::emit(&repo, "testbox", &s3, 1_000_180, 2700)?;
         let idx: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
         let live: Vec<&serde_json::Value> = idx["cards"].as_array().unwrap().iter()
@@ -3252,12 +3252,12 @@ fn selfcheck() -> Result<()> {
         assert_eq!(live[0]["severity"], "block", "index does not rank block first: {idx}");
 
         // T5 — session → workspaces → summary, as markdown a human can read.
-        let bpath = sdir.join("mission_briefing.md");
+        let bpath = sdir.join("mission_briefing.computed.md");
         let brief = std::fs::read_to_string(&bpath)?;
         assert!(brief.contains("2 need you"), "briefing does not lead with what needs attention: {brief}");
         assert!(brief.contains("| workspace | state | age |"), "briefing lost its workspace table");
         // …and when nothing is wrong it says so, rather than padding.
-        manager::emit(&repo, "testbox", &snap(vec![pane("9", "notes", "idle", "", 5)]), 1_000_240)?;
+        manager::emit(&repo, "testbox", &snap(vec![pane("9", "notes", "idle", "", 5)]), 1_000_240, 2700)?;
         assert!(std::fs::read_to_string(&bpath)?.contains("Nothing needs you"), "quiet briefing is not calm");
 
         // T5b — the guide the agent reads is scaffolded, and is NEVER overwritten afterwards.
@@ -3267,7 +3267,7 @@ fn selfcheck() -> Result<()> {
         }
         std::fs::write(repo.join("AGENTS.md"), "EDITED BY HUMAN\n")?;
         std::fs::write(repo.join("memory/beliefs.md"), "MY BELIEFS\n")?;
-        manager::emit(&repo, "testbox", &snap(vec![]), 1_000_300)?;
+        manager::emit(&repo, "testbox", &snap(vec![]), 1_000_300, 2700)?;
         assert_eq!(std::fs::read_to_string(repo.join("AGENTS.md"))?, "EDITED BY HUMAN\n",
                    "AGENTS.md was clobbered — the human owns it");
         assert_eq!(std::fs::read_to_string(repo.join("memory/beliefs.md"))?, "MY BELIEFS\n",
@@ -3307,10 +3307,15 @@ fn selfcheck() -> Result<()> {
         // does not show.
         let board = app.mobile_board_json();
         for i in 0..4u64 {
-            manager::tick_session("testbox", &board, 2_000_000 + i * 60, 2, 0)?;
+            manager::tick_session("testbox", &board, 2_000_000 + i * 60, 2, 0, 2700)?;
         }
         let sdir = manager::session_dir("auto", "testbox", 2_000_000).expect("no session dir");
-        assert!(sdir.join("mission_briefing.md").exists(), "daemon tick wrote no briefing");
+        assert!(sdir.join("mission_briefing.computed.md").exists(),
+            "daemon tick wrote no computed briefing");
+        // The agent's file is HERS: the tick must never create or overwrite it, or her work
+        // would vanish every 60 seconds.
+        assert!(!sdir.join("mission_briefing.md").exists(),
+            "the deterministic tick created the agent's briefing file");
         assert!(repo.join("index.json").exists(), "daemon tick wrote no index");
         assert!(repo.join("AGENTS.md").exists(), "daemon tick did not scaffold the guide");
         // Four ticks on an unchanged board wrote ONE stimulus — repeated ticks are not news.
@@ -3319,13 +3324,13 @@ fn selfcheck() -> Result<()> {
         // Now change state on each tick, and confirm the ring prunes to manager_snapshot_keep.
         for (i, v) in ["running", "failed", "idle", "running"].iter().enumerate() {
             let b = board.replace("\"verdict\":\"idle\"", &format!("\"verdict\":\"{v}\""));
-            manager::tick_session("testbox", &b, 2_000_100 + i as u64 * 60, 2, 0)?;
+            manager::tick_session("testbox", &b, 2_000_100 + i as u64 * 60, 2, 0, 2700)?;
         }
         let snaps = std::fs::read_dir(sdir.join("snapshots"))?.flatten().count();
         assert!(snaps <= 2, "stimuli not pruned to manager_snapshot_keep: {snaps}");
         // The index must describe the whole TREE, so a second session's daemon does not erase
         // the first from it.
-        manager::tick_session("testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2, 0)?;
+        manager::tick_session("testbox", &app.mobile_board_json().replace("\"auto\"", "\"other\""), 2_000_300, 2, 0, 2700)?;
         let idx: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(repo.join("index.json"))?)?;
         let names: Vec<&str> =
@@ -3379,7 +3384,7 @@ fn selfcheck() -> Result<()> {
                 }],
             }];
             let summary_at = |age: u64, ts: u64| -> String {
-                manager::emit(&repo, "testbox", &mk(age), ts).expect("emit");
+                manager::emit(&repo, "testbox", &mk(age), ts, 2700).expect("emit");
                 let idx: serde_json::Value = serde_json::from_str(
                     &std::fs::read_to_string(repo.join("index.json")).expect("index")).expect("json");
                 idx["sessions"].as_array().unwrap().iter()
@@ -3406,7 +3411,7 @@ fn selfcheck() -> Result<()> {
                 a.open_terminal();
                 a.mobile_board_json()
             };
-            manager::tick_session("testbox", &board, 5_000_000, 5, 0)?;
+            manager::tick_session("testbox", &board, 5_000_000, 5, 0, 2700)?;
             let dir = manager::existing_session_dir_pub("quiet").expect("session dir");
             let stamp = |p: &std::path::Path| -> Vec<(String, u64)> {
                 let mut v: Vec<(String, u64)> = walk(p).into_iter()
@@ -3430,7 +3435,7 @@ fn selfcheck() -> Result<()> {
             assert!(!before.is_empty(), "first tick wrote nothing");
             std::thread::sleep(std::time::Duration::from_millis(20));
             for i in 0..5 {
-                manager::tick_session("testbox", &board, 5_000_060 + i * 60, 5, 300)?;
+                manager::tick_session("testbox", &board, 5_000_060 + i * 60, 5, 300, 2700)?;
             }
             assert_eq!(before, stamp(&dir), "an idle session rewrote its files");
 
@@ -3439,12 +3444,12 @@ fn selfcheck() -> Result<()> {
             let chatty = board.replace("\"why\":\"", "\"why\":\"printing output ");
             // INSIDE the 300s window (last write was at 5_000_000) — otherwise the rewrite is
             // correct behaviour and the assertion tests nothing.
-            manager::tick_session("testbox", &chatty, 5_000_200, 5, 300)?;
+            manager::tick_session("testbox", &chatty, 5_000_200, 5, 300, 2700)?;
             assert_eq!(before, stamp(&dir), "a description change alone rewrote the tree");
 
             // A STATE change is news, and lands at once whatever the rate limit says.
             let failed = board.replace("\"verdict\":\"idle\"", "\"verdict\":\"failed\"");
-            manager::tick_session("testbox", &failed, 5_000_201, 5, 300)?;
+            manager::tick_session("testbox", &failed, 5_000_201, 5, 300, 2700)?;
             assert_ne!(before, stamp(&dir), "a state change did not reach the tree immediately");
         }
     println!("[selfcheck] manager auto-tick ......... PASS");

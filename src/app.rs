@@ -5134,16 +5134,46 @@ impl App {
     /// The shell is spawned and `claude` typed into it rather than exec'd directly: if the agent
     /// exits, the pane is still a usable shell in the right directory instead of a dead tab.
     pub fn manager_pane(&mut self) {
-        if let Some(i) = self.tabs.iter().position(|t| Some(t.id) == self.manager_tab) {
-            self.active_tab = i;
-            self.mode = self.mode_for_focused_pane();
-            self.status_msg = Some("Manager — the agent that writes your feed".into());
+        if self.ensure_manager_pane(true).is_none() {
+            self.status_msg = Some("Manager unavailable: no manager repo".into());
+        }
+    }
+
+    /// Type a line into the manager agent, starting it if it is not up yet.
+    ///
+    /// Skipped while the agent's pane reads `Running` — it is mid-turn, and typing then would
+    /// interleave with its own output. Nothing is lost by declining: the batch stays open in the
+    /// inbox and merges with whatever arrives next, so a slow turn produces one larger turn
+    /// rather than a backlog. Never steals focus; the engineer opts in through the command bar.
+    pub fn nudge_manager(&mut self, line: &str) {
+        let Some(tab_id) = self.ensure_manager_pane(false) else { return };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let pane_id = tab.focused_pane;
+        if self.pane_verdict(pane_id) == crate::briefing::Verdict::Running {
             return;
         }
-        let Some(repo) = crate::manager::repo_dir() else {
-            self.status_msg = Some("Manager unavailable: no manager repo".into());
+        let Some(PaneContent::Terminal(tid)) = self.panes.get(&pane_id).map(|p| p.content.clone())
+        else {
             return;
         };
+        if let Some(t) = self.terms.get_mut(&tid) {
+            t.send_bytes(line.as_bytes());
+            t.send_bytes(b"\r");
+        }
+    }
+
+    /// The manager's hidden tab, created on first use. `focus` distinguishes the engineer opening
+    /// it from the daemon quietly starting it behind their back.
+    fn ensure_manager_pane(&mut self, focus: bool) -> Option<TabId> {
+        if let Some(i) = self.tabs.iter().position(|t| Some(t.id) == self.manager_tab) {
+            if focus {
+                self.active_tab = i;
+                self.mode = self.mode_for_focused_pane();
+                self.status_msg = Some("Manager — the agent that writes your feed".into());
+            }
+            return self.manager_tab;
+        }
+        let repo = crate::manager::repo_dir()?;
         let id = self.next_term_id;
         self.next_term_id += 1;
         match terminal::spawn(
@@ -5170,16 +5200,26 @@ impl App {
                 tab.hidden = true;
                 self.tabs.push(tab);
                 self.manager_tab = Some(tab_id);
-                self.active_tab = self.tabs.len() - 1;
-                self.mode = Mode::Terminal;
+                if focus {
+                    self.active_tab = self.tabs.len() - 1;
+                    self.mode = Mode::Terminal;
+                    self.status_msg = Some("Manager started — Ctrl+g back to editor".into());
+                }
                 // The PTY buffers input until the shell reads it, so typing straight after
                 // spawn is safe; if it ever misses, the pane is still a shell in the right dir.
+                let cmd = self.tuning.manager_agent_command.clone();
                 if let Some(t) = self.terms.get_mut(&id) {
-                    t.send_bytes(b"claude\r");
+                    t.send_bytes(cmd.as_bytes());
+                    t.send_bytes(b"\r");
                 }
-                self.status_msg = Some("Manager started — Ctrl+g back to editor".into());
+                Some(tab_id)
             }
-            Err(e) => self.status_msg = Some(format!("Manager failed: {e}")),
+            Err(e) => {
+                if focus {
+                    self.status_msg = Some(format!("Manager failed: {e}"));
+                }
+                None
+            }
         }
     }
 

@@ -865,13 +865,28 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     .unwrap_or_else(|| "local".to_string());
                 // No repo path passed: `tick_session` derives it, so this call site cannot send
                 // writes somewhere the runtime isolation does not cover.
+                let now = crate::worklog::now_secs();
                 let _ = crate::manager::tick_session(
                     &origin,
                     &json,
-                    crate::worklog::now_secs(),
+                    now,
                     keep,
                     app.tuning.manager_detail_min_secs,
+                    app.tuning.manager_agent_stale_secs,
                 );
+                // …and, far more rarely, wake the agent. `agent_tick` owns every gate — the
+                // cross-daemon lock, the cadence flag file, the floor, and whether there is any
+                // unconsumed work at all — so this call site cannot accidentally spend tokens.
+                let agent_secs = app.tuning.manager_agent_secs;
+                if agent_secs > 0 {
+                    let owner = app
+                        .session_instance_id
+                        .clone()
+                        .unwrap_or_else(|| origin.clone());
+                    if let Some(line) = crate::manager::agent_tick(&json, now, agent_secs, &owner) {
+                        app.nudge_manager(&line);
+                    }
+                }
             }
         }
 
