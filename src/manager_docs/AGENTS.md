@@ -42,8 +42,10 @@ should leave real work behind, not nothing.
    actually read. Mars computes "unconsumed" from this: leaving it stale makes you re-read
    forever, and advancing it past files you did not read skips work silently.
 8. **Update `memory/`** — rules in [`docs/memory.md`](docs/memory.md).
-9. **Move the batch file to `inbox/done/`.** That is how a run is recorded as finished, and it is
-   what Mars checks to score the run.
+9. **Write a run receipt** — your own account of what you wrote and what you deliberately
+   skipped, format in [`docs/receipts.md`](docs/receipts.md). Mars checks the account against the
+   filesystem, so a skip with a reason is a clean outcome and silence is not.
+10. **Move the batch file to `inbox/done/`.** That is how a run is recorded as finished.
 
 ## The mission briefing
 

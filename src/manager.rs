@@ -636,6 +636,7 @@ fn write_index(
         }).collect::<Vec<_>>(),
         "agentStaleSecs": stale_secs,
         "agentRuns": { "ok": runs_ok, "total": runs_total },
+        "agentEnabled": agent_enabled(repo),
         "memos": cards,
     });
     // Temp + rename: atomic on POSIX, so a reader never sees half an index even when two
@@ -928,24 +929,67 @@ fn score_runs(repo: &Path, ts: u64) -> (u64, u64) {
             let Ok(batch) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
             let opened = batch["opened_ts"].as_u64().unwrap_or(0);
             let sessions = batch["sessions"].as_array().cloned().unwrap_or_default();
-            let expected = sessions.len() as u64;
-            let mut wrote = 0u64;
-            let mut missing: Vec<String> = Vec::new();
-            for sess in &sessions {
-                let dir = PathBuf::from(sess["dir"].as_str().unwrap_or_default());
-                // Written *after* the batch opened. An old briefing left in place is not work.
-                if mtime_secs(&dir.join("mission_briefing.md")) >= opened {
-                    wrote += 1;
-                } else {
-                    missing.push(sess["name"].as_str().unwrap_or_default().to_string());
+
+            // The agent's own account of the run. We verify the ACCOUNT against the filesystem
+            // rather than checking a fixed list of files exists — see `docs/receipts.md`. A rule
+            // of "produce a file per workspace" reliably produces a file per workspace, including
+            // for the workspaces that did not change, which is the padding we are trying to stop.
+            let receipt: serde_json::Value = std::fs::read_to_string(repo.join("runs").join(&name))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let claimed: Vec<String> = receipt["wrote"].as_array().map(|a| {
+                a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+            }).unwrap_or_default();
+
+            let mut faults: Vec<serde_json::Value> = Vec::new();
+            // 1. Every file it SAYS it wrote must exist and post-date the batch. This is the
+            //    check that catches a run which reported success and did nothing.
+            for f in &claimed {
+                if mtime_secs(Path::new(f)) < opened {
+                    faults.push(serde_json::json!({ "kind": "claimed-not-written", "path": f }));
                 }
+            }
+            // 2. Every session in the batch must be accounted for — written about, or skipped
+            //    WITH A REASON. Silence is the only thing not allowed; deciding there is nothing
+            //    to say is a valid outcome and is recorded as one.
+            for sess in &sessions {
+                let sname = sess["name"].as_str().unwrap_or_default();
+                let dir = sess["dir"].as_str().unwrap_or_default();
+                let touched = claimed.iter().any(|f| f.starts_with(dir));
+                let skipped = receipt["skipped"].as_array().is_some_and(|a| {
+                    a.iter().any(|k| k["session"].as_str() == Some(sname)
+                        && k["why"].as_str().is_some_and(|w| !w.trim().is_empty()))
+                });
+                if !touched && !skipped {
+                    faults.push(serde_json::json!({ "kind": "unaccounted", "session": sname }));
+                }
+            }
+            // 3. The cursor may not advance past what the batch actually offered — that would
+            //    silently mark snapshots as read that nobody read.
+            for sess in &sessions {
+                let sid = sess["id"].as_str().unwrap_or_default();
+                let newest = sess["snapshots"].as_array()
+                    .and_then(|a| a.last()).and_then(|v| v.as_str()).unwrap_or_default();
+                if let Some(at) = receipt["cursor"].get(sid).and_then(|v| v.as_str()) {
+                    if !newest.is_empty() && at > newest {
+                        faults.push(serde_json::json!({
+                            "kind": "cursor-overrun", "session": sid, "at": at, "offered": newest,
+                        }));
+                    }
+                }
+            }
+            let no_receipt = receipt.get("wrote").is_none();
+            if no_receipt {
+                faults.push(serde_json::json!({ "kind": "no-receipt" }));
             }
             lines.push_str(&format!(
                 "{}\n",
                 serde_json::json!({
-                    "batch": name, "scored": iso(ts), "scored_ts": ts,
-                    "opened_ts": opened, "expected": expected, "wrote": wrote,
-                    "missing": missing, "ok": expected > 0 && wrote == expected,
+                    "batch": name, "scored": iso(ts), "scored_ts": ts, "opened_ts": opened,
+                    "sessions": sessions.len(), "claimed": claimed.len(),
+                    "skipped": receipt["skipped"].as_array().map(|a| a.len()).unwrap_or(0),
+                    "faults": faults, "ok": faults.is_empty(),
                 })
             ));
         }
@@ -966,6 +1010,24 @@ fn score_runs(repo: &Path, ts: u64) -> (u64, u64) {
     let total = tail.clone().count() as u64;
     let ok = tail.filter(|v| v["ok"].as_bool().unwrap_or(false)).count() as u64;
     (ok, total)
+}
+
+/// Is the agent switched on?
+///
+/// Absent means off, so nothing runs an agent by merely existing. Present-and-empty means on, so
+/// `touch` does the obvious thing from a shell. And because the CONTENTS decide it when there are
+/// any, the phone can flip it through the `fs.write` it already has — no delete verb, no new
+/// protocol frame, and the same file is the switch from either side.
+pub fn agent_enabled(repo: &Path) -> bool {
+    match std::fs::read_to_string(repo.join("agent.enabled")) {
+        Err(_) => false,
+        Ok(body) => !matches!(body.trim(), "0" | "off" | "false" | "no"),
+    }
+}
+
+/// The file the phone writes to flip the switch.
+pub fn agent_switch_path() -> Option<PathBuf> {
+    Some(repo_dir()?.join("agent.enabled"))
 }
 
 /// The file whose mtime gates the agent's cadence. Deleting it forces a run on the next tick —
@@ -1018,7 +1080,7 @@ pub fn agent_tick(
     // install, a test run, or an isolated runtime must never do that by simply existing.
     //   touch ~/.mars/manager/agent.enabled     # on
     //   rm    ~/.mars/manager/agent.enabled     # off
-    if !repo.join("agent.enabled").exists() {
+    if !agent_enabled(&repo) {
         return None;
     }
     let snap = parse_board(board_json)?;
@@ -1087,6 +1149,7 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("docs/layout.md"), include_str!("manager_docs/layout.md"))?;
     seed(&repo.join("docs/cards.md"), include_str!("manager_docs/cards.md"))?;
     seed(&repo.join("docs/memos.md"), include_str!("manager_docs/memos.md"))?;
+    seed(&repo.join("docs/receipts.md"), include_str!("manager_docs/receipts.md"))?;
     seed(&repo.join("docs/memory.md"), include_str!("manager_docs/memory.md"))?;
     seed(&repo.join("docs/tools.md"), include_str!("manager_docs/tools.md"))?;
     seed(&repo.join("policy.md"), include_str!("manager_docs/policy.md"))?;
