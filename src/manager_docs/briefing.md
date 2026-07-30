@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 8 -->
+<!-- mars-doc-version: 10 -->
 # The mission briefing
 
 **Read first. Written last.** It is the only thing many glances ever see: two to five seconds,
@@ -47,14 +47,25 @@ Three short paragraphs, blank line between. No headings, no bullets, no lists, n
 forty words total.
 
 ```
-The sweep finished at 0.91, its best yet. claude has been waiting on a prompt for 20m.
+Afternoon, captain. The sweep finished at 0.91 while you were out, its best yet — though
+claude has been waiting on a prompt for 20m.
 
 Answer claude — nothing else moves until you do.
 
-Everything else is quiet, which for this board is its own kind of news.
+The rest can wait for you.
 ```
 
-1. **What CHANGED since they last looked.** Not the state — the delta. At most two sentences.
+1. **Greet the captain, then say what CHANGED.** Open with a short warm line addressed to them —
+   the tone of someone who has been keeping watch and is glad they are back, not a status
+   terminal. Then straight into what moved. Same paragraph, no ceremony, at most three sentences
+   in total.
+
+   ```
+   Morning, captain. The sweep finished at 0.91 while you were out, its best yet.
+   ```
+
+   The greeting is one clause, and it varies — never open the same way twice in a row. If
+   something is on fire, the warmth compresses to a word and the fact comes first.
 2. **The one thing that needs them**, as a single next move. When nothing does, write exactly
    `Nothing is blocked.` and stop.
 3. **One closing line.** This is where the wit lives, and only here. A dry beat when the board is
@@ -80,6 +91,18 @@ Nothing is blocked.
 A quiet board is the one moment there is room to answer *"what was I doing?"* rather than
 *"what just happened?"*. Spending it on "all quiet" wastes the only briefing they will read
 unhurried.
+
+## Never report what did not change
+
+A workspace that has not moved is **not news** and must not appear. "Terminal 2 is unchanged",
+"terminal 3 is still idle", "both panes unmoved" — cut every one of them. The board already shows
+idle panes; repeating them spends the captain's attention on the one thing they can see for
+themselves.
+
+This applies to the whole briefing, including the closing line. If the only thing you can find to
+say is that nothing moved, you have a quiet board — go to project state and next steps, above.
+
+Say what a pane is doing when it is doing something. Otherwise leave it out entirely.
 
 ## Rules
 

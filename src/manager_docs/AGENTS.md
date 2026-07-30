@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 9 -->
+<!-- mars-doc-version: 10 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the

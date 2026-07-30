@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 9 -->
+<!-- mars-doc-version: 10 -->
 # Workspace summaries
 
 **Read second**, after the briefing, when a row is tapped. One file per workspace at
@@ -50,8 +50,12 @@ matters differently the day before a release than in the middle of a refactor.
 ## Rules
 
 - **Never restate the row.** Name, state and age are already on screen above this.
-- **Skip workspaces whose delta is empty.** An untouched file beats a rewritten identical one,
-  and it is how they can trust that a changed file means something changed.
+- **Skip a workspace whose TAIL is unchanged since the previous snapshot** — not one whose delta
+  is empty. `delta` only fills from lines that scroll off, so a full-screen program that repaints
+  in place (an editor, an agent, a dashboard) has an empty delta forever no matter how much it
+  does. Comparing this snapshot's tail against the previous one is what actually tells you whether
+  anything happened. An untouched file beats a rewritten identical one, and it is how the captain
+  can trust that a changed file means something changed.
 - **Formatting is allowed here** — bullets and one bold item — unlike the mission briefing, which
   is plain prose. This is read deliberately, not at a glance.
 - **Do not invent a command.** If the output does not show one, `Last: unknown` is the honest
