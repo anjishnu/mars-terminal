@@ -547,7 +547,7 @@ fn strip_markup(text: &str) -> String {
         .join("\n")
 }
 
-fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64) -> Option<String> {
+fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64, plain_only: bool) -> Option<String> {
     let age = ts.saturating_sub(mtime_secs(path));
     if age > stale_secs {
         return None;
@@ -568,7 +568,10 @@ fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64) -> Option<String> {
         .skip_while(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    let body = strip_markup(body.trim());
+    // Only the briefing must be plain: it renders as markdown on a glance surface, where a
+    // stray backtick swallows a line. A workspace note is read deliberately, and its bullets and
+    // bolded recommendation are the point.
+    let body = if plain_only { strip_markup(body.trim()) } else { body.trim().to_string() };
     let body = body.trim();
     (!body.is_empty()).then(|| body.to_string())
 }
@@ -676,7 +679,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
             // …then prefer the agent, but only while its prose is FRESHER than the ground truth
             // it describes. An eloquent briefing about a board that has since moved is worse
             // than a blunt sentence about the board as it is.
-            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs));
+            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs, true));
             let (narrative, narrative_source) = match agent {
                 Some(a) => (a, "agent"),
                 None => (computed, "computed"),
@@ -693,7 +696,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     // Per FIELD, not per document: a garbled workspace summary costs that one
                     // workspace its prose and nothing else.
                     let w = dir.as_ref()
-                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs));
+                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs, false));
                     let (summary, source) = match w {
                         Some(a) => (a, "agent"),
                         None => (workspace_summary(p), "computed"),
