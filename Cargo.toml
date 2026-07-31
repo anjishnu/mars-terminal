@@ -18,9 +18,16 @@ categories = ["command-line-utilities", "text-editors"]
 # Keep the published package lean: ship only source + README + LICENSE, not the
 # design docs, .claude/, or scratch. (target/ and .git are auto-excluded.)
 # Leading "/" anchors to the package root (gitignore glob semantics) so a bare
-# "README.md" doesn't also sweep in design_ideas/README.md. install.sh is REQUIRED:
-# broker.rs embeds it via include_str!, so the crate won't compile without it.
-include = ["src/**/*.rs", "src/prompts/*.md", "src/**/*.json", "src/syntaxes/*.sublime-syntax", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md", "/install.sh"]
+# "README.md" doesn't also sweep in design_ideas/README.md.
+#
+# Two entries are REQUIRED rather than nice-to-have, and both are easy to lose because nothing
+# in a local build notices: `include_str!` reads from the source tree, so a file missing from the
+# PACKAGE only fails for whoever installs from crates.io.
+#   install.sh          — broker.rs embeds it.
+#   src/manager_docs/*  — manager.rs embeds all 12 (AGENTS.md, the docs/ spokes, prompt.md AND
+#                         run.sh, which is why this is a bare * and not *.md).
+# Verify with a build from the extracted tarball, never from `cargo package --list` alone.
+include = ["src/**/*.rs", "src/prompts/*.md", "src/manager_docs/*", "src/**/*.json", "src/syntaxes/*.sublime-syntax", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md", "/install.sh"]
 
 [[bin]]
 name = "mars"

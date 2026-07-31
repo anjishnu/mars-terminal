@@ -633,6 +633,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // In memory deliberately: a daemon restart just means the first snapshot has a tail and no
     // delta, which is the honest answer — we genuinely did not watch that stretch.
     let mut pane_cursors: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    // The previous snapshot's tail per pane, so "what is new" can be computed for a pane that
+    // repaints instead of scrolling. In memory deliberately, like the cursor above: a daemon
+    // restart just means the first snapshot has a tail and no delta, which is the honest answer.
+    let mut last_tail: std::collections::HashMap<usize, Vec<String>> = std::collections::HashMap::new();
     let mut last_pane_json: Option<String> = None;
     let mut watched_pane: Option<usize> = None;
     // Whether the watched pane is streamed as raw PTY bytes (the xterm.js renderer) rather
@@ -897,7 +901,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         rows.iter().map(|r| crate::manager::plain(r))
                             .filter(|l| !l.trim().is_empty()).collect()
                     };
-                    let delta = take(total.saturating_sub(MANAGER_DELTA_CAP).max(cursor), total);
+                    let scrolled = take(total.saturating_sub(MANAGER_DELTA_CAP).max(cursor), total);
                     // The tail is the VISIBLE SCREEN, not the log. `capture()` only harvests rows
                     // that scrolled OFF, so a pane whose output fits on screen has an entirely
                     // empty line log — which is why every snapshot carried tail=0, delta=0 and the
@@ -925,6 +929,25 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         .rev()
                         .collect();
                     pane_cursors.insert(tid, total);
+                    // What is NEW since the last snapshot.
+                    //
+                    // The log only holds rows that scrolled OFF the top, so for a full-screen TUI
+                    // that repaints in place — an agent pane, vim, htop — it is permanently empty.
+                    // Measured on this machine: delta was empty in 147 of 147 pane-records, while
+                    // `AGENTS.md` tells the agent an empty delta means "the pane has genuinely not
+                    // moved, and that is your licence to skip it". So it skipped everything, wrote
+                    // nothing for thirteen hours, and its prose aged out of the briefing entirely.
+                    //
+                    // Diffing consecutive tails covers exactly the case the log cannot see. Both
+                    // are kept: the log is the real record for a pane that scrolls, and the diff
+                    // is the only record for one that repaints.
+                    let prev = last_tail.get(&tid);
+                    let delta: Vec<String> = if !scrolled.is_empty() {
+                        scrolled
+                    } else {
+                        crate::manager::tail_delta(prev.map(|v| v.as_slice()).unwrap_or(&[]), &tail)
+                    };
+                    last_tail.insert(tid, tail.clone());
                     out.insert(pid.to_string(), serde_json::json!({ "tail": tail, "delta": delta }));
                 }
                 let output = serde_json::Value::Object(out);

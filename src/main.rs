@@ -6584,6 +6584,51 @@ fn selfcheck() -> Result<()> {
                 "the host must still record what it is given — the byUser gate lives on the phone");
         }
         println!("[selfcheck] manager: an action resolves to the words it judged ... PASS");
+        // The lock must not be held by a daemon that decided not to run. An idle session used to
+        // claim it every tick, refresh it, bail at the inbox and keep it forever — starving the
+        // busy session for twelve hours on this machine.
+        {
+            let _ = std::fs::remove_file(repo.join("agent.lock"));
+            assert!(manager::claim_lock_for_test(&repo, "idle-session", 9_000_000),
+                "a free lock was refused");
+            // A second daemon is correctly refused while the first genuinely holds it…
+            assert!(!manager::claim_lock_for_test(&repo, "busy-session", 9_000_010),
+                "two daemons held the agent lock at once");
+            // …but the moment the holder gives it back, the busy one gets it on the NEXT tick —
+            // not three minutes later when the lock happens to go stale.
+            manager::release_lock_for_test(&repo, "idle-session");
+            assert!(manager::claim_lock_for_test(&repo, "busy-session", 9_000_020),
+                "the lock was not released by its owner, so a bail still starves everyone else");
+            // Releasing is owner-scoped: a daemon must never drop a lock it does not hold.
+            manager::release_lock_for_test(&repo, "idle-session");
+            assert!(!manager::claim_lock_for_test(&repo, "third-session", 9_000_030),
+                "a non-owner released somebody else's lock");
+            let _ = std::fs::remove_file(repo.join("agent.lock"));
+        }
+        println!("[selfcheck] manager: the lock is released when a run is declined ... PASS");
+        // `delta` answers "what is new", and the line log only sees rows that scrolled OFF — so
+        // for a repainting TUI it saw nothing, told the agent the pane had not moved, and the
+        // agent skipped every workspace for thirteen hours.
+        {
+            let v = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| s.to_string()).collect() };
+            // Scrolled: the window moved up by two, so only the two genuinely new lines are new.
+            assert_eq!(manager::tail_delta(&v(&["a", "b", "c"]), &v(&["b", "c", "d", "e"])),
+                v(&["d", "e"]), "a scrolled window reported the wrong delta");
+            // Repainted in place: one row changed, and only that row is news.
+            assert_eq!(manager::tail_delta(&v(&["x", "y", "z"]), &v(&["x", "CHANGED", "z"])),
+                v(&["CHANGED"]), "a repaint in place reported the wrong delta");
+            // Unmoved must stay EMPTY — that is the agent's licence to skip, and a delta that is
+            // never empty would make it rewrite every workspace on every tick instead.
+            assert!(manager::tail_delta(&v(&["a", "b"]), &v(&["a", "b"])).is_empty(),
+                "an unchanged pane reported a delta, so nothing can ever be skipped");
+            // First sight of a pane: everything is new.
+            assert_eq!(manager::tail_delta(&[], &v(&["a"])), v(&["a"]),
+                "the first snapshot dropped the screen it had never seen");
+            // A repeated line must not let a short accidental overlap beat the real one.
+            assert_eq!(manager::tail_delta(&v(&["p", "p", "q"]), &v(&["p", "q", "r"])),
+                v(&["r"]), "a repeated line confused the overlap scan");
+        }
+        println!("[selfcheck] manager: delta sees a repainting pane ... PASS");
     // ── mars pair preflight ─────────────────────────────────────────────────────────────
     // Pure logic, so it is testable without a tunnel, an account or a phone.
     #[cfg(feature = "web")]
@@ -6634,6 +6679,56 @@ fn selfcheck() -> Result<()> {
             "the preflight check leaked its fixture into the real config");
     }
     println!("[selfcheck] pair: preflight is instant and config-backed ... PASS");
+
+    // ── The bridge's filesystem seam ────────────────────────────────────────────────────
+    // The phone reaches this over a PUBLIC tunnel, so `fs.read`/`fs.write` with an unbounded
+    // path was arbitrary file access as the user: `~/.ssh/id_rsa` out, `~/.zshrc` in, which is
+    // remote code execution on the next shell.
+    #[cfg(feature = "web")]
+    {
+        use serve::resolve_path_for_test as rp;
+        let home = sys::paths::home_dir().expect("no home");
+        let sandbox = home.join(".mars").join("fscheck");
+        std::fs::create_dir_all(&sandbox)?;
+
+        // Ordinary work is still reachable — a containment check that denies everything would
+        // pass every assertion below and make the feature useless.
+        std::fs::write(sandbox.join("notes.md"), "hello\n")?;
+        assert!(rp(&sandbox.join("notes.md").display().to_string()).is_ok(),
+            "containment rejected an ordinary file inside the root");
+        assert!(rp("~/").is_ok(), "the root itself was rejected");
+
+        // Outside the root, by absolute path and by traversal.
+        assert!(rp("/etc/hosts").is_err(), "served a file outside the root");
+        assert!(rp("~/../../etc/passwd").is_err(), "`..` escaped the root");
+
+        // Credentials, INSIDE the root. The bridge exists to read your work; none of this is.
+        assert!(rp("~/.ssh/id_rsa").is_err(), "served an ssh private key");
+        assert!(rp("~/.aws/credentials").is_err(), "served aws credentials");
+        assert!(rp("~/.env").is_err(), "served a dotenv file");
+        // …but a name that merely STARTS with a denied one is an ordinary directory. A string
+        // prefix test would reject this; component matching is why it doesn't.
+        std::fs::create_dir_all(home.join(".mars/fscheck/.sshnotes"))?;
+        std::fs::write(home.join(".mars/fscheck/.sshnotes/a.md"), "x\n")?;
+        assert!(rp(&home.join(".mars/fscheck/.sshnotes/a.md").display().to_string()).is_ok(),
+            "`.sshnotes` was denied by a prefix match on `.ssh`");
+
+        // The one that pins the ORDER of canonicalize and check. A symlink living inside the
+        // root points out of it; only resolving first, then testing, catches this. Checking the
+        // raw string first passes every other assertion here and still leaks the whole disk.
+        #[cfg(unix)]
+        {
+            let link = sandbox.join("escape");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink("/etc", &link).ok();
+            assert!(rp(&link.join("hosts").display().to_string()).is_err(),
+                "a symlink inside the root escaped it — resolve_path is checking before it \
+                 canonicalizes");
+            let _ = std::fs::remove_file(&link);
+        }
+        let _ = std::fs::remove_dir_all(&sandbox);
+        println!("[selfcheck] bridge: fs paths are contained ... PASS");
+    }
 
 
 

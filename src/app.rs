@@ -5233,13 +5233,32 @@ impl App {
         }
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return false };
         let pane_id = tab.focused_pane;
-        if self.pane_verdict(pane_id) == crate::briefing::Verdict::Running {
-            return false;
-        }
         let Some(PaneContent::Terminal(tid)) = self.panes.get(&pane_id).map(|p| p.content.clone())
         else {
             return false;
         };
+        // Never deliver a turn into a pane that is already working — that would run two `claude`
+        // processes over the same batch, both writing the same files.
+        //
+        // Ask the PROCESS TABLE, not the verdict. This used to test `verdict == Running`, and two
+        // separate things make that unreliable: a turn that goes quiet while the model thinks now
+        // reads `stalled` rather than `running`, and `classify` falls back to Running for any
+        // verdict string matching no keyword — so the guard could be both too loose and too
+        // tight. "Is a command executing in this pane" has an exact answer and this is it.
+        match self.terms.get(&tid).and_then(|t| t.foreground_busy()) {
+            Some(true) => return false,
+            Some(false) => {}
+            // No claim available (Windows has no foreground process group to ask). Fall back to
+            // the verdict, treating a stalled pane as busy — it is one, by definition.
+            None => {
+                if matches!(
+                    self.pane_verdict(pane_id),
+                    crate::briefing::Verdict::Running | crate::briefing::Verdict::Stalled
+                ) {
+                    return false;
+                }
+            }
+        }
         // One-shot `-p` per turn rather than typing into a live REPL. A REPL needs its startup,
         // its trust prompt and its turn state all detected from the outside; a shell is idle at a
         // prompt and runs what it is given. The agent's memory lives on disk by design, so

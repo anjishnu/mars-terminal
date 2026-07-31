@@ -590,6 +590,38 @@ fn unwrap_prose(text: &str) -> String {
         .join("\n\n")
 }
 
+/// When did the captain last stop looking at this session? Anything written after that is news to
+/// them, however old the wall clock says it is.
+///
+/// `presence.json` records the attach edge and how long they had been away, so the moment they
+/// stopped looking is `since_ts - away_secs` while attached, and `since_ts` itself once they have
+/// left. The same record that scopes an arrival run answers this.
+fn last_seen_ts(sdir: &Path) -> Option<u64> {
+    let p: serde_json::Value = std::fs::read_to_string(presence_path(sdir))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())?;
+    let since = p["since_ts"].as_u64()?;
+    Some(match p["watched"].as_bool() {
+        Some(true) => since.saturating_sub(p["away_secs"].as_u64().unwrap_or(0)),
+        _ => since,
+    })
+}
+
+/// Signed agent prose regardless of age, with how old it is.
+///
+/// Age is no longer a reason to DISCARD. It used to be: anything past 45 minutes was dropped and
+/// the phone showed arithmetic instead — so logging in after a night away produced "2 running · 1
+/// idle" while a real briefing about that night sat unread on disk. Hiding the good answer to
+/// avoid showing an old one is the wrong trade; the fix is to say how old it is.
+///
+/// The original worry stands and is answered by the label rather than by suppression: a briefing
+/// describing a board that has since moved is misleading *if you cannot tell*. The board rows
+/// beside it are always current, and the age is now rendered next to the prose.
+fn read_agent_prose_aged(path: &Path, ts: u64, plain_only: bool) -> Option<(String, u64)> {
+    let body = read_agent_prose(path, ts, u64::MAX, plain_only)?;
+    Some((body, ts.saturating_sub(mtime_secs(path))))
+}
+
 fn read_agent_prose(path: &Path, ts: u64, stale_secs: u64, plain_only: bool) -> Option<String> {
     let age = ts.saturating_sub(mtime_secs(path));
     if age > stale_secs {
@@ -725,10 +757,22 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
             // …then prefer the agent, but only while its prose is FRESHER than the ground truth
             // it describes. An eloquent briefing about a board that has since moved is worse
             // than a blunt sentence about the board as it is.
-            let agent = dir.as_ref().and_then(|d| read_agent_prose(&d.join("mission_briefing.md"), ts, stale_secs, true));
-            let (narrative, narrative_source) = match agent {
-                Some(a) => (a, "agent"),
-                None => (computed, "computed"),
+            // Prefer what the agent actually wrote, at ANY age. Arithmetic is the floor for when
+            // she has written nothing at all — not a replacement for prose that got old.
+            let agent = dir.as_ref()
+                .and_then(|d| read_agent_prose_aged(&d.join("mission_briefing.md"), ts, true));
+            let seen = dir.as_ref().and_then(|d| last_seen_ts(d));
+            let (narrative, narrative_source, age, fresh_to_them) = match agent {
+                Some((a, age)) => {
+                    // "New to me" beats "recent". A briefing written six hours ago, while they
+                    // were asleep, is news; one written five minutes before they last looked is
+                    // not, however fresh the clock calls it.
+                    let news = seen
+                        .map(|s| mtime_secs(&dir.as_ref().unwrap().join("mission_briefing.md")) > s)
+                        .unwrap_or(true);
+                    (a, "agent", Some(age), news)
+                }
+                None => (computed, "computed", None, true),
             };
             // The briefing had no identity at all: it reached the phone as prose plus a source
             // label, so nothing could ever point at the words somebody actually read.
@@ -739,6 +783,11 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                 "narrative": narrative,
                 "narrativeSource": narrative_source,
                 "narrativeVersion": narrative_version,
+                // How old the prose is, and whether it postdates their last look. The phone
+                // renders the first and uses the second to decide whether to type it out again —
+                // re-animating a briefing somebody already read is the tell of a dumb screen.
+                "narrativeAgeSecs": age,
+                "narrativeIsNews": fresh_to_them,
                 "path": dir.as_ref()
                     .map(|d| d.join("mission_briefing.md").to_string_lossy().to_string())
                     .unwrap_or_default(),
@@ -746,19 +795,31 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     // Per FIELD, not per document: a garbled workspace summary costs that one
                     // workspace its prose and nothing else.
                     let w = dir.as_ref()
-                        .and_then(|d| read_agent_prose(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, stale_secs, false));
+                        .and_then(|d| read_agent_prose_aged(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, false));
                     // Two FIELDS, not one. The ticker ("running · 5m") and the agent's note are
                     // different kinds of thing on different clocks — one is arithmetic that must
                     // always be current, the other is judgement that may be minutes old or absent.
                     // Sharing a field meant whichever wrote last erased the other, so a live
                     // status could silently replace a considered note and vice versa.
-                    let summary = w.unwrap_or_default();
+                    // An EMPTY summary is not a neutral default — the phone reads it as "the
+                    // daemon has not answered", waits a grace period, and then spends a model
+                    // call asking for one itself. Every 4-second poll re-ran that, so a stale
+                    // note produced a summary that changed wording every few seconds. Falling
+                    // back to the deterministic status line instead is stable, current and free.
+                    let (summary, summary_source, summary_age) = match w {
+                        Some((text, age)) => (text, "agent", Some(age)),
+                        None => (workspace_summary(p), "computed", None),
+                    };
                     serde_json::json!({
                         "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
                         "kind": p.kind, "ageSecs": p.age_secs,
                         "status": workspace_summary(p),
                         "summary": summary,
-                        "summarySource": "agent",
+                        // Was hardcoded "agent" even when the summary was empty or computed —
+                        // the provenance mark, whose only job is honesty, asserting authorship
+                        // of a string the agent never wrote.
+                        "summarySource": summary_source,
+                        "summaryAgeSecs": summary_age,
                         "summaryVersion": version_of(&summary),
                     })
                 }).collect::<Vec<_>>()).unwrap_or_default(),
@@ -1571,6 +1632,23 @@ fn claim_agent_lock(repo: &Path, owner: &str, ts: u64, stale_secs: u64) -> bool 
     true
 }
 
+/// Give the lock back, if it is ours to give.
+///
+/// Claiming is cheap and holding is not: the holder is refreshed on every tick, so a daemon that
+/// claims and then finds nothing to do keeps the mutex fresh forever and every other daemon backs
+/// off from a lock whose owner is not using it. Releasing on the way out means a bail costs the
+/// next tick nothing.
+fn release_agent_lock(repo: &Path, owner: &str) {
+    let path = repo.join("agent.lock");
+    let held: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if held["owner"].as_str() == Some(owner) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Decide whether to wake the agent, and compose what to type if so.
 ///
 /// Returns the prompt line. `None` means "nothing to do" — which is the common case and is a
@@ -1594,9 +1672,6 @@ pub fn agent_tick(
     let snap = parse_board(board_json)?;
     let sessions = [snap];
 
-    if !claim_agent_lock(&repo, owner, ts, AGENT_LOCK_STALE_SECS) {
-        return None;
-    }
     // The flag file is the cadence gate. Absent → due now, which is what makes deleting it the
     // testing lever. A newly-blocked workspace still bypasses the floor entirely.
     let last = std::fs::metadata(last_run_path(&repo))
@@ -1616,12 +1691,30 @@ pub fn agent_tick(
     if reason != "blocked" && reason != "arrived" && !floor_passed {
         return None;
     }
+    // The lock is claimed HERE, not at the top, and the ordering is the whole point.
+    //
+    // Everything above is a read-only decision. Claiming before making it meant a session with
+    // nothing to do took the mutex every tick, refreshed its timestamp, bailed at the inbox, and
+    // held it forever — while a session with twenty unconsumed snapshots backed off from a lock
+    // whose owner was not using it. That cost this machine twelve hours of manager silence, and
+    // it is a standing hazard with more than one session rather than a one-off: the idle one
+    // always wins the race, because it is the one that finishes its tick first.
+    if !claim_agent_lock(&repo, owner, ts, AGENT_LOCK_STALE_SECS) {
+        return None;
+    }
     // Only now do we touch the inbox: no pending snapshots means no turn, whatever the clock says.
     // Compose the batch, but return only WHY we are waking. The turn's instruction lives in
     // prompt.md and is read by the shell at delivery — the one thing we most want to iterate on
     // should not need a recompile, and there is only ever one open batch to find.
-    compose_batch(&repo, &sessions, ts, arrival.as_ref()).ok().flatten()?;
-    Some(reason.to_string())
+    match compose_batch(&repo, &sessions, ts, arrival.as_ref()) {
+        Ok(Some(_)) => Some(reason.to_string()),
+        // Nothing to work after all — hand the lock straight back rather than sit on it until it
+        // goes stale three minutes from now.
+        _ => {
+            release_agent_lock(&repo, owner);
+            None
+        }
+    }
 }
 
 /// Write a file only if it is absent. `AGENTS.md`, `docs/**`, `policy.md` and the memory seeds
@@ -1874,6 +1967,10 @@ pub fn existing_session_dir_pub(name: &str) -> Option<PathBuf> { existing_sessio
 
 // Seams for the headless checks, which have no daemon, no phone and no agent behind them.
 pub fn render_briefing_for_test(s: &SessionSnap) -> String { session_briefing(s, 0) }
+pub fn claim_lock_for_test(repo: &Path, owner: &str, ts: u64) -> bool {
+    claim_agent_lock(repo, owner, ts, AGENT_LOCK_STALE_SECS)
+}
+pub fn release_lock_for_test(repo: &Path, owner: &str) { release_agent_lock(repo, owner) }
 pub fn render_narrative_for_test(s: &SessionSnap) -> String { session_narrative(s) }
 pub fn arrival_for_test(repo: &Path, sessions: &[SessionSnap], floor_secs: u64) -> Option<Arrival> {
     arrival(repo, sessions, floor_secs)
@@ -2450,6 +2547,33 @@ pub fn plain(row: &[u8]) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).trim_end().to_string()
+}
+
+/// What is new in `now` that was not in `prev` — the delta for a pane that REPAINTS rather than
+/// scrolls, where the line log sees nothing at all.
+///
+/// Two shapes have to work and they want opposite algorithms. A pane that scrolls shifts its whole
+/// window up, so the new lines are a suffix and the old ones reappear shifted; a pane that
+/// repaints rewrites arbitrary rows in place. The overlap scan handles the first — find the
+/// longest prefix of `now` that is a suffix of `prev` and take what follows. Falling back to a
+/// set difference handles the second, and also a screen that changed completely.
+///
+/// A blank result is meaningful and must stay possible: it is how the agent is told a pane really
+/// has not moved, which is the licence to skip it.
+pub fn tail_delta(prev: &[String], now: &[String]) -> Vec<String> {
+    if prev.is_empty() {
+        return now.to_vec();
+    }
+    // Scrolled: the top of `now` is the bottom of `prev`. Longest overlap wins, so a repeated
+    // line cannot make a short accidental match beat the real one.
+    for keep in (1..=prev.len().min(now.len())).rev() {
+        if prev[prev.len() - keep..] == now[..keep] {
+            return now[keep..].to_vec();
+        }
+    }
+    // Repainted, or replaced outright: whatever is on screen that was not before, in order.
+    let before: std::collections::HashSet<&String> = prev.iter().collect();
+    now.iter().filter(|l| !before.contains(l)).cloned().collect()
 }
 
 /// What is worth acting on, pulled out of the text by pattern rather than by judgement.

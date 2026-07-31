@@ -19,7 +19,7 @@
 use anyhow::{anyhow, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -60,12 +60,27 @@ fn lan_ip() -> String {
 }
 
 /// 128-bit hex token from the OS CSPRNG (single-use pairing token, short-lived by policy).
-fn mint_token() -> String {
+/// 128 bits from the OS, or nothing.
+///
+/// This used to swallow both failures — the open and the read — leaving `buf` as sixteen zero
+/// bytes and minting the token `00000000000000000000000000000000`, silently, while pairing
+/// reported success. An attacker who can reach the tunnel tries that constant first.
+///
+/// There is no safe degraded mode for a secret, so the only honest failure is to refuse. Note the
+/// asymmetry with everything else in this file: elsewhere a missing piece degrades to a smaller
+/// feature, because the worst case is a duller product. Here the worst case is an open door.
+fn mint_token() -> Result<String> {
     let mut buf = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|e| anyhow!("cannot open /dev/urandom to mint a pairing token: {e}"))?;
+    f.read_exact(&mut buf)
+        .map_err(|e| anyhow!("short read from /dev/urandom while minting a pairing token: {e}"))?;
+    // A working urandom cannot plausibly return this, but the whole point of this function is
+    // that a silent all-zero token once shipped. Cheap to assert, catastrophic to miss.
+    if buf.iter().all(|&b| b == 0) {
+        return Err(anyhow!("/dev/urandom returned all zeros — refusing to mint a pairing token"));
     }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The current pairing token, persisted at `~/.mars/serve.token` so it survives a bridge restart
@@ -87,12 +102,13 @@ fn write_token(tok: &str) {
         let _ = std::fs::write(&p, tok);
     }
 }
-/// Read the persisted token, minting + storing one on first use.
-fn ensure_token() -> String {
-    if let Some(t) = read_token() { return t; }
-    let t = mint_token();
+/// Read the persisted token, minting + storing one on first use. Propagates a minting failure
+/// rather than serving: a bridge that cannot produce a credential must not accept connections.
+fn ensure_token() -> Result<String> {
+    if let Some(t) = read_token() { return Ok(t); }
+    let t = mint_token()?;
     write_token(&t);
-    t
+    Ok(t)
 }
 
 /// A stable-ish daemon identity fingerprint for the prototype (LAN-scoped, TOFU).
@@ -108,7 +124,7 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
     let ip = lan_ip();
     let port = DEFAULT_PORT;
-    let token = mint_token();
+    let token = mint_token()?;
     let fp = daemon_fingerprint(&session);
 
     // The phone loads the app and reads endpoint+identity+token from the FRAGMENT
@@ -252,7 +268,7 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
 
     let (_tunnel, base) = start_tunnel(port)?;
     let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
-    let token = ensure_token();
+    let token = ensure_token()?;
     let fp = daemon_fingerprint(&session);
     let app_url = format!(
         "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
@@ -342,7 +358,7 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
          ngrok (http://127.0.0.1:4040). See the bridge's log (`~/.mars/serve-agent.log`)."
     ))?;
     let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
-    let token = ensure_token();
+    let token = ensure_token()?;
     let fp = daemon_fingerprint(session);
     let app_url = format!(
         "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
@@ -368,7 +384,7 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
 /// tunnel and its URL are untouched.
 pub fn reset_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
-    write_token(&mint_token());
+    write_token(&mint_token()?);
     if running_tunnel_url().is_some() {
         reprint_running(&session, true)
     } else {
@@ -893,8 +909,44 @@ fn fs_home() -> PathBuf {
     crate::sys::paths::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
-/// The path seam. v1: expand `~`, then canonicalize (resolving `..`/symlinks against the
-/// real fs). A not-yet-existing write target canonicalizes its parent and rejoins the name.
+/// Directories whose contents are credentials, never documents. Denied even inside the root,
+/// because the point of the bridge is reading your work, and nothing here is your work.
+const FS_DENY: [&str; 6] = [".ssh", ".aws", ".gnupg", ".config/gh", ".kube", ".docker"];
+
+/// Is `p` inside `root`, and outside every denied directory?
+fn contained(p: &Path, root: &Path) -> bool {
+    if !p.starts_with(root) {
+        return false;
+    }
+    let Ok(rel) = p.strip_prefix(root) else { return false };
+    // Compare whole path COMPONENTS, never a string prefix: `.sshfoo` starts with `.ssh` as text
+    // and is a perfectly ordinary directory.
+    let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into()).collect();
+    if parts.iter().any(|c| c == ".env" || c.starts_with(".env.")) {
+        return false;
+    }
+    !FS_DENY.iter().any(|deny| {
+        let d: Vec<&str> = deny.split('/').collect();
+        parts.windows(d.len()).any(|w| w.iter().zip(&d).all(|(a, b)| a == b))
+    })
+}
+
+/// The path seam: expand `~`, canonicalize (resolving `..`/symlinks against the real fs), then
+/// **verify containment**. A not-yet-existing write target canonicalizes its parent and rejoins
+/// the name.
+///
+/// Order is the whole security property. Canonicalize FIRST, check SECOND — a check on the raw
+/// string is defeated by `../` and by a symlink inside the root pointing out of it, both of which
+/// canonicalization resolves before we ever look. Reversing these two lines silently reopens the
+/// hole while every test still passes.
+///
+/// Without this, one authenticated frame read `~/.ssh/id_rsa`, and one wrote `~/.zshrc` — which is
+/// remote code execution on the next shell. The bridge is reachable from a public tunnel, so a
+/// leaked pairing token meant total host compromise rather than "somebody can see my terminals".
+pub fn resolve_path_for_test(raw: &str) -> std::io::Result<PathBuf> {
+    resolve_path(raw)
+}
+
 fn resolve_path(raw: &str) -> std::io::Result<PathBuf> {
     let raw = raw.trim();
     let p = if raw.is_empty() || raw == "~" {
@@ -904,13 +956,23 @@ fn resolve_path(raw: &str) -> std::io::Result<PathBuf> {
     } else {
         PathBuf::from(raw)
     };
-    match p.canonicalize() {
-        Ok(c) => Ok(c),
+    let resolved = match p.canonicalize() {
+        Ok(c) => c,
         Err(e) => match (p.parent(), p.file_name()) {
-            (Some(parent), Some(name)) => Ok(parent.canonicalize()?.join(name)),
-            _ => Err(e),
+            (Some(parent), Some(name)) => parent.canonicalize()?.join(name),
+            _ => return Err(e),
         },
+    };
+    // The root is canonicalized too: on macOS `$HOME` is often reached through `/System/Volumes`,
+    // so comparing a canonical path against a raw root rejects every legitimate file.
+    let root = fs_home().canonicalize().unwrap_or_else(|_| fs_home());
+    if !contained(&resolved, &root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "outside the shared root",
+        ));
     }
+    Ok(resolved)
 }
 
 fn mtime_secs(md: &std::fs::Metadata) -> u64 {
@@ -1392,7 +1454,7 @@ pub fn link_main(session_arg: Option<String>) -> Result<()> {
     let base = running_tunnel_url()
         .ok_or_else(|| anyhow!("no bridge is running — start one with `mars pair`"))?;
     let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
-    let token = ensure_token();
+    let token = ensure_token()?;
     let fp = daemon_fingerprint(&session);
     println!(
         "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
