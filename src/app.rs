@@ -1151,10 +1151,21 @@ impl App {
                 Some(row)
             })
             .collect();
+        // Where this session actually lives, so the phone's file explorer opens on the work
+        // instead of on the home directory. The focused pane's spawn cwd is the honest answer to
+        // "where am I" — a pane can `cd` later and a PTY cannot see that, so this is where the
+        // shell was put, not a live value.
+        let cwd = match self.panes.get(&self.focused_pane_id()).map(|p| &p.content) {
+            Some(PaneContent::Terminal(t)) => self.terms.get(t).and_then(|t| t.spawn_cwd.clone()),
+            _ => None,
+        }
+        .or_else(|| self.terms.values().find_map(|t| t.spawn_cwd.clone()))
+        .map(|p| p.display().to_string());
         serde_json::json!({
             "session": self.session_name.clone().unwrap_or_default(),
             "rows": rows,
             "health": self.health.line(), // ambient host stats for the phone's console
+            "cwd": cwd,
             "ts": ts,
         })
         .to_string()

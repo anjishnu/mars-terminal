@@ -3352,6 +3352,17 @@ fn selfcheck() -> Result<()> {
         // Exactly the bytes the phone is sent — so the manager can never describe a world Rover
         // does not show.
         let board = app.mobile_board_json();
+        // The phone's file explorer opens on the session's cwd rather than at $HOME, so the board
+        // has to carry it. Asserted against the real spawn directory, not merely for presence —
+        // a field that is always `null` would satisfy a weaker check and change nothing on screen.
+        {
+            let v: serde_json::Value = serde_json::from_str(&board)?;
+            let here = std::env::current_dir()?.canonicalize()?;
+            let got = v["cwd"].as_str().map(std::path::PathBuf::from)
+                .and_then(|p| p.canonicalize().ok());
+            assert_eq!(got.as_ref(), Some(&here),
+                "the board did not carry the session's cwd (got {:?})", v["cwd"]);
+        }
         for i in 0..4u64 {
             manager::tick_session("testbox", &board, 2_000_000 + i * 60, 2, 0, 2700, &serde_json::Value::Null)?;
         }
