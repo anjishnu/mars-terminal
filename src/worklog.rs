@@ -207,13 +207,17 @@ pub fn tier0(e: &WorkEntry) -> (String, String, String) {
     let kind = match crate::briefing::classify(&e.verdict, default) {
         Verdict::Failed => "failed",
         Verdict::Blocked => "blocked",
+        // Unreachable via `classify`, which reads a verdict STRING and has no phrase
+        // that means stalled — stalling is observed from the process table, not written
+        // down by a model. Mapped anyway so the ladder stays total.
+        Verdict::Stalled => "stalled",
         Verdict::Done => "done",
         Verdict::Running => "running",
         Verdict::Context => "context",
     };
     let severity = match kind {
         "failed" => "fail",
-        "blocked" => "warn",
+        "blocked" | "stalled" => "warn",
         _ => "info",
     };
     // Deterministic headline: prefer the structured facts, fall back to the

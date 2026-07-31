@@ -130,6 +130,9 @@ pub struct Term {
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
+    /// The shell we spawned. Compared against the PTY's foreground process group to
+    /// answer "is a command executing right now" — see `foreground_busy`.
+    shell_pid: Option<u32>,
     kill_tx: mpsc::Sender<()>,
     startup_input: Option<StartupInput>,
     exit_code: Arc<Mutex<Option<i32>>>,
@@ -199,6 +202,7 @@ pub fn spawn(
         cmd.env("MARS_SESSION_ID", id);
     }
     let mut child = pair.slave.spawn_command(cmd)?;
+    let shell_pid = child.process_id();
     // Drop our slave copy; child-process exit is tracked separately because
     // ConPTY can keep the master output pipe open after the child is gone.
     drop(pair.slave);
@@ -325,6 +329,7 @@ pub fn spawn(
         parser,
         writer,
         master: pair.master,
+        shell_pid,
         kill_tx,
         startup_input: Some(StartupInput {
             bytes: Vec::new(),
@@ -431,6 +436,32 @@ impl Term {
     /// available once the process watcher has reported exit.
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code.lock().ok().and_then(|code| *code)
+    }
+
+    /// Is a foreground command executing in this pane right now?
+    ///
+    /// The kernel already knows: a PTY has one foreground process group, and the shell
+    /// puts a job there while it runs and takes it back at the prompt. So the answer is
+    /// `tcgetpgrp(master) != shell_pid`, with no cooperation from the shell at all.
+    ///
+    /// This is deliberately NOT the OSC-133 route. Mars scans those markers already, but
+    /// it does not install shell integration — so on a plain zsh no markers ever arrive
+    /// and a feature built on them would silently do nothing on most machines. The
+    /// process group is there whether or not anyone configured anything.
+    ///
+    /// `None` means "cannot know" (Windows, or a PTY that does not report a leader), and
+    /// every caller must read it as *no claim* rather than as `false`.
+    pub fn foreground_busy(&self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            let leader = self.master.process_group_leader()?;
+            let shell = self.shell_pid? as i32;
+            Some(leader != shell)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {

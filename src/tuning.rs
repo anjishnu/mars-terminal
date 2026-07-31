@@ -133,6 +133,7 @@ pub struct Tuning {
     pub tree_width: u16,
     pub tree_show_dotfiles: u64,
     pub watch_quiet_secs: u64,
+    pub stall_secs: u64,
     pub agent_scrollback_context: usize,
     pub memory_cwd_boost: f64,
     pub memory_recency_boost: f64,
@@ -236,6 +237,7 @@ impl Default for Tuning {
             tree_width: 30,
             tree_show_dotfiles: 1,
             watch_quiet_secs: 20,
+            stall_secs: 300,
             agent_scrollback_context: 200,
             memory_cwd_boost: 0.25,
             memory_recency_boost: 0.15,
@@ -444,6 +446,11 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "Seconds a watched terminal (C-t w) must be silent before Mars summarizes it \
              (W6). Also fires immediately on process exit. Generous by design — a false \
              'done' costs more than the feature earns.")),
+        ("stall_secs", knob(json!(d.stall_secs),
+            "Seconds a pane may have a command executing and print NOTHING before it reads \
+             `stalled` instead of `running`. Much longer than watch_quiet_secs on purpose: \
+             quiet is normal (a compile, a download), wedged is not, and only time tells \
+             them apart. 0 disables the verdict entirely.")),
         ("agent_scrollback_context", knob(json!(d.agent_scrollback_context),
             "Lines of a watched/focused terminal's screen sent to the agent for a summary \
              or triage.")),
@@ -660,6 +667,7 @@ pub fn load() -> Tuning {
         t.tree_width = get_u64(&map, "tree_width", t.tree_width as u64) as u16;
         t.tree_show_dotfiles = get_u64(&map, "tree_show_dotfiles", t.tree_show_dotfiles);
         t.watch_quiet_secs = get_u64(&map, "watch_quiet_secs", t.watch_quiet_secs);
+        t.stall_secs = get_u64(&map, "stall_secs", t.stall_secs);
         t.agent_scrollback_context =
             get_u64(&map, "agent_scrollback_context", t.agent_scrollback_context as u64) as usize;
         t.memory_cwd_boost = get_f64(&map, "memory_cwd_boost", t.memory_cwd_boost);

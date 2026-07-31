@@ -615,6 +615,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // owning client so a glance never takes over; board/briefing frames are
     // pushed here on a throttled cadence and dead streams are pruned on write.
     let mut subscribers: Vec<crate::sys::control::Stream> = Vec::new();
+    // Whether a phone was attached on the previous iteration. `None` until the first pass, which
+    // forces one write at boot: a daemon that restarted while a phone was connected would
+    // otherwise inherit a `watched: true` from its predecessor and, on the next reconnect,
+    // measure the absence from an attach that happened in another process's lifetime.
+    let mut presence_watched: Option<bool> = None;
     let mut last_mobile_push: Option<std::time::Instant> = None;
     // The watched pane pushes on its OWN, much tighter clock, and only when the screen actually
     // changed. Coupling it to the board's ~1 Hz status cadence meant a keystroke could take a
@@ -641,6 +646,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
         // Only spend LLM tokens on Rover's map/reduce while a phone is glancing in.
         // (Dead streams are pruned on the next push; a one-tick lag is harmless.)
         app.rover_active = !subscribers.is_empty();
+        // Record the edge, not the state: the manager needs to know when somebody started
+        // looking and how long they had been away, which is a fact about a transition.
+        if presence_watched != Some(app.rover_active) {
+            if let Some(name) = app.session_name.as_deref() {
+                crate::manager::mark_presence(name, app.rover_active, crate::worklog::now_secs());
+            }
+            presence_watched = Some(app.rover_active);
+        }
         // The last phone dropped while raw-watching → stop capturing its pane's output.
         if subscribers.is_empty() {
             seeded_pane = None;

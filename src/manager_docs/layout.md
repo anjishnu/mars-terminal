@@ -1,3 +1,4 @@
+<!-- mars-doc-version: 1 -->
 # Layout
 
 ```
@@ -10,6 +11,7 @@
 │   ├── index.json               the same, for Rover — one read         <- generated
 │   ├── timeline.md              append-only event log, oldest first    <- generated
 │   ├── inbox/                   stimuli waiting to be processed
+│   ├── archive/YYYY-MM-DD.jsonl everything you have ever written       <- generated
 │   └── memory/                  YOURS. Nothing else writes here.
 │       ├── beliefs.md           working memory, <=200 lines, REWRITTEN
 │       ├── projects.md          what each project is
@@ -23,6 +25,24 @@
     ├── snapshots/               raw stimuli, pruned                    <- generated
     └── timeline.md              this session's events                  <- generated
 ```
+
+## The archive
+
+`mission_briefing.md` and every `workspaces/<pane>.md` are **overwritten** each run. That is right
+for the live artifacts — the phone wants the current answer — but it means each sentence you write
+destroys the one before it.
+
+`archive/<YYYY-MM-DD>.jsonl` keeps them. One append-only line per version, written by Mars when
+your prose changes, holding `{at, session, session_id, kind, pane, words, text}`. Deduplicated on
+**content**, so rewriting a note identically keeps nothing and a run that only touched mtimes adds
+no records. Only signed prose is kept; the deterministic `*.computed.md` rendering is arithmetic
+over snapshots that are still on disk.
+
+You may read it, and it is the only way to answer questions that span time: whether a belief held
+up, whether the same failure keeps coming back, what you said about this last week. Nothing yet
+requires you to — treat it as available evidence rather than another step in the run.
+
+Never write here. One writer, append-only, or the record is not a record.
 
 ## Why the directory is an id, not a name
 

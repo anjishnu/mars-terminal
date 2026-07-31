@@ -271,6 +271,7 @@ fn verdict_color(app: &App, v: crate::briefing::Verdict) -> Color {
     match v {
         Verdict::Blocked => app.tuning.palette.warning, // amber
         Verdict::Failed  => app.tuning.palette.danger,  // red
+        Verdict::Stalled => app.tuning.palette.warning, // amber — it may want you
         Verdict::Running => app.tuning.palette.success,        // green
         Verdict::Done    => app.tuning.palette.info,       // teal
         Verdict::Context => app.tuning.palette.text_dim,                          // idle

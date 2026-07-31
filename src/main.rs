@@ -1195,6 +1195,24 @@ fn selfcheck() -> Result<()> {
     while rx.try_recv().is_ok() {}
     println!("[selfcheck] terminal PTY echo .......... PASS");
 
+    // 15z. The `stalled` verdict rests entirely on knowing whether a command is EXECUTING, and
+    //      the kernel is the only thing that knows: a PTY's foreground process group is the shell
+    //      at a prompt, or the job it launched. Both directions are asserted, because a predicate
+    //      stuck on either answer would silently make the verdict either impossible or universal.
+    #[cfg(unix)]
+    {
+        assert_eq!(sh.foreground_busy(), Some(false),
+            "a shell sitting at its prompt reported a foreground command");
+        sh.send_bytes(b"sleep 5\r");
+        assert!(wait_until(|| sh.foreground_busy() == Some(true)),
+            "a running `sleep` was not visible as a foreground command");
+        sh.send_bytes(b"\x03"); // C-c — leave the shell at a prompt for the checks that follow
+        assert!(wait_until(|| sh.foreground_busy() == Some(false)),
+            "the pane stayed busy after the command was interrupted");
+        while rx.try_recv().is_ok() {}
+        println!("[selfcheck] pane foreground detection .. PASS");
+    }
+
     // 15a. Terminal mouse-copy: the selection extractor pulls the selected cells
     //      as text (the core of drag-to-copy in a terminal pane).
     {
@@ -6344,6 +6362,127 @@ fn selfcheck() -> Result<()> {
                 "the placeholder instance matched an unrelated session");
         }
         println!("[selfcheck] manager: a rename moves the record, not the history ... PASS");
+        // `stalled` has to travel the whole way as its own state. It was tempting to fold it into
+        // `running` on the board and only distinguish it in prose — which would have left the one
+        // surface people actually look at unable to show the thing.
+        {
+            use briefing::Verdict;
+            assert!(Verdict::Stalled.rank() > Verdict::Running.rank()
+                && Verdict::Stalled.rank() < Verdict::Failed.rank(),
+                "stalled must outrank healthy work and yield to a settled failure");
+            let stalled = manager::PaneRow {
+                id: "7".into(), pane_id: "7".into(), name: "build".into(),
+                verdict: "stalled".into(), kind: "terminal".into(),
+                why: "cargo build · silent 12m".into(),
+                age_secs: 900, blocked_prompt: None, focused: false,
+            };
+            let snap = manager::SessionSnap {
+                name: "stall".into(), health: String::new(), panes: vec![stalled],
+            };
+            let doc = manager::render_briefing_for_test(&snap);
+            assert!(doc.contains("1 needs you"),
+                "a stalled pane did not count as needing the captain: {doc}");
+            assert!(doc.contains("build"), "the stalled workspace was not named: {doc}");
+            let prose = manager::render_narrative_for_test(&snap);
+            assert!(prose.contains("silent") && prose.contains("build"),
+                "the deterministic narrative said nothing about the stall: {prose}");
+            assert!(!prose.contains("board is quiet"),
+                "a stalled board reported itself as quiet: {prose}");
+        }
+        println!("[selfcheck] manager: stalled is its own state end to end ... PASS");
+        // "What did I miss" — an arrival must widen the window PAST the agent's own cursor.
+        // Without that this feature is indistinguishable from the ordinary cadence, which is
+        // exactly the failure mode: it would look implemented and change nothing.
+        {
+            let dir = manager::session_dir("awaytest", "inst-away", 2_000_000).expect("no dir");
+            let snaps = dir.join("snapshots");
+            std::fs::create_dir_all(&snaps)?;
+            for n in ["2026-07-30T01-00-00.json", "2026-07-30T05-00-00.json",
+                      "2026-07-30T08-00-00.json"] {
+                std::fs::write(snaps.join(n), "{}")?;
+            }
+            // The agent has already read everything up to 05:00.
+            std::fs::create_dir_all(repo.join("memory"))?;
+            std::fs::write(repo.join("memory/cursor.json"), serde_json::json!({
+                "awaytest": "2026-07-30T05-00-00.json",
+            }).to_string())?;
+            let board = vec![manager::SessionSnap {
+                name: "awaytest".into(), health: String::new(), panes: Vec::new(),
+            }];
+
+            // Nobody has arrived: the batch is scoped by the cursor, as it always was.
+            let _ = std::fs::remove_dir_all(repo.join("inbox"));
+            let p = manager::compose_batch(&repo, &board, 2_000_100, None)?.expect("no batch");
+            let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p)?)?;
+            let names = |v: &serde_json::Value| -> Vec<String> {
+                v["sessions"][0]["snapshots"].as_array().unwrap_or(&vec![]).iter()
+                    .filter_map(|s| s.as_str().map(String::from)).collect()
+            };
+            assert_eq!(names(&v), vec!["2026-07-30T08-00-00.json"],
+                "an ordinary batch did not follow the cursor");
+
+            // They left at 01:00 and picked the phone up at 09:00. Everything since they stopped
+            // looking is back on the table, including the snapshot the agent already consumed.
+            manager::mark_presence("awaytest", false, 1_785_000_000);
+            manager::mark_presence("awaytest", true, 1_785_000_000 + 8 * 3600);
+            let _ = std::fs::remove_dir_all(repo.join("inbox"));
+            let a = manager::arrival_for_test(&repo, &board, 1200).expect("no arrival detected");
+            assert_eq!(a.away_secs, 8 * 3600, "the absence was measured wrong");
+            let p = manager::compose_batch(&repo, &board, 2_000_200, Some(&a))?.expect("no batch");
+            let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p)?)?;
+            assert!(names(&v).len() >= 2 && names(&v).contains(&"2026-07-30T05-00-00.json".into()),
+                "an arrival did not reach back past the agent's cursor: {:?}", names(&v));
+            assert_eq!(v["sessions"][0]["away_secs"].as_u64(), Some(8 * 3600),
+                "the agent was not told how long they were gone");
+            assert!(v["sessions"][0]["covers_from"].is_string(),
+                "the batch claimed an absence window without saying where it really starts");
+
+            // A brief glance away is not an absence. Firing here would rewrite the briefing the
+            // captain is holding, with the same facts, every time the screen woke up.
+            manager::mark_presence("awaytest", false, 1_785_100_000);
+            manager::mark_presence("awaytest", true, 1_785_100_000 + 30);
+            assert!(manager::arrival_for_test(&repo, &board, 1200).is_none(),
+                "a 30-second glance counted as an absence");
+        }
+        println!("[selfcheck] manager: arrival widens the window past the cursor ... PASS");
+        // The archive is the only place a briefing survives being overwritten, so the thing worth
+        // asserting is that it captures a REPLACEMENT rather than only the first version.
+        {
+            let dir = manager::session_dir("archtest", "inst-arch", 2_100_000).expect("no dir");
+            std::fs::create_dir_all(dir.join("workspaces"))?;
+            let brief = dir.join("mission_briefing.md");
+            let day = repo.join("archive").join(format!("{}.jsonl", &manager::iso(2_100_000)[..10]));
+            let _ = std::fs::remove_file(&day);
+
+            std::fs::write(&brief, "---\nsource: agent\n---\nfirst thing it ever said\n")?;
+            std::fs::write(dir.join("workspaces/3.md"), "---\nsource: agent\n---\nthe build is fine\n")?;
+            manager::archive_artifacts(&repo, 2_100_000);
+            // Unchanged content must not accumulate a record per tick — the archiver runs on the
+            // same clock as everything else, so a mtime-based check would add one a minute.
+            manager::archive_artifacts(&repo, 2_100_060);
+            std::fs::write(&brief, "---\nsource: agent\n---\nand now something else entirely\n")?;
+            manager::archive_artifacts(&repo, 2_100_120);
+            // Never archive what Mars computed itself: it is arithmetic over snapshots that are
+            // still on disk, so keeping it is storing a derivation next to its own inputs.
+            std::fs::write(dir.join("mission_briefing.computed.md"), "2 running · 1 idle\n")?;
+            manager::archive_artifacts(&repo, 2_100_180);
+
+            let lines: Vec<serde_json::Value> = std::fs::read_to_string(&day)?
+                .lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let mine: Vec<&serde_json::Value> = lines.iter()
+                .filter(|v| v["session"].as_str() == Some("archtest")).collect();
+            let briefs: Vec<&str> = mine.iter()
+                .filter(|v| v["kind"].as_str() == Some("briefing"))
+                .filter_map(|v| v["text"].as_str()).collect();
+            assert_eq!(briefs, vec!["first thing it ever said", "and now something else entirely"],
+                "the archive lost a briefing, or kept a duplicate: {briefs:?}");
+            assert!(mine.iter().any(|v| v["kind"].as_str() == Some("workspace")
+                    && v["pane"].as_str() == Some("3")),
+                "workspace summaries were not archived at all");
+            assert!(!mine.iter().any(|v| v["text"].as_str() == Some("2 running · 1 idle")),
+                "the archive kept deterministic output alongside the agent's");
+        }
+        println!("[selfcheck] manager: prose is archived by day, deduped on content ... PASS");
     // ── mars pair preflight ─────────────────────────────────────────────────────────────
     // Pure logic, so it is testable without a tunnel, an account or a phone.
     #[cfg(feature = "web")]

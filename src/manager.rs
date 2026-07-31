@@ -364,6 +364,7 @@ fn workspace_summary(p: &PaneRow) -> String {
     match p.verdict.as_str() {
         "blocked" => format!("waiting on input{tail}"),
         "failed" => format!("failed{tail}"),
+        "stalled" => format!("stalled{tail}"),
         "running" => format!("running{tail}"),
         "done" => "finished".into(),
         _ if !why.is_empty() => why.to_string(),
@@ -389,6 +390,7 @@ fn coarse_age(secs: u64) -> String {
 fn session_narrative(s: &SessionSnap) -> String {
     let blocked: Vec<&PaneRow> = s.panes.iter().filter(|p| p.verdict == "blocked").collect();
     let failed: Vec<&PaneRow> = s.panes.iter().filter(|p| p.verdict == "failed").collect();
+    let stalled: Vec<&PaneRow> = s.panes.iter().filter(|p| p.verdict == "stalled").collect();
     let running = s.panes.iter().filter(|p| p.verdict == "running").count();
     let done = s.panes.iter().filter(|p| p.verdict == "done").count();
     let names = |v: &[&PaneRow]| -> String {
@@ -417,6 +419,15 @@ fn session_narrative(s: &SessionSnap) -> String {
             if failed.len() == 1 { "has" } else { "have" }
         ));
     }
+    if !stalled.is_empty() {
+        let oldest = stalled.iter().map(|p| p.age_secs).max().unwrap_or(0);
+        parts.push(format!(
+            "{} {} been silent for {} with something still running.",
+            names(&stalled),
+            if stalled.len() == 1 { "has" } else { "have" },
+            coarse_age(oldest)
+        ));
+    }
     if running > 0 {
         parts.push(format!("{running} still running."));
     }
@@ -433,10 +444,14 @@ fn session_briefing(s: &SessionSnap, ts: u64) -> String {
     let mut needs: Vec<&PaneRow> = s
         .panes
         .iter()
-        .filter(|p| p.verdict == "blocked" || p.verdict == "failed")
+        .filter(|p| p.verdict == "blocked" || p.verdict == "failed" || p.verdict == "stalled")
         .collect();
     needs.sort_by(|a, b| {
-        let rank = |v: &str| if v == "blocked" { 0 } else { 1 };
+        let rank = |v: &str| match v {
+            "blocked" => 0,
+            "failed" => 1,
+            _ => 2,
+        };
         rank(&a.verdict).cmp(&rank(&b.verdict)).then(b.age_secs.cmp(&a.age_secs))
     });
     let running = s.panes.iter().filter(|p| p.verdict == "running").count();
@@ -455,7 +470,11 @@ fn session_briefing(s: &SessionSnap, ts: u64) -> String {
             if needs.len() == 1 { "s" } else { "" }
         ));
         for p in &needs {
-            let mark = if p.verdict == "blocked" { "⚠" } else { "✗" };
+            let mark = match p.verdict.as_str() {
+                "blocked" => "⚠",
+                "stalled" => "◔",
+                _ => "✗",
+            };
             md.push_str(&format!("- {mark} **{}** — {} · {}\n", p.name, p.verdict, coarse_age(p.age_secs)));
             if !p.why.trim().is_empty() {
                 md.push_str(&format!("  \n  {}\n", p.why.trim()));
@@ -796,6 +815,101 @@ fn parse_board(json: &str) -> Option<SessionSnap> {
 }
 
 
+// ── Presence: when the captain was last actually looking ─────────────────────────────────
+//
+// The briefing is written on the AGENT's clock. What you read at 09:00 describes whatever the
+// last run happened to see, because each run only reports what changed since the previous one —
+// so a fact from 02:00 has already been overwritten by one from 07:00 and the night is gone.
+//
+// These two clocks were never the same clock, and only one of them is yours.
+//
+// `presence.json` records the one thing the daemon knows and nobody else does: whether a phone is
+// attached right now, and when that last changed. It is written ONLY by the session loop that
+// owns the socket — one writer, its own file, no lock — and read only here.
+
+fn presence_path(sdir: &Path) -> PathBuf {
+    sdir.join("presence.json")
+}
+
+/// A phone attached, or dropped. Called on the EDGE only, by the daemon that owns the session.
+///
+/// `away_secs` is computed here, at the transition, rather than derived later from two
+/// timestamps by whoever happens to ask — the process that watched the gap is the only one that
+/// can sign for how long it was.
+pub fn mark_presence(session_name: &str, watched: bool, ts: u64) {
+    let Some(sdir) = existing_session_dir(session_name) else { return };
+    let path = presence_path(&sdir);
+    let prior: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    // Away only means something on the way IN, and only when the prior state was genuinely
+    // "nobody watching". Anything else is zero rather than a guess.
+    let away = if watched && prior["watched"].as_bool() == Some(false) {
+        ts.saturating_sub(prior["since_ts"].as_u64().unwrap_or(ts))
+    } else {
+        0
+    };
+    let body = serde_json::json!({
+        "watched": watched,
+        "since": iso(ts), "since_ts": ts,
+        "away_secs": away,
+    });
+    if let Ok(txt) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write(&path, txt);
+    }
+}
+
+/// A phone that has just attached after a real absence.
+#[derive(Clone, Debug)]
+pub struct Arrival {
+    pub session_id: String,
+    pub away_secs: u64,
+    /// Snapshot-filename floor to re-offer from: everything written since they stopped looking.
+    pub after: String,
+}
+
+/// Is somebody looking who was not looking a moment ago, and were they gone long enough for the
+/// answer to have changed?
+///
+/// The threshold is the cadence floor itself, and deliberately not a new knob: below it, the
+/// briefing they are holding is the one this run would write again.
+fn arrival(repo: &Path, sessions: &[SessionSnap], floor_secs: u64) -> Option<Arrival> {
+    let state: serde_json::Value = std::fs::read_to_string(repo.join("memory/agent.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    for s in sessions {
+        let Some(sdir) = existing_session_dir(&s.name) else { continue };
+        let id = sdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let p: serde_json::Value = std::fs::read_to_string(presence_path(&sdir))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if p["watched"].as_bool() != Some(true) {
+            continue;
+        }
+        let at = p["since_ts"].as_u64().unwrap_or(0);
+        let away = p["away_secs"].as_u64().unwrap_or(0);
+        if at == 0 || away < floor_secs {
+            continue;
+        }
+        // Already answered. The attach stays true for as long as they hold the phone, so
+        // without this the same arrival would re-fire on every tick of a long glance.
+        if state["arrived"][&id].as_u64() == Some(at) {
+            continue;
+        }
+        return Some(Arrival {
+            session_id: id,
+            away_secs: away,
+            // Filenames are ISO timestamps, so the floor is just the moment they left, spelled
+            // the way the directory spells it. No index, no parse.
+            after: iso(at.saturating_sub(away)).replace(':', "-"),
+        });
+    }
+    None
+}
+
 // ── The agent inbox ──────────────────────────────────────────────────────────────────────
 //
 // Snapshots are ground truth: deterministic, append-only, never model-touched. The agent reads
@@ -848,7 +962,12 @@ fn open_batch(repo: &Path) -> Option<PathBuf> {
 ///
 /// A session's entry carries the snapshot filenames rather than their contents: the agent has a
 /// filesystem and the batch stays small enough to re-read cheaply on every merge.
-pub fn compose_batch(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<Option<PathBuf>> {
+pub fn compose_batch(
+    repo: &Path,
+    sessions: &[SessionSnap],
+    ts: u64,
+    arrival: Option<&Arrival>,
+) -> Result<Option<PathBuf>> {
     let cursor: serde_json::Value = std::fs::read_to_string(repo.join("memory/cursor.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -858,12 +977,24 @@ pub fn compose_batch(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<O
     for s in sessions {
         let Some(sdir) = existing_session_dir(&s.name) else { continue };
         let id = sdir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let after = cursor.get(&id).and_then(|v| v.as_str());
-        let pending = snapshots_after(&sdir, after);
+        let mut after = cursor.get(&id).and_then(|v| v.as_str()).map(String::from);
+        let mut away: Option<u64> = None;
+        if let Some(a) = arrival.filter(|a| a.session_id == id) {
+            // Re-offer everything since they stopped looking, INCLUDING snapshots the agent has
+            // already consumed. The cursor answers "what has the agent read"; this answers "what
+            // did the captain miss". Those are two different questions and the cursor was only
+            // ever an answer to the first one.
+            if after.as_deref().map(|c| a.after.as_str() < c).unwrap_or(true) {
+                after = Some(a.after.clone());
+            }
+            away = Some(a.away_secs);
+        }
+        let pending = snapshots_after(&sdir, after.as_deref());
         if pending.is_empty() {
             continue;
         }
-        entries.push(serde_json::json!({
+        let covers_from = pending.first().cloned();
+        let mut entry = serde_json::json!({
             "id": id,
             "name": s.name,
             "dir": sdir.display().to_string(),
@@ -871,7 +1002,17 @@ pub fn compose_batch(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<O
             "snapshots": pending,
             "blocked": s.panes.iter().filter(|p| p.verdict == "blocked")
                 .map(|p| p.pane_id.clone()).collect::<Vec<_>>(),
-        }));
+            "stalled": s.panes.iter().filter(|p| p.verdict == "stalled")
+                .map(|p| p.pane_id.clone()).collect::<Vec<_>>(),
+        });
+        if let Some(secs) = away {
+            // The window is only as complete as retention. Say what was actually offered rather
+            // than implying the whole absence is in the batch — an agent told "you have the last
+            // 9 hours" when it has the last 40 minutes will write a confident, wrong briefing.
+            entry["away_secs"] = serde_json::json!(secs);
+            entry["covers_from"] = serde_json::json!(covers_from);
+        }
+        entries.push(entry);
     }
     if entries.is_empty() {
         return Ok(None);
@@ -907,7 +1048,13 @@ pub fn compose_batch(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<O
 /// the LLM summaries did, and one exception — a workspace that has newly entered `blocked` wakes
 /// it immediately, because that is the state where the engineer is the bottleneck and latency is
 /// pure waste. A block already seen at the last nudge is not new and does not re-fire.
-pub fn nudge_reason(repo: &Path, sessions: &[SessionSnap], ts: u64, floor_secs: u64) -> Option<&'static str> {
+pub fn nudge_reason(
+    repo: &Path,
+    sessions: &[SessionSnap],
+    ts: u64,
+    floor_secs: u64,
+    arrived: bool,
+) -> Option<&'static str> {
     let state: serde_json::Value = std::fs::read_to_string(repo.join("memory/agent.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -923,6 +1070,14 @@ pub fn nudge_reason(repo: &Path, sessions: &[SessionSnap], ts: u64, floor_secs: 
     });
     if fresh_block {
         return Some("blocked");
+    }
+    // Somebody picked up the phone after a real absence. This is the one moment where a briefing
+    // is worth writing regardless of the clock, because it is the only moment we know it will be
+    // read — and it is also strictly CHEAPER than the alternative: away six hours on a busy board,
+    // the cadence produces ~18 briefings nobody looks at, where this produces one, covering the
+    // whole window, which a single pass can rank across.
+    if arrived {
+        return Some("arrived");
     }
     let last = state["last_nudge_ts"].as_u64().unwrap_or(0);
     (ts.saturating_sub(last) >= floor_secs).then_some("material-change")
@@ -940,11 +1095,31 @@ pub fn mark_nudged(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<()>
                 .map(move |p| format!("{}:{}", s.name, p.pane_id))
         })
         .collect();
+    // Every arrival currently in effect is answered by this run. Recorded by re-reading presence
+    // rather than by having the caller thread the `Arrival` down here: the file is the fact, and
+    // a parameter would be a copy of it that could disagree.
+    let mut arrived = serde_json::Map::new();
+    for s in sessions {
+        let Some(sdir) = existing_session_dir(&s.name) else { continue };
+        let p: serde_json::Value = std::fs::read_to_string(presence_path(&sdir))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if p["watched"].as_bool() == Some(true) {
+            if let (Some(id), Some(at)) = (
+                sdir.file_name().map(|n| n.to_string_lossy().to_string()),
+                p["since_ts"].as_u64(),
+            ) {
+                arrived.insert(id, serde_json::json!(at));
+            }
+        }
+    }
     std::fs::create_dir_all(repo.join("memory"))?;
     std::fs::write(
         repo.join("memory/agent.json"),
         serde_json::to_string_pretty(&serde_json::json!({
             "last_nudge_ts": ts, "last_nudge": iso(ts), "blocked": blocked,
+            "arrived": arrived,
         }))?,
     )?;
     Ok(())
@@ -958,6 +1133,114 @@ pub fn mark_nudged(repo: &Path, sessions: &[SessionSnap], ts: u64) -> Result<()>
 /// exactly like a quiet board from the outside, and without this it would never be noticed.
 ///
 /// Appends one line per newly-scored run to `memory/runs.jsonl` and returns the rolling tally.
+// ── The archive: what the manager said, kept ─────────────────────────────────────────────
+//
+// `mission_briefing.md` and each `workspaces/<pane>.md` are OVERWRITTEN every run. That is right
+// for the live artifacts — the phone wants the current answer, not a pile — but it means every
+// sentence the manager has ever written has been destroyed by the next one. There is no way to
+// ask "what did it say about this at 3am", or whether a belief held up, or whether the briefings
+// got better.
+//
+// This is the one thing in the repo that genuinely must be STORED rather than computed, because
+// the source it would be derived from is gone: the artifact is mutable by design, and history is
+// exactly what a mutable file does not have.
+//
+// One append-only JSONL per UTC day. Not a file per artifact per run — that is tens of thousands
+// of tiny files a year for something whose whole purpose is to be read in bulk and across time.
+// A day is the natural grain because it is the grain the question is asked in.
+
+/// Capture the manager's prose whenever it changes. Called on every tick, before the idle fast
+/// path returns, because the agent writes on her own clock: gating this on board movement would
+/// miss precisely the briefings written over a quiet board.
+///
+/// Deduplicated on CONTENT against the newest record for the same key, never on mtime. A run that
+/// rewrites a workspace note identically archives nothing; a rename that preserves mtime still
+/// archives, because the text is what is being remembered.
+pub fn archive_artifacts(repo: &Path, ts: u64) {
+    let Some(root) = sessions_root() else { return };
+    let Ok(rd) = std::fs::read_dir(&root) else { return };
+
+    let dir = repo.join("archive");
+    let day = dir.join(format!("{}.jsonl", &iso(ts)[..10]));
+    // The day's records, so "has this text already been kept" is answered from the file itself
+    // rather than from a side-index that could disagree with it. A day is tens of small lines.
+    let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in std::fs::read_to_string(&day).unwrap_or_default().lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let key = format!(
+            "{}\u{1}{}\u{1}{}",
+            v["session_id"].as_str().unwrap_or_default(),
+            v["kind"].as_str().unwrap_or_default(),
+            v["pane"].as_str().unwrap_or_default()
+        );
+        latest.insert(key, v["text"].as_str().unwrap_or_default().to_string());
+    }
+
+    let mut fresh: Vec<serde_json::Value> = Vec::new();
+    for e in rd.flatten() {
+        let sdir = e.path();
+        let Some(sid) = sdir.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
+        let name = std::fs::read_to_string(sdir.join("meta.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|m| m["name"].as_str().map(String::from))
+            .unwrap_or_else(|| sid.clone());
+
+        // (kind, pane, path). Only agent-signed prose is worth keeping: the deterministic
+        // rendering is arithmetic over snapshots and can be recomputed from them forever.
+        let mut want: Vec<(&str, String, PathBuf)> =
+            vec![("briefing", String::new(), sdir.join("mission_briefing.md"))];
+        if let Ok(ws) = std::fs::read_dir(sdir.join("workspaces")) {
+            for w in ws.flatten() {
+                let p = w.path();
+                if p.extension().and_then(|x| x.to_str()) != Some("md") {
+                    continue;
+                }
+                let pane = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                // `emit` writes its own copy alongside as `<pane>.computed.md`; that one is
+                // regenerable and would double every record for nothing.
+                if pane.ends_with(".computed") {
+                    continue;
+                }
+                want.push(("workspace", pane, p));
+            }
+        }
+
+        for (kind, pane, path) in want {
+            let Some(text) = std::fs::read_to_string(&path).ok() else { continue };
+            let Some((front, body)) = split_front(&text) else { continue };
+            if front_field(front, "source").as_deref() != Some("agent") {
+                continue;
+            }
+            let body = body.trim().to_string();
+            if body.is_empty() {
+                continue;
+            }
+            let key = format!("{sid}\u{1}{kind}\u{1}{pane}");
+            if latest.get(&key).map(|t| t == &body).unwrap_or(false) {
+                continue;
+            }
+            latest.insert(key, body.clone());
+            fresh.push(serde_json::json!({
+                "at": iso(ts), "at_ts": ts,
+                "session": name, "session_id": sid,
+                "kind": kind,
+                "pane": if pane.is_empty() { serde_json::Value::Null } else { serde_json::json!(pane) },
+                "words": body.split_whitespace().count(),
+                "text": body,
+            }));
+        }
+    }
+    if fresh.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&day) else { return };
+    for v in fresh {
+        let _ = writeln!(f, "{v}");
+    }
+}
+
 fn score_runs(repo: &Path, ts: u64) {
     let done = repo.join("inbox/done");
     let log = repo.join("memory/runs.jsonl");
@@ -1245,15 +1528,19 @@ pub fn agent_tick(
         None => true,
         Some(t) => ts.saturating_sub(t) >= floor_secs,
     };
-    let reason = nudge_reason(&repo, &sessions, ts, floor_secs)?;
-    if reason != "blocked" && !floor_passed {
+    let arrival = arrival(&repo, &sessions, floor_secs);
+    let reason = nudge_reason(&repo, &sessions, ts, floor_secs, arrival.is_some())?;
+    // Two reasons outrank the cadence, and for the same reason in both cases: latency is pure
+    // waste when somebody is standing there. A block means the engineer is the bottleneck; an
+    // arrival means they are reading the answer right now.
+    if reason != "blocked" && reason != "arrived" && !floor_passed {
         return None;
     }
     // Only now do we touch the inbox: no pending snapshots means no turn, whatever the clock says.
     // Compose the batch, but return only WHY we are waking. The turn's instruction lives in
     // prompt.md and is read by the shell at delivery — the one thing we most want to iterate on
     // should not need a recompile, and there is only ever one open batch to find.
-    compose_batch(&repo, &sessions, ts).ok().flatten()?;
+    compose_batch(&repo, &sessions, ts, arrival.as_ref()).ok().flatten()?;
     Some(reason.to_string())
 }
 
@@ -1504,6 +1791,13 @@ pub fn sessions_root() -> Option<PathBuf> {
 /// Find a session's directory without minting one — used by the idle fast path, which must not
 /// create anything just to discover there is nothing to do.
 pub fn existing_session_dir_pub(name: &str) -> Option<PathBuf> { existing_session_dir(name) }
+
+// Seams for the headless checks, which have no daemon, no phone and no agent behind them.
+pub fn render_briefing_for_test(s: &SessionSnap) -> String { session_briefing(s, 0) }
+pub fn render_narrative_for_test(s: &SessionSnap) -> String { session_narrative(s) }
+pub fn arrival_for_test(repo: &Path, sessions: &[SessionSnap], floor_secs: u64) -> Option<Arrival> {
+    arrival(repo, sessions, floor_secs)
+}
 
 /// Lookup with an explicit identity — for tests, which have no live daemon to ask.
 pub fn existing_session_dir_for(name: &str, instance: Option<&str>) -> Option<PathBuf> {
@@ -1765,6 +2059,9 @@ pub fn tick_session(
     // Bookkeeping first, on every tick and before any early return: a finished agent run must be
     // scored whether or not the board moved, and the read path must stay free of writes.
     score_runs(repo, ts);
+    // Same reason, and it must come before the idle return for a sharper one: a briefing written
+    // over a board that did not move is still a briefing, and it is about to be overwritten.
+    archive_artifacts(repo, ts);
     let Some(snap) = parse_board(board_json) else { return Ok(()) };
     if snap.name.is_empty() {
         return Ok(());
@@ -1841,6 +2138,10 @@ pub fn snapshot_main(repo: Option<String>) -> Result<()> {
         .collect();
     let ts = now_secs();
     let events = emit(&repo, &origin, &sessions, ts, 2700, &serde_json::Value::Null)?;
+    // The daemon archives on its own tick; doing it here too means a machine whose daemons are
+    // still on an older binary can capture what has already been written, and gives a manual
+    // lever. Deduplicated on content, so calling it twice costs a read.
+    archive_artifacts(&repo, ts);
     println!(
         "snapshot {} · {} session(s) · {} event(s) → {}",
         iso(ts),
@@ -1970,7 +2271,9 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
         println!("snapshotted {n} live session(s)");
     }
     let sessions: Vec<SessionSnap> = live_session_names().iter().filter_map(|n| board_of(n)).collect();
-    let Some(batch) = compose_batch(&repo, &sessions, ts)? else {
+    // A hand-forced run is somebody at the keyboard asking for a turn now, so it takes the
+    // cursor's window and not an absence window — nobody just arrived.
+    let Some(batch) = compose_batch(&repo, &sessions, ts, None)? else {
         return Ok("nothing to do — no unconsumed snapshots (try --force)".into());
     };
     let name = batch.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -2021,6 +2324,16 @@ pub fn status_report(ts: u64) -> Result<String> {
     s.push_str(&format!("last run      {}\n", last.map(|t| format!("{} ago", human_age(ts.saturating_sub(t)))).unwrap_or_else(|| "never (floor open)".into())));
     s.push_str(&format!("lock          {}\n", if repo.join("agent.lock").exists() { "held" } else { "free" }));
     s.push_str(&format!("runs          {ok}/{total} clean · {timing}\n"));
+    let arch = repo.join("archive");
+    let (days, records) = std::fs::read_dir(&arch)
+        .map(|rd| {
+            rd.flatten().fold((0usize, 0usize), |(d, r), e| {
+                let n = std::fs::read_to_string(e.path()).unwrap_or_default().lines().count();
+                (d + 1, r + n)
+            })
+        })
+        .unwrap_or((0, 0));
+    s.push_str(&format!("archive       {records} kept over {days} day(s) → {}\n", arch.display()));
     Ok(s)
 }
 

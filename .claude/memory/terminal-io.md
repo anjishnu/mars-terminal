@@ -42,3 +42,11 @@ Byte-level behavior that headless tests cannot see. Most of these cost real debu
   TIOCSWINSZ or ratatui renders into a 0x0 area (blank). `screen.buffer[y][x].bg` exposes
   cell background, which is how the invisible-tree-highlight bug was cracked
   (see [`ui-input.md`]).
+
+- **"Is a command running in this pane?" is a kernel question, not a shell-integration one.**
+  `portable_pty::MasterPty::process_group_leader()` (unix) is `tcgetpgrp(master)`; compare it to
+  the spawned shell's `child.process_id()` — different means a foreground job is executing, equal
+  means the shell is at its prompt. Works on any shell with no `precmd`/OSC-133 setup. Mars scans
+  OSC 133 already (`osc133.rs`) but **never installs shell integration**, so anything built on
+  those markers silently does nothing on a plain zsh. Returns `None` on Windows — treat that as
+  "no claim", never as `false`. Used by `App::pane_stalled` for the `stalled` verdict.

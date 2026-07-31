@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 16 -->
+<!-- mars-doc-version: 17 -->
 # The mission briefing
 
 **Read first. Written last.** It is the only thing many glances ever see: two to five seconds,
@@ -52,6 +52,30 @@ what it already told them is not news twice.
 
 A briefing that reads like the last one gets skimmed, then skipped. The only thing that keeps
 someone opening it is that it is different every time because the day is.
+
+## When they have been away
+
+Sometimes the batch carries **`away_secs`** on a session. That means this run is not the cadence
+firing into an empty room — the captain has just picked the phone up after being gone that long,
+and they are looking at the screen now.
+
+Two things change.
+
+**Your window is their absence, not your last turn.** The batch has widened the snapshots
+backwards to cover the whole gap, including ones you already read. Normally you report what moved
+since *you* last looked; here you report what moved since *they* last looked. A failure at 02:00
+that was already superseded by 07:00 still belongs in this briefing if they slept through both.
+
+**Say how long, once, in the greeting.** "Morning, captain — nine hours' worth." Then never
+mention it again. It is orientation, not a subject.
+
+Read across the whole window before ranking. That is the advantage this run has and the cadence
+does not: eighteen separate briefings could each only see their own slice, and one pass over the
+night can tell which of those slices actually mattered.
+
+Check **`covers_from`** against `away_secs`. When retention has cut the window short, the honest
+briefing covers what is there and says nothing about the rest. Never write "quiet night" about
+hours you cannot see — an absence of snapshots is an absence of evidence, not evidence of calm.
 
 ## Shape
 

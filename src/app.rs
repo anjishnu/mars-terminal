@@ -910,8 +910,23 @@ impl App {
             PaneContent::Editor(_) => return Verdict::Context,
         };
         if let Some(w) = self.watches.get(&tid) {
-            if let Some(v) = &w.verdict {
-                return crate::briefing::classify(v, Verdict::Running);
+            let judged = w
+                .verdict
+                .as_deref()
+                .map(|v| crate::briefing::classify(v, Verdict::Running));
+            // Blocked and Failed are settled conclusions and outrank a stall, which is
+            // only ever a suspicion about a process that is still alive. Order matters
+            // here: a `[y/N]` prompt is silent BY NATURE, so checking stall first would
+            // relabel every blocked pane `stalled` after five minutes — turning the one
+            // verdict that tells you exactly what to do into the one that doesn't.
+            if let Some(v @ (Verdict::Blocked | Verdict::Failed)) = judged {
+                return v;
+            }
+            if self.pane_stalled(tid) {
+                return Verdict::Stalled;
+            }
+            if let Some(v) = judged {
+                return v;
             }
             // Running means producing output RIGHT NOW — not "has ever produced
             // output." run_started_tick stays set forever (it anchors the duration
@@ -925,6 +940,10 @@ impl App {
                     return Verdict::Running;
                 }
             }
+        } else if self.pane_stalled(tid) {
+            // A pane that has never printed a byte has no watch entry, which is exactly
+            // the shape of a command that wedged before its first line of output.
+            return Verdict::Stalled;
         }
         if let Some(t) = self.terms.get(&tid) {
             if t.exited {
@@ -936,6 +955,40 @@ impl App {
         }
         Verdict::Context // idle / quiet
     }
+    /// Has this pane had a command executing, printing nothing, for `stall_secs`?
+    ///
+    /// Two conditions, and BOTH are needed — either alone is a lie the board used to
+    /// tell. Silence alone is the shell sitting at a prompt, which is idle, not stuck.
+    /// A running command alone is a healthy build, which is running, not stuck. Only
+    /// the pair is news, and only the kernel can tell them apart (`foreground_busy`).
+    ///
+    /// A pane whose PTY cannot report a foreground group answers `None` there, and this
+    /// returns false — no claim rather than a guess. Windows therefore never stalls, and
+    /// the board reads exactly as it did before.
+    pub fn pane_stalled(&self, tid: crate::terminal::TermId) -> bool {
+        if self.tuning.stall_secs == 0 {
+            return false;
+        }
+        // Tick arithmetic FIRST. This is evaluated for every pane of every tab on every
+        // frame, and `foreground_busy` is a syscall; being quiet for minutes is the rare
+        // case, so only panes that have already earned the question pay for asking it.
+        let ticks =
+            (self.tuning.stall_secs * 1000 / self.tuning.poll_interval_ms.max(1)).max(1);
+        let last_output = self.watches.get(&tid).map(|w| w.last_output_tick).unwrap_or(0);
+        if self.frame_tick.saturating_sub(last_output) < ticks {
+            return false;
+        }
+        let Some(t) = self.terms.get(&tid) else { return false };
+        !t.exited && t.foreground_busy() == Some(true)
+    }
+
+    /// How long a pane has been silent, in seconds — the "no output for 12m" that gives
+    /// a `stalled` verdict its only useful detail.
+    pub fn pane_quiet_secs(&self, tid: crate::terminal::TermId) -> u64 {
+        let last_output = self.watches.get(&tid).map(|w| w.last_output_tick).unwrap_or(0);
+        self.frame_tick.saturating_sub(last_output) * self.tuning.poll_interval_ms / 1000
+    }
+
     /// A tab's aggregate status: worst-wins across its panes, needs-you first — so a
     /// tab with any blocked/failed pane reads warm even if its other panes are fine.
     pub fn tab_status(&self, tab: &Tab) -> crate::briefing::Verdict {
@@ -1197,6 +1250,15 @@ impl App {
         let cmd = w.and_then(|w| w.last_command.as_ref()).map(|c| c.trim().to_string());
         let why = if w.map(|w| w.summ_inflight).unwrap_or(false) {
             "summarizing…".to_string()
+        } else if tid.map(|t| self.pane_stalled(t)).unwrap_or(false) {
+            // Ahead of the watch verdict on purpose: that verdict was written when the
+            // pane last spoke, so on a stalled pane it is by definition the stalest
+            // sentence available. How long it has been silent is the fact that matters.
+            let quiet = crate::briefing::fmt_secs(self.pane_quiet_secs(tid.unwrap()));
+            match cmd.as_deref().filter(|c| !c.is_empty()) {
+                Some(c) => format!("{c} · silent {quiet}"),
+                None => format!("no output for {quiet}"),
+            }
         } else if let Some(v) = w.and_then(|w| w.verdict.as_ref()) {
             v.lines().next().unwrap_or("").trim().to_string()
         } else if let Some(t) = tid.and_then(|t| self.terms.get(&t)) {
@@ -6167,6 +6229,7 @@ impl App {
                 let w = match r.verdict {
                     Verdict::Failed => "failed",
                     Verdict::Blocked => "blocked",
+                    Verdict::Stalled => "stalled",
                     Verdict::Done => "done",
                     Verdict::Running => "running",
                     Verdict::Context => "·",

@@ -10,6 +10,11 @@
 pub enum Verdict {
     Failed,
     Blocked,
+    /// A command is genuinely still executing and has produced nothing for a long
+    /// time. Distinct from `Running` (which means "producing output right now") and
+    /// from `Context` (which means "nothing is executing") — without it, a hung
+    /// build and a shell sitting at a prompt were the same word.
+    Stalled,
     Done,
     Running,
     Context,
@@ -20,6 +25,7 @@ impl Verdict {
         match self {
             Verdict::Failed => "✗",
             Verdict::Blocked => "⏸",
+            Verdict::Stalled => "◔",
             Verdict::Done => "✓",
             Verdict::Running => "●",
             Verdict::Context => "·",
@@ -31,6 +37,7 @@ impl Verdict {
         match self {
             Verdict::Failed => "failed",
             Verdict::Blocked => "blocked",
+            Verdict::Stalled => "stalled",
             Verdict::Done => "done",
             Verdict::Running => "running",
             Verdict::Context => "idle",
@@ -41,10 +48,16 @@ impl Verdict {
     /// by: the tab bar's worst-pane aggregate, the bottom summary, and the
     /// command-bar board. (Deliberately distinct from the derived `Ord`, which is
     /// Failed-first — tuned for the arrival briefing's "what happened" display.)
+    ///
+    /// Stalled outranks Running because it is the one that might want you: healthy
+    /// work needs nothing, a wedged process needs a decision. It sits below Failed
+    /// because "stalled" is still a suspicion about a live process, where a failure
+    /// is a settled fact.
     pub fn rank(self) -> u8 {
         match self {
-            Verdict::Blocked => 5, // needs you now — a keystroke unblocks it
-            Verdict::Failed  => 4,
+            Verdict::Blocked => 6, // needs you now — a keystroke unblocks it
+            Verdict::Failed  => 5,
+            Verdict::Stalled => 4,
             Verdict::Running => 3,
             Verdict::Done    => 2,
             Verdict::Context => 1,
