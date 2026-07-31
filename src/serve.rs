@@ -258,6 +258,15 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
         "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
     );
 
+    // Prove the path before showing a QR. A QR that cannot work is worse than an error: it moves
+    // the failure onto a device with no diagnostics.
+    let checked = verify_public(&endpoint.replacen("wss://", "https://", 1));
+    print_checks("bridge", &checked);
+    if let Some(c) = checked.iter().find(|c| c.failed()) {
+        anyhow::bail!("{} — {}", c.name, c.fix.clone().unwrap_or_default());
+    }
+    println!();
+
     print_wordmark();
     println!();
     print_qr(&app_url);
@@ -1049,4 +1058,330 @@ fn fs_write_json(raw: &str, content: &str, base_mtime: Option<u64>) -> String {
     }
     let mtime = std::fs::metadata(&path).map(|m| mtime_secs(&m)).unwrap_or(0);
     serde_json::json!({ "t": "fs.saved", "path": path.display().to_string(), "mtime": mtime }).to_string()
+}
+
+// ── Preflight ────────────────────────────────────────────────────────────────────────────
+//
+// Everything that has to be true before a QR is worth printing, checked cheaply and up front.
+// The alternative — start work and interpret the wreckage — is what produced a 25-second timeout
+// ending in "is your authtoken set?", which is a guess about a condition we can simply read.
+
+/// One preflight line. `Skip` is a real outcome, not a soft failure: pairing without a static
+/// domain works fine, it just costs a re-scan later, and saying so is different from an error.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CheckState {
+    Ok(String),
+    Skip(String),
+    Fail(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct Check {
+    pub name: &'static str,
+    pub state: CheckState,
+    /// What the developer should do. Printed only when it would help.
+    pub fix: Option<String>,
+}
+
+impl Check {
+    fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+        Check { name, state: CheckState::Ok(detail.into()), fix: None }
+    }
+    fn skip(name: &'static str, detail: impl Into<String>) -> Self {
+        Check { name, state: CheckState::Skip(detail.into()), fix: None }
+    }
+    fn fail(name: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        Check { name, state: CheckState::Fail(detail.into()), fix: Some(fix.into()) }
+    }
+    pub fn failed(&self) -> bool {
+        matches!(self.state, CheckState::Fail(_))
+    }
+}
+
+/// The ngrok static domain: config first, environment as an override.
+///
+/// It lived only in `MARS_NGROK_DOMAIN`, which is lost in a new shell and invisible to the launchd
+/// agent — so the "this URL survives restarts" promise quietly broke under exactly the supervision
+/// meant to keep it alive.
+pub fn ngrok_domain() -> Option<String> {
+    if let Some(d) = std::env::var("MARS_NGROK_DOMAIN").ok().filter(|d| !d.trim().is_empty()) {
+        return Some(d.trim().to_string());
+    }
+    let path = crate::sys::paths::home_dir()?.join(".mars").join("config.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v["ngrok_domain"].as_str().map(str::trim).filter(|d| !d.is_empty()).map(String::from)
+}
+
+/// Persist the domain where a new shell and the launchd agent will both find it.
+pub fn set_ngrok_domain(domain: &str) -> Result<()> {
+    let path = crate::sys::paths::home_dir()
+        .ok_or_else(|| anyhow!("no home directory"))?
+        .join(".mars")
+        .join("config.json");
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v["ngrok_domain"] = serde_json::json!(domain.trim());
+    std::fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
+}
+
+fn tool_version(bin: &str, arg: &str) -> Option<String> {
+    let out = std::process::Command::new(bin).arg(arg).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    Some(s.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or_else(|| s.trim())
+        .to_string())
+}
+
+/// Can the phone reach this machine.
+pub fn preflight_bridge(session: Option<&str>) -> Vec<Check> {
+    let mut out = Vec::new();
+
+    out.push(match session {
+        Some(s) => Check::ok("session", s.to_string()),
+        None => Check::fail("session", "none running", "start one with `mars`"),
+    });
+
+    match tool_version("ngrok", "version") {
+        Some(v) => out.push(Check::ok("ngrok", v)),
+        None => out.push(Check::fail("ngrok", "not installed", "brew install ngrok")),
+    }
+
+    // Read the condition instead of inferring it from a tunnel that never appears.
+    let token_ok = std::process::Command::new("ngrok")
+        .args(["config", "check"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    out.push(if token_ok {
+        Check::ok("authtoken", "configured")
+    } else {
+        Check::fail("authtoken", "not configured", "ngrok config add-authtoken <token>")
+    });
+
+    out.push(match ngrok_domain() {
+        Some(d) => Check::ok("stable URL", d),
+        None => Check::skip("stable URL", "not set — the QR changes on every restart"),
+    });
+    out
+}
+
+/// Can the manager actually run. Independent of the bridge: a dead agent must never stop someone
+/// pairing their phone, it just means the briefing will not move.
+pub fn preflight_manager(probe: bool) -> Vec<Check> {
+    let mut out = Vec::new();
+
+    let have = tool_version("claude", "--version");
+    match &have {
+        Some(v) => out.push(Check::ok("claude", v.clone())),
+        None => out.push(Check::fail(
+            "claude",
+            "not installed",
+            "install Claude Code, then re-run `mars pair`",
+        )),
+    }
+
+    if have.is_some() && probe {
+        out.push(claude_can_run());
+    }
+
+    let enabled = crate::manager::repo_dir().is_some_and(|r| crate::manager::agent_enabled(&r));
+    out.push(if enabled {
+        Check::ok("agent", "on")
+    } else {
+        Check::skip("agent", "off")
+    });
+    out
+}
+
+/// One tiny turn, with the same environment scrub the manager's `run.sh` uses.
+///
+/// Worth its single small call: ANTHROPIC_API_KEY silently takes precedence over a claude.ai
+/// login, so a stale or empty key makes the manager fail with "credit balance is too low" while
+/// the developer's subscription is perfectly fine. Scrubbing it is what run.sh already does —
+/// this check confirms the result rather than leaving them to discover it from a briefing that
+/// never changes.
+fn claude_can_run() -> Check {
+    let out = std::process::Command::new("env")
+        .args(["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "claude", "-p", "ok"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let keyed = std::env::var("ANTHROPIC_API_KEY").is_ok();
+            Check::ok(
+                "can run",
+                if keyed { "on your subscription (API key ignored)" } else { "on your subscription" },
+            )
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output").trim();
+            Check::fail("can run", line.chars().take(90).collect::<String>(), "run `claude` once to sign in")
+        }
+        Err(e) => Check::fail("can run", e.to_string(), "run `claude` once to sign in"),
+    }
+}
+
+/// Render a group. Failures carry their fix; a skip states its cost and moves on.
+pub fn print_checks(group: &str, checks: &[Check]) {
+    println!("  \x1b[38;5;244m{group}\x1b[0m");
+    for c in checks {
+        let (mark, colour, detail) = match &c.state {
+            CheckState::Ok(d) => ("✓", 35, d),
+            CheckState::Skip(d) => ("·", 244, d),
+            CheckState::Fail(d) => ("✗", 208, d),
+        };
+        println!("  \x1b[38;5;{colour}m{mark}\x1b[0m {:<13} {detail}", c.name);
+        if let (CheckState::Fail(_), Some(fix)) = (&c.state, &c.fix) {
+            println!("      \x1b[38;5;244m{fix}\x1b[0m");
+        }
+    }
+}
+
+// ── Guided fixes ─────────────────────────────────────────────────────────────────────────
+//
+// We open pages, take a paste, and write config. We never install software: putting things on
+// someone's machine is their call, so `brew install …` is printed rather than run.
+
+fn open_page(url: &str) {
+    println!("  \x1b[38;5;244mopening {url}\x1b[0m");
+    let _ = std::process::Command::new("open").arg(url).status();
+}
+
+fn prompt(label: &str) -> Option<String> {
+    use std::io::Write;
+    print!("  {label} ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    let t = line.trim().to_string();
+    (!t.is_empty()).then_some(t)
+}
+
+/// Walk the two gaps that are ours to close. Returns the checks as they stand afterwards, so the
+/// caller re-reads reality rather than assuming the fix worked.
+pub fn guided_bridge_setup(checks: &[Check]) -> Result<()> {
+    let failed = |n: &str| checks.iter().any(|c| c.name == n && c.failed());
+    let skipped = |n: &str| checks.iter().any(|c| c.name == n && matches!(c.state, CheckState::Skip(_)));
+
+    if failed("authtoken") {
+        println!();
+        println!("  ngrok needs an authtoken before it can open a tunnel. Free, about a minute.");
+        open_page("https://dashboard.ngrok.com/get-started/your-authtoken");
+        if let Some(token) = prompt("Paste your authtoken (Enter to skip):") {
+            let st = std::process::Command::new("ngrok")
+                .args(["config", "add-authtoken", &token])
+                .status();
+            match st {
+                Ok(s) if s.success() => println!("  \x1b[38;5;35m✓\x1b[0m authtoken     saved"),
+                _ => println!("  \x1b[38;5;208m✗\x1b[0m authtoken     ngrok rejected it"),
+            }
+        }
+    }
+
+    if skipped("stable URL") {
+        println!();
+        println!("  A static domain keeps this QR working across restarts — free, one per account.");
+        open_page("https://dashboard.ngrok.com/domains");
+        if let Some(d) = prompt("Paste your domain (Enter to skip):") {
+            let d = d.trim().trim_start_matches("https://").trim_end_matches('/').to_string();
+            if d.contains('.') && !d.contains(' ') {
+                set_ngrok_domain(&d)?;
+                println!("  \x1b[38;5;35m✓\x1b[0m stable URL    saved to ~/.mars/config.json");
+            } else {
+                println!("  \x1b[38;5;208m✗\x1b[0m stable URL    that does not look like a domain");
+            }
+        } else {
+            println!("  \x1b[38;5;244m·\x1b[0m ephemeral — this QR stops working when the bridge restarts");
+        }
+    }
+    Ok(())
+}
+
+/// Exercise the public path before showing a QR.
+///
+/// The bridge used to announce itself ready when the local listener bound, which proves nothing
+/// about the tunnel. A QR that cannot work is worse than an error, because it moves the failure
+/// onto a device with no diagnostics.
+pub fn verify_public(base: &str) -> Vec<Check> {
+    let mut out = Vec::new();
+
+    let reachable = std::process::Command::new("curl")
+        .args(["-sS", "-o", "/dev/null", "-m", "12", "-w", "%{http_code}", base])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|c| c.starts_with('2') || c.starts_with('3'));
+    out.push(match reachable {
+        Some(code) => Check::ok("reachable", format!("public URL answered {code}")),
+        None => Check::fail("reachable", "no answer over the tunnel", "check ngrok is still up"),
+    });
+
+    // The whole bridge is one long-lived WebSocket, so an HTTP 200 is not enough evidence.
+    let ws = base.replacen("https://", "wss://", 1);
+    let upgraded = std::process::Command::new("curl")
+        .args([
+            "-sS", "-o", "/dev/null", "-m", "12", "-w", "%{http_code}",
+            "-H", "Connection: Upgrade", "-H", "Upgrade: websocket",
+            "-H", "Sec-WebSocket-Version: 13",
+            "-H", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+            base,
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    out.push(match upgraded.as_deref() {
+        Some("101") => Check::ok("websocket", "upgrade accepted"),
+        Some(other) => Check::fail(
+            "websocket",
+            format!("tunnel answered {other}, not 101"),
+            format!("the tunnel is not passing websockets through to {ws}"),
+        ),
+        None => Check::fail("websocket", "no answer", "check ngrok is still up"),
+    });
+    out
+}
+
+/// `mars pair --check` — the preflight alone, so it can be run without starting anything.
+pub fn check_main(session_arg: Option<String>) -> Result<()> {
+    let session = resolve_session(session_arg).ok();
+    println!();
+    println!("  \x1b[38;5;208mRover\x1b[0m · preflight");
+    println!();
+    let bridge = preflight_bridge(session.as_deref());
+    print_checks("bridge", &bridge);
+    println!();
+    // Probe for real here: `--check` is the one place a developer explicitly asked us to find out,
+    // so spending one tiny turn to answer "can the manager actually run" is what they came for.
+    print_checks("manager", &preflight_manager(true));
+    println!();
+    if bridge.iter().any(|c| c.failed()) {
+        anyhow::bail!("bridge preflight failed — fix the ✗ lines above, then `mars pair`");
+    }
+    println!("  ready — run `mars pair` to bring the bridge up");
+    Ok(())
+}
+
+/// `mars pair --link` — just the pairing URL, for when a camera will not focus.
+pub fn link_main(session_arg: Option<String>) -> Result<()> {
+    let session = resolve_session(session_arg)?;
+    let base = running_tunnel_url()
+        .ok_or_else(|| anyhow!("no bridge is running — start one with `mars pair`"))?;
+    let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
+    let token = ensure_token();
+    let fp = daemon_fingerprint(&session);
+    println!(
+        "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
+    );
+    Ok(())
 }

@@ -405,19 +405,30 @@ fn main() -> Result<()> {
         }
         // The Rover bridge — a phone/web client over WebSocket. `qr` prints a pairing
         // QR; `serve` runs the WS ⇄ session-socket pump. Built only with `--features web`.
+        // `pair` names what it does — connect your phone. `serve` named the mechanism, and is
+        // kept forever as a silent alias: ~/Library/LaunchAgents/com.mars.rover-bridge.plist
+        // hardcodes it, so dropping the verb would break every already-supervised bridge on its
+        // next restart, silently.
         #[cfg(feature = "web")]
-        Some("serve") => {
+        Some("pair") | Some("serve") => {
             // `mars serve [session]` runs the bridge (or reprints the QR if one's already up);
             // `mars serve --reset [session]` rotates the pairing QR and disconnects phones.
             let rest: Vec<String> = args.collect();
-            let reset = rest.iter().any(|a| a == "--reset" || a == "reset");
-            let session = rest.into_iter().find(|a| !a.starts_with('-') && a != "reset");
+            let has = |f: &str| rest.iter().any(|a| a == f);
+            let reset = has("--reset") || rest.iter().any(|a| a == "reset");
+            let session = rest.iter().find(|a| !a.starts_with('-') && *a != "reset").cloned();
+            if has("--check") {
+                return serve::check_main(session);
+            }
+            if has("--link") {
+                return serve::link_main(session);
+            }
             return if reset { serve::reset_main(session) } else { serve::serve_main(session) };
         }
         #[cfg(feature = "web")]
         Some("qr") => return serve::qr_main(args.next()),
         #[cfg(not(feature = "web"))]
-        Some("serve") | Some("qr") => {
+        Some("pair") | Some("serve") | Some("qr") => {
             eprintln!(
                 "this build has no Rover bridge; rebuild with:  cargo build --features web"
             );
@@ -6333,6 +6344,57 @@ fn selfcheck() -> Result<()> {
                 "the placeholder instance matched an unrelated session");
         }
         println!("[selfcheck] manager: a rename moves the record, not the history ... PASS");
+    // ── mars pair preflight ─────────────────────────────────────────────────────────────
+    // Pure logic, so it is testable without a tunnel, an account or a phone.
+    #[cfg(feature = "web")]
+    {
+        use serve::{CheckState, ngrok_domain, preflight_bridge, set_ngrok_domain};
+
+        // A missing session is a failure that names its own fix, not a panic.
+        let none = preflight_bridge(None);
+        let sess = none.iter().find(|c| c.name == "session").expect("no session check");
+        assert!(sess.failed() && sess.fix.is_some(), "a missing session gave no fix");
+
+        // Point HOME at the throwaway runtime for the config round-trip. set_ngrok_domain writes
+        // to $HOME/.mars/config.json, and without this the check edits the developer's real
+        // config — which it did, once, before this line existed.
+        let real_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", cfg_dir.join("pairhome"));
+
+        // The domain resolves config-then-env, env winning. It used to live ONLY in the env,
+        // where a new shell and the launchd agent could not see it — which silently broke the
+        // "survives restarts" promise under exactly the supervision meant to keep it alive.
+        std::env::remove_var("MARS_NGROK_DOMAIN");
+        set_ngrok_domain("probe-domain.ngrok-free.app")?;
+        assert_eq!(ngrok_domain().as_deref(), Some("probe-domain.ngrok-free.app"),
+            "the domain did not come back from config");
+        std::env::set_var("MARS_NGROK_DOMAIN", "override.ngrok-free.app");
+        assert_eq!(ngrok_domain().as_deref(), Some("override.ngrok-free.app"),
+            "the environment did not override config");
+        std::env::remove_var("MARS_NGROK_DOMAIN");
+
+        // Timing is the point of the authtoken check: it replaced a 25s timeout with a read.
+        let t0 = std::time::Instant::now();
+        let checks = preflight_bridge(Some("probe"));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5),
+            "preflight took {:?} — it must never diagnose by waiting for a timeout", t0.elapsed());
+        // A set domain reports Ok, never Skip.
+        set_ngrok_domain("probe-domain.ngrok-free.app")?;
+        let checks2 = preflight_bridge(Some("probe"));
+        let url = checks2.iter().find(|c| c.name == "stable URL").expect("no stable URL check");
+        assert!(matches!(url.state, CheckState::Ok(_)), "a configured domain read as unset");
+        assert!(checks.iter().any(|c| c.name == "ngrok"), "ngrok was not checked at all");
+
+        // …and hand HOME back, so nothing after this block writes into a temp directory either.
+        match real_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        assert!(!crate::serve::ngrok_domain().is_some_and(|d| d.starts_with("probe-domain")),
+            "the preflight check leaked its fixture into the real config");
+    }
+    println!("[selfcheck] pair: preflight is instant and config-backed ... PASS");
+
 
 
 
