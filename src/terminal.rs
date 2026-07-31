@@ -449,6 +449,19 @@ impl Term {
     /// and a feature built on them would silently do nothing on most machines. The
     /// process group is there whether or not anyone configured anything.
     ///
+    /// The bare command name out of whatever `ps` reported.
+    ///
+    /// Two surprises, each of which silently defeats an exact match. macOS `ps -o comm=` includes
+    /// ARGUMENTS, so Claude Code's helpers report as `claude bg-pty-host`; and anything off the
+    /// default PATH reports a full path. Take the first token, then its basename.
+    ///
+    /// Getting this wrong is invisible rather than loud: the agent flag simply never gets set, and
+    /// a reboot quietly comes back without resuming the conversation it was supposed to restore.
+    pub fn command_name(ps_output: &str) -> String {
+        let first = ps_output.trim().split_whitespace().next().unwrap_or_default();
+        first.rsplit('/').next().unwrap_or(first).to_string()
+    }
+
     /// The NAME of the foreground command, when one is running (`claude`, `cargo`, …).
     ///
     /// Same source as `foreground_busy` — the PTY's foreground process group — resolved to a
@@ -466,10 +479,7 @@ impl Term {
                 .args(["-o", "comm=", "-p", &leader.to_string()])
                 .output()
                 .ok()?;
-            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            // `ps` gives a path for anything not on the default PATH; the basename is the answer.
-            let base = name.rsplit('/').next().unwrap_or(&name).to_string();
-            (!base.is_empty()).then_some(base)
+            Some(Self::command_name(&String::from_utf8_lossy(&out.stdout))).filter(|s| !s.is_empty())
         }
         #[cfg(not(unix))]
         {

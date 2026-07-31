@@ -1248,6 +1248,28 @@ fn selfcheck() -> Result<()> {
              rows_formatted, the workaround may now be unnecessary");
         while rx.try_recv().is_ok() {}
         println!("[selfcheck] manager tail keeps its gaps .... PASS");
+
+        // Which pane was running a coding agent decides whether a reboot resumes the conversation
+        // or silently comes back without it. It is read from `ps`, and `ps` has two habits that
+        // each defeat a naive exact match — both of these strings are real output from this
+        // machine.
+        {
+            let cn = terminal::Term::command_name;
+            // macOS `comm=` includes ARGUMENTS. This is what Claude Code's helpers report as, and
+            // it is what made the first version of this never match.
+            assert_eq!(cn("claude bg-pty-host --bg-pty-host /tmp/cc-daemon"), "claude",
+                "arguments in `ps -o comm=` defeated the command name");
+            assert_eq!(cn("claude agents"), "claude");
+            assert_eq!(cn("claude"), "claude");
+            // Anything off the default PATH reports a full path.
+            assert_eq!(cn("/Users/me/.local/bin/claude"), "claude",
+                "a full path defeated the command name");
+            assert_eq!(cn("  /bin/zsh  \n"), "zsh", "whitespace was not trimmed");
+            // …and it must not turn an unrelated command into a match.
+            assert_eq!(cn("cargo build --release"), "cargo");
+            assert_eq!(cn(""), "");
+        }
+        println!("[selfcheck] pane: agent detection survives ps output ... PASS");
     }
 
     // 15a. Terminal mouse-copy: the selection extractor pulls the selected cells
