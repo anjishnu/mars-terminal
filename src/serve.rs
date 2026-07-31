@@ -395,23 +395,27 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
         std::thread::sleep(Duration::from_millis(750 * attempt));
         checked = verify_public(&https);
     }
-    print_checks("bridge", &checked);
-    if let Some(c) = checked.iter().find(|c| c.failed()) {
-        // Supervised, this must NOT be fatal. launchd restarts whatever exits, so bailing turns a
-        // tunnel that is merely slow into a bridge that restarts every five seconds forever — and
-        // each restart tears down the ngrok it just started, so it can never recover. Interactively
-        // the gate is still right: refuse to print a QR that cannot work.
-        //
-        // Not a terminal ⇒ nobody is watching this output ⇒ we are supervised.
-        use std::io::IsTerminal;
-        if std::io::stdout().is_terminal() {
-            anyhow::bail!("{} — {}", c.name, c.fix.clone().unwrap_or_default());
-        }
-        eprintln!(
-            "[rover] {} — {} · serving anyway; a phone may still connect once the tunnel settles",
-            c.name,
-            c.fix.clone().unwrap_or_default()
+    // A NOTE, never a gate.
+    //
+    // This probe leaves the host, crosses the internet and comes back to the same host. That is a
+    // hairpin, and it fails for reasons that have nothing to do with whether a phone can connect:
+    // a VPN, split-horizon DNS, a captive network. On the machine this was written on it fails
+    // every single time — four `utun` interfaces — while phones connect immediately.
+    //
+    // So it cannot tell "the tunnel is broken" from "the tunnel is not visible from here", and
+    // something that cannot tell those apart has no business refusing to print a QR. It once did
+    // exactly that, and under a supervisor it exited rather than serve: a working tunnel produced
+    // a bridge restarting every five seconds, each restart killing the ngrok it had just started.
+    //
+    // The phone is the only instrument that can actually answer this. Show it the QR and let it.
+    if checked.iter().any(|c| c.failed()) {
+        print_checks("bridge", &checked);
+        println!(
+            "  \x1b[38;5;244mcould not reach the tunnel FROM THIS MACHINE — normal behind a VPN or \n\
+             \x20 split-horizon DNS, and not evidence that your phone cannot. Scan and see.\x1b[0m"
         );
+    } else {
+        print_checks("bridge", &checked);
     }
     println!();
 
