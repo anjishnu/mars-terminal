@@ -1596,6 +1596,23 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
         None => attached_session()
             .ok_or_else(|| anyhow!("no attached session — name one: mars reboot <name>"))?,
     };
+    // Reboot RESTARTS a running session; it must never quietly create one. Skipping the kill for
+    // a name with no live socket and spawning anyway looks like success and is not: asked to
+    // reboot `0` — a session since renamed — it left the real daemon untouched and started a
+    // second session beside it. The board then shows two, neither of them what was asked for.
+    if crate::sys::control::probe(&socket_path(&name)?) != crate::sys::control::Probe::Live {
+        let live: Vec<String> = list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, alive, _)| *alive)
+            .map(|(n, _, _)| n)
+            .collect();
+        anyhow::bail!(
+            "no live session '{name}' — reboot restarts a running session, it does not create \
+             one.\nlive: {}",
+            if live.is_empty() { "(none)".into() } else { live.join(", ") }
+        );
+    }
     // The new daemon restores its own workspaces from this manifest at boot — see the
     // MARS_OPEN_TERMINAL branch in `server_main`. Read here only to say what is about to happen,
     // and to be honest when there is nothing to restore.
@@ -1616,9 +1633,7 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
 
     // Graceful: the daemon flushes its state and removes its own socket. kill_main already waits
     // for the socket to disappear, which is the only reliable "it is really gone".
-    if socket_path(&name).map(|p| p.exists()).unwrap_or(false) {
-        kill_main(&name)?;
-    }
+    kill_main(&name)?;
     spawn_daemon(&name, None)?;
     println!("'{name}' is back on {}", env!("CARGO_PKG_VERSION"));
     Ok(())
