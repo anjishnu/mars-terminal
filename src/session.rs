@@ -641,9 +641,32 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     let mut app = App::new(file)?;
     app.session_name = Some(name.to_string());
     app.session_instance_id = Some(session_instance_id);
-    // A no-file session opens straight into a terminal (multiplexer default).
+    // A no-file session opens straight into a terminal (multiplexer default) — or, after a
+    // reboot, back into the workspaces it had.
+    //
+    // Restoring HERE rather than from `mars reboot` is what removes the startup race instead of
+    // narrowing it. An external process can only paste `cd` over the socket and hope the shell is
+    // listening yet; `nudge_manager` already records what that costs — "the command would be typed
+    // into a terminal that is not reading yet and silently vanish". Worse, a swallowed `cd` that is
+    // followed by a landed `claude --continue` resumes a DIFFERENT project's conversation, because
+    // `--continue` picks by directory. A plausible wrong answer, silently.
+    //
+    // In here neither can happen: a cwd is a spawn argument, so the pane is born in the right
+    // place and nothing is typed at all; and `Term::send_bytes` already queues behind the prompt
+    // probe, so the agent line waits for a shell that is genuinely ready.
     if !had_file && std::env::var("MARS_OPEN_TERMINAL").is_ok() {
-        app.open_terminal();
+        let panes = read_restore(&name);
+        if panes.is_empty() {
+            app.open_terminal();
+        } else {
+            for (i, (cwd, agent)) in panes.iter().enumerate() {
+                if i > 0 {
+                    app.new_tab();
+                }
+                app.restore_workspace(std::path::Path::new(cwd), *agent);
+            }
+            app.clear_startup_cwd();
+        }
     }
 
     let mut client: Option<(crate::sys::control::Stream, u64)> = None;
@@ -1573,8 +1596,23 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
         None => attached_session()
             .ok_or_else(|| anyhow!("no attached session — name one: mars reboot <name>"))?,
     };
+    // The new daemon restores its own workspaces from this manifest at boot — see the
+    // MARS_OPEN_TERMINAL branch in `server_main`. Read here only to say what is about to happen,
+    // and to be honest when there is nothing to restore.
     let panes = read_restore(&name);
-    println!("rebooting '{name}' — {} workspace(s) to restore", panes.len().max(1));
+    if panes.is_empty() {
+        println!(
+            "rebooting '{name}' — no saved layout, so it comes back as a bare shell.\n\
+             (A session started before this feature has no manifest; the next reboot will have one.)"
+        );
+    } else {
+        let agents = panes.iter().filter(|(_, a)| *a).count();
+        println!(
+            "rebooting '{name}' — {} workspace(s) to restore{}",
+            panes.len(),
+            if agents > 0 { format!(", {agents} with a coding agent") } else { String::new() }
+        );
+    }
 
     // Graceful: the daemon flushes its state and removes its own socket. kill_main already waits
     // for the socket to disappear, which is the only reliable "it is really gone".
@@ -1582,35 +1620,8 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
         kill_main(&name)?;
     }
     spawn_daemon(&name, None)?;
-
-    // Rebuild the shape. The new daemon opened one terminal for itself, so the first entry lands
-    // in that pane and the rest each get a new tab.
-    let stream = crate::sys::control::connect(&socket_path(&name)?)
-        .map_err(|e| anyhow!("rebooted '{name}' but could not reach it: {e}"))?;
-    let mut w = stream.try_clone()?;
-    for (i, (cwd, agent)) in panes.iter().enumerate() {
-        if i > 0 {
-            write_frame(&mut w, &ClientFrame::NewTerminal)?;
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        // `cd` rather than spawning the shell in place: the pane already exists by the time we
-        // get here, and a shell that is already at a prompt takes a line far more reliably than
-        // one being raced during startup.
-        write_frame(&mut w, &ClientFrame::Paste(format!("cd {} && clear\r", shell_quote(cwd))))?;
-        std::thread::sleep(Duration::from_millis(150));
-        if *agent {
-            // `--continue` resumes the most recent conversation IN THAT DIRECTORY, so restoring
-            // the cwd is what restores the session. No id to record, nothing to go stale.
-            write_frame(&mut w, &ClientFrame::Paste("claude --continue\r".to_string()))?;
-            std::thread::sleep(Duration::from_millis(150));
-        }
-    }
     println!("'{name}' is back on {}", env!("CARGO_PKG_VERSION"));
     Ok(())
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Start a session's daemon and wait for its socket, without attaching a client.

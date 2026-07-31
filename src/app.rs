@@ -5182,6 +5182,38 @@ impl App {
 
     // ── Terminal pane ────────────────────────────────────────────────────────
 
+    /// Bring back one workspace after a reboot: a terminal rooted where it was, and the coding
+    /// agent resumed if one was running there.
+    ///
+    /// Both halves avoid the startup race by construction rather than by timing. The cwd is a
+    /// SPAWN argument, so the shell is born in the right directory and no `cd` is ever typed.
+    /// The agent line goes through `send_bytes`, which queues behind the prompt probe and flushes
+    /// only once the shell is genuinely reading — the mechanism `nudge_manager` learned to use
+    /// after a turn typed into a not-yet-ready terminal vanished without trace.
+    pub fn restore_workspace(&mut self, cwd: &std::path::Path, agent: bool) {
+        // `open_terminal` takes its cwd from here; setting it is the whole of "restore the
+        // directory". Cleared by the caller once the last workspace is up.
+        self.startup_cwd = Some(cwd.to_path_buf());
+        self.open_terminal();
+        if !agent {
+            return;
+        }
+        let id = self.focused_pane_id();
+        if let Some(PaneContent::Terminal(tid)) = self.panes.get(&id).map(|p| p.content.clone()) {
+            if let Some(t) = self.terms.get_mut(&tid) {
+                // `--continue` resumes the most recent conversation IN THIS DIRECTORY, which is
+                // why getting the cwd right above is what restores the right conversation. No
+                // session id to record, and nothing that can go stale.
+                t.send_bytes(b"claude --continue\r");
+            }
+        }
+    }
+
+    /// Done restoring — stop overriding where new terminals open.
+    pub fn clear_startup_cwd(&mut self) {
+        self.startup_cwd = None;
+    }
+
     pub fn open_terminal(&mut self) {
         // If this pane is already a terminal, just re-attach.
         if let PaneContent::Terminal(_) = self.focused_pane().content {
