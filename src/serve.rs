@@ -382,10 +382,36 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
 
     // Prove the path before showing a QR. A QR that cannot work is worse than an error: it moves
     // the failure onto a device with no diagnostics.
-    let checked = verify_public(&endpoint.replacen("wss://", "https://", 1));
+    //
+    // Retried, because ngrok reports its URL before the edge is routing to it — checking once, at
+    // the earliest possible moment, tests the tunnel at exactly the instant it is least likely to
+    // answer.
+    let https = endpoint.replacen("wss://", "https://", 1);
+    let mut checked = verify_public(&https);
+    for attempt in 1..=4 {
+        if !checked.iter().any(|c| c.failed()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(750 * attempt));
+        checked = verify_public(&https);
+    }
     print_checks("bridge", &checked);
     if let Some(c) = checked.iter().find(|c| c.failed()) {
-        anyhow::bail!("{} — {}", c.name, c.fix.clone().unwrap_or_default());
+        // Supervised, this must NOT be fatal. launchd restarts whatever exits, so bailing turns a
+        // tunnel that is merely slow into a bridge that restarts every five seconds forever — and
+        // each restart tears down the ngrok it just started, so it can never recover. Interactively
+        // the gate is still right: refuse to print a QR that cannot work.
+        //
+        // Not a terminal ⇒ nobody is watching this output ⇒ we are supervised.
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            anyhow::bail!("{} — {}", c.name, c.fix.clone().unwrap_or_default());
+        }
+        eprintln!(
+            "[rover] {} — {} · serving anyway; a phone may still connect once the tunnel settles",
+            c.name,
+            c.fix.clone().unwrap_or_default()
+        );
     }
     println!();
 
