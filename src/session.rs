@@ -903,11 +903,18 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     // empty line log — which is why every snapshot carried tail=0, delta=0 and the
                     // agent had nothing to summarise. Screen for where it landed, log for what
                     // streamed past: that is the split the two fields were always meant to be.
+                    //
+                    // `contents()`, NOT `rows_formatted()`. vt100 encodes a run of blank cells
+                    // between two styled ones as a cursor MOVE rather than as spaces, and
+                    // stripping escapes then deletes the gap along with the escape — so a
+                    // styled TUI reached the agent as "meta agentexiststoansweris". The words
+                    // the manager reads were being welded together by the very step meant to
+                    // make them readable.
                     let screen = term.screen();
-                    let (_, cols) = screen.size();
                     let tail: Vec<String> = screen
-                        .rows_formatted(0, cols)
-                        .map(|r| crate::manager::plain(&r))
+                        .contents()
+                        .lines()
+                        .map(|l| l.trim_end().to_string())
                         .filter(|l| !l.trim().is_empty())
                         .collect::<Vec<_>>()
                         .into_iter()

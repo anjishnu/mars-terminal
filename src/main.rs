@@ -1213,6 +1213,36 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] pane foreground detection .. PASS");
     }
 
+    // 15y. The manager's tail must survive STYLED output. vt100 encodes a gap between two styled
+    //      cells as a cursor move, so stripping escape codes deleted the spaces with them and the
+    //      agent read "meta agentexiststoansweris" — its only input, welded shut.
+    {
+        // Gaps made by MOVING the cursor, not by writing spaces — which is what a TUI does when
+        // it positions each word rather than padding between them. A literal space is a cell with
+        // contents and survives; a skipped cell is never written, and vt100 re-encodes it as a
+        // cursor move that escape-stripping then swallows whole.
+        sh.send_bytes(b"printf 'red\\033[3Cgreen\\033[3Cblue\\n'\r");
+        assert!(wait_until(|| sh.screen().contents().contains("red   green   blue")),
+            "cursor-positioned words lost the gaps between them: {:?}",
+            sh.screen().contents().lines().filter(|l| l.contains("red")).collect::<Vec<_>>());
+        // …and pin WHY the tail is built from `contents()`. The formatted rows encode those gaps
+        // as cursor moves, so stripping escapes welds the words together. Asserting the
+        // difference means anyone "simplifying" the tail back to rows_formatted has to delete
+        // this line first, and will see what it costs.
+        let welded = {
+            let screen = sh.screen();
+            let (_, cols) = screen.size();
+            let rows: Vec<String> =
+                screen.rows_formatted(0, cols).map(|r| manager::plain(&r)).collect();
+            rows.iter().any(|l| l.contains("redgreen") || l.contains("greenblue"))
+        };
+        assert!(welded,
+            "vt100 no longer encodes blank runs as cursor moves — re-check why the tail avoids \
+             rows_formatted, the workaround may now be unnecessary");
+        while rx.try_recv().is_ok() {}
+        println!("[selfcheck] manager tail keeps its gaps .... PASS");
+    }
+
     // 15a. Terminal mouse-copy: the selection extractor pulls the selected cells
     //      as text (the core of drag-to-copy in a terminal pane).
     {
