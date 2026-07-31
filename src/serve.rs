@@ -240,15 +240,28 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
             }
         }
     }
-    // Bind to the session's INSTANCE ID, not its name. The socket is named after the session, so
-    // `mars rename` moves it and a path captured here would go stale — the bridge would keep
-    // accepting phones and forward nothing. The instance id is minted once per daemon and never
-    // re-derived from the name, so re-resolving by it follows a rename automatically.
+    // Bind to the session's DIRECTORY, not its name and not the daemon's instance id.
+    //
+    // Not the name: `mars rename` moves the socket, so a path captured here goes stale and the
+    // bridge keeps accepting phones while forwarding nothing.
+    //
+    // Not the instance id either, which is what this used to do. An instance id is `pid-nanos`,
+    // minted afresh on every daemon start — immutable, but not DURABLE. It names a process, and
+    // the process is exactly what `mars reboot` replaces. A bridge holding one across a restart
+    // found nothing and refused every connection from then on: a locked-out phone, delivered by
+    // the feature meant to save a trip to the keyboard.
+    //
+    // A session outlives its daemons and its own name; the directory under ~/.mars/sessions is
+    // what carries that. Resolve through it per connection and both a rename and a reboot are
+    // followed with no restart here at all.
     let instance_id = session::identify(&socket).map(|(_, id, _)| id).unwrap_or_default();
-    if instance_id.is_empty() {
+    let session_dir = crate::manager::existing_session_dir_pub(&session)
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_default();
+    if session_dir.is_empty() && instance_id.is_empty() {
         return Err(anyhow!(
-            "session '{session}' did not report an instance id — is it an older `mars`? \
-             Restart the session so the bridge can follow it across renames."
+            "session '{session}' has neither a manager directory nor an instance id — is it an \
+             older `mars`? Restart the session so the bridge can follow it."
         ));
     }
     // Remember it: this is what a later start reads when the name it was given has moved.
@@ -306,8 +319,13 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
         // a misdirected bridge indistinguishable from a broken client.
         let fallback = socket.clone();
         let id = instance_id.clone();
+        let dir_id = session_dir.clone();
         thread::spawn(move || {
-            let sock = match crate::session::socket_for_instance(&id) {
+            // Directory first — it survives both a rename and a reboot. The instance id is kept
+            // only as a fallback for a session with no manager directory yet.
+            let found = crate::session::socket_for_session_dir(&dir_id)
+                .or_else(|| crate::session::socket_for_instance(&id));
+            let sock = match found {
                 Some((name, p)) => {
                     if p != fallback {
                         crate::session::debug_log(&format!(

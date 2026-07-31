@@ -301,6 +301,44 @@ pub fn socket_for_instance(instance_id: &str) -> Option<(String, PathBuf)> {
     None
 }
 
+/// Find the socket now serving this SESSION, whatever process is behind it.
+/// Returns `(current_name, socket_path)`.
+///
+/// The distinction from `socket_for_instance` is the whole point, and it is subtle enough to have
+/// shipped wrong. An `instance_id` is `pid-nanos`, minted afresh every time a daemon starts — it
+/// is immutable, but it is not DURABLE. It names a process, and the process is precisely the thing
+/// a reboot replaces. A bridge holding one across a restart finds nothing and refuses every
+/// connection from then on, which is a locked-out phone rather than a visible error.
+///
+/// A session outlives its daemons, and what carries that identity is its DIRECTORY under
+/// `~/.mars/sessions/`. The directory name is fixed at creation; a rename rewrites the `name`
+/// field inside `meta.json` and leaves the directory alone. So: directory → current name →
+/// socket, re-read on every call so a rename is followed rather than cached.
+/// The name this session directory currently goes by.
+///
+/// Split out from the socket lookup so the property that matters is testable without a live
+/// daemon: the answer depends on the directory and the CURRENT name, and on nothing about the
+/// process. Feeding it a directory whose `instance_id` has changed must change nothing.
+pub fn session_name_for_dir(dir_id: &str) -> Option<String> {
+    if dir_id.is_empty() {
+        return None;
+    }
+    let sdir = crate::manager::sessions_root()?.join(dir_id);
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sdir.join("meta.json")).ok()?).ok()?;
+    meta["name"].as_str().filter(|n| !n.is_empty()).map(String::from)
+}
+
+pub fn socket_for_session_dir(dir_id: &str) -> Option<(String, PathBuf)> {
+    // Re-read per call, so a rename between two connections is followed rather than cached.
+    let name = session_name_for_dir(dir_id)?;
+    let path = socket_path(&name).ok()?;
+    // Probe rather than trust the file's existence: a socket left behind by a dead daemon is
+    // exactly what "the session is gone" is supposed to catch, and `identify` already answers it.
+    let (live_name, _, _) = identify(&path)?;
+    Some((live_name, path))
+}
+
 /// The session a bridge should serve when told nothing: the one a client is ATTACHED to.
 ///
 /// Defaulting to "the first session listed" is how a bridge ended up serving a name whose daemon

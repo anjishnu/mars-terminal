@@ -6410,6 +6410,42 @@ fn selfcheck() -> Result<()> {
                 "the placeholder instance matched an unrelated session");
         }
         println!("[selfcheck] manager: a rename moves the record, not the history ... PASS");
+        // The bridge must follow the SESSION, not the process serving it. It used to hold the
+        // daemon's instance id, which is minted fresh on every start — so the first `mars reboot`
+        // orphaned it and it refused every connection from then on. A locked-out phone, caused by
+        // the feature meant to avoid a trip to the keyboard.
+        {
+            let dir = manager::session_dir("pinned", "inst-first", 3_000_000).expect("no dir");
+            std::fs::create_dir_all(&dir)?;
+            let write_meta = |name: &str, instance: &str| -> anyhow::Result<()> {
+                std::fs::write(dir.join("meta.json"), serde_json::json!({
+                    "id": "pinned", "name": name, "instance_id": instance,
+                }).to_string())?;
+                Ok(())
+            };
+            let dir_id = dir.file_name().unwrap().to_string_lossy().to_string();
+
+            write_meta("pinned", "inst-first")?;
+            assert_eq!(session::session_name_for_dir(&dir_id).as_deref(), Some("pinned"),
+                "the directory did not resolve to its own session");
+
+            // A REBOOT: same session, same directory, brand-new process identity. This is the
+            // case that broke — resolution must not notice at all.
+            write_meta("pinned", "inst-second-after-reboot")?;
+            assert_eq!(session::session_name_for_dir(&dir_id).as_deref(), Some("pinned"),
+                "a new instance id orphaned the session — the bridge is pinned to the process");
+
+            // A RENAME: the directory is unchanged and the name moved, so resolution must follow
+            // it. Cached anywhere and the bridge forwards to a socket that no longer exists.
+            write_meta("renamed-live", "inst-second-after-reboot")?;
+            assert_eq!(session::session_name_for_dir(&dir_id).as_deref(), Some("renamed-live"),
+                "a rename was not followed — the name is being cached somewhere");
+
+            // And it must not invent a session for a directory that has none.
+            assert!(session::session_name_for_dir("no-such-directory").is_none(),
+                "resolved a session directory that does not exist");
+        }
+        println!("[selfcheck] bridge: follows the session, not the process ... PASS");
         // `stalled` has to travel the whole way as its own state. It was tempting to fold it into
         // `running` on the board and only distinguish it in prose — which would have left the one
         // surface people actually look at unable to show the thing.
