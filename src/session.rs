@@ -950,6 +950,28 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     last_tail.insert(tid, tail.clone());
                     out.insert(pid.to_string(), serde_json::json!({ "tail": tail, "delta": delta }));
                 }
+                // The session's shape, refreshed on the same tick as the snapshot. A reboot reads
+                // this to come back as itself; writing it here rather than on shutdown means a
+                // daemon that is killed outright still leaves one behind.
+                let shape: Vec<(String, bool)> = app
+                    .tabs
+                    .iter()
+                    .filter(|t| !t.hidden)
+                    .filter_map(|t| {
+                        let pid = t.focused_pane;
+                        let crate::pane::PaneContent::Terminal(tid) =
+                            app.panes.get(&pid)?.content else { return None };
+                        let term = app.terms.get(&tid)?;
+                        let cwd = term.spawn_cwd.as_ref()?.display().to_string();
+                        // Was a coding agent running here? Ask the process table for the pane's
+                        // foreground command — `last_command` only knows what MARS typed, so a
+                        // `claude` the engineer started by hand is invisible to it.
+                        Some((cwd, term.foreground_command().as_deref() == Some("claude")))
+                    })
+                    .collect();
+                if let Some(n) = app.session_name.as_deref() {
+                    crate::session::write_restore(n, &shape);
+                }
                 let output = serde_json::Value::Object(out);
                 let _ = crate::manager::tick_session(
                     &origin,
@@ -1460,6 +1482,149 @@ fn state_dir() -> Option<PathBuf> {
 const MANAGER_TAIL: u64 = 20;
 const MANAGER_DELTA_CAP: u64 = 200;
 
+/// What a session needs in order to come back as itself.
+///
+/// A daemon owns its PTYs, so restarting it kills every process in every pane — nothing can save
+/// those. What CAN be saved is the shape: which workspaces existed, where each was rooted, and
+/// which were running a coding agent whose conversation is resumable.
+///
+/// Stored rather than derived, for the same reason the archive is: the live state it describes
+/// stops existing at exactly the moment somebody wants it back. Written on the manager's tick, so
+/// a manifest is always on disk whether the daemon exits cleanly or is killed outright — waiting
+/// for a graceful shutdown to write it would mean a wedged daemon, the one you most want to
+/// reboot, is the one that comes back empty.
+pub fn restore_path(name: &str) -> Option<std::path::PathBuf> {
+    crate::manager::existing_session_dir_pub(name).map(|d| d.join("restore.json"))
+}
+
+/// Snapshot the session's shape. `panes` is `(cwd, running_a_coding_agent)` per workspace.
+pub fn write_restore(name: &str, panes: &[(String, bool)]) {
+    let Some(p) = restore_path(name) else { return };
+    let body = serde_json::json!({
+        "at_ts": crate::worklog::now_secs(),
+        "panes": panes.iter().map(|(cwd, agent)| serde_json::json!({
+            "cwd": cwd, "agent": agent,
+        })).collect::<Vec<_>>(),
+    });
+    if let Ok(t) = serde_json::to_string_pretty(&body) {
+        let _ = std::fs::write(p, t);
+    }
+}
+
+pub fn read_restore(name: &str) -> Vec<(String, bool)> {
+    let Some(p) = restore_path(name) else { return Vec::new() };
+    let Ok(txt) = std::fs::read_to_string(p) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return Vec::new() };
+    v["panes"].as_array().map(|a| {
+        a.iter().filter_map(|p| {
+            let cwd = p["cwd"].as_str()?.to_string();
+            (!cwd.is_empty()).then(|| (cwd, p["agent"].as_bool().unwrap_or(false)))
+        }).collect()
+    }).unwrap_or_default()
+}
+
+/// `mars reboot [name]` — bring a session back on the binary that is on disk NOW.
+///
+/// The whole point is that the caller is not the thing being restarted. A daemon cannot restart
+/// itself (it is the process going away) and the bridge must not try (it is the phone's only way
+/// back, and a bridge inside the blast radius turns a failed reboot into a lost machine). So this
+/// runs as its own short-lived process, and both of those keep serving.
+pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
+    let name = match name_arg {
+        Some(n) => n,
+        None => attached_session()
+            .ok_or_else(|| anyhow!("no attached session — name one: mars reboot <name>"))?,
+    };
+    let panes = read_restore(&name);
+    println!("rebooting '{name}' — {} workspace(s) to restore", panes.len().max(1));
+
+    // Graceful: the daemon flushes its state and removes its own socket. kill_main already waits
+    // for the socket to disappear, which is the only reliable "it is really gone".
+    if socket_path(&name).map(|p| p.exists()).unwrap_or(false) {
+        kill_main(&name)?;
+    }
+    spawn_daemon(&name, None)?;
+
+    // Rebuild the shape. The new daemon opened one terminal for itself, so the first entry lands
+    // in that pane and the rest each get a new tab.
+    let stream = crate::sys::control::connect(&socket_path(&name)?)
+        .map_err(|e| anyhow!("rebooted '{name}' but could not reach it: {e}"))?;
+    let mut w = stream.try_clone()?;
+    for (i, (cwd, agent)) in panes.iter().enumerate() {
+        if i > 0 {
+            write_frame(&mut w, &ClientFrame::NewTerminal)?;
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        // `cd` rather than spawning the shell in place: the pane already exists by the time we
+        // get here, and a shell that is already at a prompt takes a line far more reliably than
+        // one being raced during startup.
+        write_frame(&mut w, &ClientFrame::Paste(format!("cd {} && clear\r", shell_quote(cwd))))?;
+        std::thread::sleep(Duration::from_millis(150));
+        if *agent {
+            // `--continue` resumes the most recent conversation IN THAT DIRECTORY, so restoring
+            // the cwd is what restores the session. No id to record, nothing to go stale.
+            write_frame(&mut w, &ClientFrame::Paste("claude --continue\r".to_string()))?;
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+    println!("'{name}' is back on {}", env!("CARGO_PKG_VERSION"));
+    Ok(())
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Start a session's daemon and wait for its socket, without attaching a client.
+///
+/// Factored out of `session_main` so a reboot can bring a session back up from a process that is
+/// NOT going to attach to it — the phone has no terminal to hand over to.
+///
+/// `std::env::current_exe()` is what makes a reboot pick up a new build: the caller is whichever
+/// `mars` binary is on disk now, so the daemon it spawns is that one and not the one that has been
+/// running since yesterday.
+pub fn spawn_daemon(name: &str, file: Option<String>) -> Result<()> {
+    let path = socket_path(name)?;
+    let _ = std::fs::remove_file(&path);
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    isolate_session_daemon_env(&mut cmd);
+    cmd.arg("--server").arg(name);
+    if let Some(f) = &file {
+        cmd.arg(f);
+    }
+    let log = state_dir()
+        .map(|d| d.join(format!("{name}.log")))
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    cmd.env("RUST_BACKTRACE", "1");
+    if file.is_none() {
+        cmd.env("MARS_OPEN_TERMINAL", "1");
+    }
+    cmd.stdin(std::process::Stdio::null());
+    match log {
+        Some(f) => {
+            let f2 = f.try_clone().ok();
+            cmd.stdout(f);
+            match f2 {
+                Some(f2) => { cmd.stderr(f2); }
+                None => { cmd.stderr(std::process::Stdio::null()); }
+            }
+        }
+        None => {
+            cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        }
+    }
+    crate::sys::daemon::detach(&mut cmd);
+    cmd.spawn()?;
+    for _ in 0..60 {
+        std::thread::sleep(Duration::from_millis(50));
+        if crate::sys::control::probe(&path) == crate::sys::control::Probe::Live {
+            return Ok(());
+        }
+    }
+    Err(anyhow!("session daemon for '{name}' did not start"))
+}
+
 pub fn session_main(name: &str, file: Option<String>) -> Result<()> {
     crate::broker::ensure_broker(); // auto-start the key broker so every session reaches the LLM
     let path = socket_path(name)?;
@@ -1471,56 +1636,7 @@ pub fn session_main(name: &str, file: Option<String>) -> Result<()> {
             );
         }
         crate::sys::control::Probe::Dead => {
-            let _ = std::fs::remove_file(&path);
-            let exe = std::env::current_exe()?;
-            let mut cmd = std::process::Command::new(exe);
-            isolate_session_daemon_env(&mut cmd);
-            cmd.arg("--server").arg(name);
-            if let Some(f) = &file {
-                cmd.arg(f);
-            }
-            // Daemon output goes to a log file — a crashed session must leave a
-            // postmortem, not vanish into /dev/null.
-            let log = state_dir()
-                .map(|d| d.join(format!("{name}.log")))
-                .and_then(|p| {
-                    std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
-                });
-            cmd.env("RUST_BACKTRACE", "1");
-            // A no-file session opens straight into a terminal pane.
-            if file.is_none() {
-                cmd.env("MARS_OPEN_TERMINAL", "1");
-            }
-            cmd.stdin(std::process::Stdio::null());
-            match log {
-                Some(f) => {
-                    let f2 = f.try_clone().ok();
-                    cmd.stdout(f);
-                    match f2 {
-                        Some(f2) => { cmd.stderr(f2); }
-                        None => { cmd.stderr(std::process::Stdio::null()); }
-                    }
-                }
-                None => {
-                    cmd.stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null());
-                }
-            }
-            // Fully detach from this TTY so the daemon survives the window.
-            crate::sys::daemon::detach(&mut cmd);
-            cmd.spawn()?;
-            // Wait for the daemon's socket to come up.
-            let mut ok = false;
-            for _ in 0..60 {
-                std::thread::sleep(Duration::from_millis(50));
-                if crate::sys::control::probe(&path) == crate::sys::control::Probe::Live {
-                    ok = true;
-                    break;
-                }
-            }
-            if !ok {
-                return Err(anyhow!("session daemon for '{name}' did not start"));
-            }
+            spawn_daemon(name, file.clone())?;
         }
         crate::sys::control::Probe::Live => {}
     }

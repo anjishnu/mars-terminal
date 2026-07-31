@@ -745,6 +745,33 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
     match v.get("t").and_then(|t| t.as_str()) {
         // Opinions, not commands — already recorded above, and there is nothing else to do.
         Some("dismiss") | Some("snooze") | Some("seen") | Some("jump") => {}
+        // Reboot the session onto whatever `mars` is on disk now.
+        //
+        // Spawned DETACHED, as a separate short-lived process, and deliberately not done here.
+        // The bridge is the phone's only route back to this machine: if it took part in the
+        // restart it would be inside the blast radius, and a reboot that failed halfway would
+        // leave no way to see that it had, let alone retry. It stays up, watches the daemon go
+        // and come back, and re-resolves on the next connection like it already does for a
+        // rename.
+        Some("reboot") => {
+            let session = v.get("session").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            crate::manager::record_client_event("reboot", &v, crate::worklog::now_secs());
+            let _ = tx.send(format!(
+                "{{\"t\":\"rebooting\",\"session\":{}}}", json_str(&session)
+            ));
+            if let Ok(exe) = std::env::current_exe() {
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg("reboot");
+                if !session.is_empty() {
+                    cmd.arg(&session);
+                }
+                cmd.stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                crate::sys::daemon::detach(&mut cmd);
+                let _ = cmd.spawn();
+            }
+        }
         // LLM proxy — the phone asks, the host answers with its own key.
         Some(kind @ ("ask" | "summarize")) => {
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("session").to_string();

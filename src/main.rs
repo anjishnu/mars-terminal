@@ -397,6 +397,13 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: mars ssh <host> [ssh args…]   (needs: mars keyd)"))?;
             return broker::ssh_main(host, args.collect());
         }
+        // `mars reboot [name]` — bring a session back on the binary that is on disk now, with its
+        // workspaces rooted where they were and any coding agent resumed. Runs as its own process
+        // precisely so neither the daemon (which is going away) nor the bridge (the phone's only
+        // way back) has to survive its own restart.
+        Some("reboot") => {
+            return session::reboot_main(args.next());
+        }
         Some("kill") | Some("--kill") => {
             let name = args
                 .next()

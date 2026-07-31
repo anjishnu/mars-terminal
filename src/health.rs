@@ -141,6 +141,12 @@ impl Health {
 
     /// The one-line status string, e.g. `up 2h 13m · load 1.40 · mem 63% · disk 82% free · gpu 40%`.
     /// Any probe that returned `None` is silently dropped, so the line self-trims.
+    /// Seconds since this daemon came up — the anchor for "was the binary replaced after I
+    /// started", which is how a stale daemon is detected.
+    pub fn uptime_secs(&self) -> u64 {
+        self.start.elapsed().as_secs()
+    }
+
     pub fn line(&self) -> String {
         let mut parts = vec![format!("up {}", fmt_uptime(self.start.elapsed().as_secs()))];
         if let Some(l) = self.load1 {

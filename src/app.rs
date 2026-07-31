@@ -1161,11 +1161,31 @@ impl App {
         }
         .or_else(|| self.terms.values().find_map(|t| t.spawn_cwd.clone()))
         .map(|p| p.display().to_string());
+        // Is this daemon running code that has since been replaced on disk?
+        //
+        // Compared by TIME, not by version string. Version strings would not have caught the case
+        // this exists for: reinstalling 0.6.0 over 0.6.0 all day leaves the string identical while
+        // every daemon keeps running the build from this morning. "The binary changed after I
+        // started" is the actual question, and its answer is two mtimes.
+        let started = ts.saturating_sub(self.health.uptime_secs());
+        let binary_mtime = std::env::current_exe()
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
         serde_json::json!({
             "session": self.session_name.clone().unwrap_or_default(),
             "rows": rows,
             "health": self.health.line(), // ambient host stats for the phone's console
             "cwd": cwd,
+            "daemon": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "startedTs": started,
+                "binaryMtime": binary_mtime,
+                // The phone renders "a newer mars is installed — reboot to pick it up".
+                "stale": binary_mtime.map(|b| b > started).unwrap_or(false),
+            },
             "ts": ts,
         })
         .to_string()

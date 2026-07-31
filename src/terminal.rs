@@ -449,6 +449,34 @@ impl Term {
     /// and a feature built on them would silently do nothing on most machines. The
     /// process group is there whether or not anyone configured anything.
     ///
+    /// The NAME of the foreground command, when one is running (`claude`, `cargo`, …).
+    ///
+    /// Same source as `foreground_busy` — the PTY's foreground process group — resolved to a
+    /// command name. This is how Mars can tell an agent pane from a build: `last_command` only
+    /// records what Mars itself typed, so anything the engineer started by hand is invisible to
+    /// it, and OSC-133 needs shell integration that Mars does not install.
+    pub fn foreground_command(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            let leader = self.master.process_group_leader()?;
+            if Some(leader as u32) == self.shell_pid {
+                return None; // at a prompt: nothing is running
+            }
+            let out = std::process::Command::new("ps")
+                .args(["-o", "comm=", "-p", &leader.to_string()])
+                .output()
+                .ok()?;
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // `ps` gives a path for anything not on the default PATH; the basename is the answer.
+            let base = name.rsplit('/').next().unwrap_or(&name).to_string();
+            (!base.is_empty()).then_some(base)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// `None` means "cannot know" (Windows, or a PTY that does not report a leader), and
     /// every caller must read it as *no claim* rather than as `false`.
     pub fn foreground_busy(&self) -> Option<bool> {
