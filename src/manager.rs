@@ -6,7 +6,9 @@
 //!
 //! OWNERSHIP is the load-bearing rule, because an agent joins this repo later:
 //!
-//! * this module owns `sessions/**`, `index.json`, `index.md`, `timeline.md` — regenerated freely
+//! * this module owns `sessions/**`, `timeline.md`, `archive/**`, `events.jsonl` — the first two
+//!   regenerated freely, the last two append-only (`index.json`/`index.md` are gone; the view is
+//!   computed on read)
 //! * the AGENT owns `memory/**` — never written here, only read
 //! * the HUMAN owns `AGENTS.md`, `docs/**`, `policy.md` — scaffolded once, never overwritten
 //!
@@ -692,6 +694,9 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                 "updated_ts": front_field(front, "updated_ts").and_then(|s| s.parse::<u64>().ok()),
                 "mtime": mtime_secs(&c.file),
                 "body": body.trim(), "actions": parse_actions(front),
+                // The id survives a rewrite; the words do not. A dismissal has to be able to say
+                // WHICH version was dismissed, or the log records a verdict on text nobody saw.
+                "version": version_of(&format!("{}\u{1}{}", c.headline, body.trim())),
             }));
         }
     }
@@ -725,11 +730,15 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                 Some(a) => (a, "agent"),
                 None => (computed, "computed"),
             };
+            // The briefing had no identity at all: it reached the phone as prose plus a source
+            // label, so nothing could ever point at the words somebody actually read.
+            let narrative_version = version_of(&narrative);
             serde_json::json!({
                 "name": n,
                 "briefing": b,
                 "narrative": narrative,
                 "narrativeSource": narrative_source,
+                "narrativeVersion": narrative_version,
                 "path": dir.as_ref()
                     .map(|d| d.join("mission_briefing.md").to_string_lossy().to_string())
                     .unwrap_or_default(),
@@ -743,12 +752,14 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     // always be current, the other is judgement that may be minutes old or absent.
                     // Sharing a field meant whichever wrote last erased the other, so a live
                     // status could silently replace a considered note and vice versa.
+                    let summary = w.unwrap_or_default();
                     serde_json::json!({
                         "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
                         "kind": p.kind, "ageSecs": p.age_secs,
                         "status": workspace_summary(p),
-                        "summary": w.unwrap_or_default(),
+                        "summary": summary,
                         "summarySource": "agent",
+                        "summaryVersion": version_of(&summary),
                     })
                 }).collect::<Vec<_>>()).unwrap_or_default(),
             })
@@ -814,6 +825,72 @@ fn parse_board(json: &str) -> Option<SessionSnap> {
     })
 }
 
+
+// ── Versions and events: what was shown, and what the human did about it ─────────────────
+//
+// Every artifact the manager writes is OVERWRITTEN in place. That is right for the live copy, and
+// it makes one question unanswerable: when somebody dismissed a memo, what did it actually say?
+// Looking it up afterwards returns the CURRENT text, which is the text they never read.
+//
+// So each rendered artifact carries a version — a hash of the exact words — and every recorded
+// action echoes the version it was looking at. The phone stamps it at the moment of the tap; the
+// host never reconstructs it from a clock. An action and its cause are then joined by an identity
+// neither side can change afterwards, which is the only kind of join that survives a rewrite.
+
+/// Content id for a piece of prose. FNV-1a over the bytes: stable across processes and machines,
+/// unlike any hasher whose seed is randomised per run, and short enough to sit in a JSON field.
+pub fn version_of(text: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in text.trim().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+fn events_path(repo: &Path) -> PathBuf {
+    repo.join("events.jsonl")
+}
+
+/// Append one thing that happened. Append-only, one line, never rewritten.
+///
+/// Two shapes go in here and they are deliberately the same file. An IMPRESSION says a memo was
+/// put in front of somebody; an ACTION says what they did about it. Without impressions the log
+/// cannot tell "they ignored it" from "they never saw it" — opposite facts that both appear in an
+/// action log as silence, and reading one as the other would tune the manager backwards.
+pub fn record_event(kind: &str, ts: u64, fields: serde_json::Value) {
+    let Some(repo) = repo_dir() else { return };
+    let mut v = serde_json::json!({ "at": iso(ts), "at_ts": ts, "kind": kind });
+    if let (Some(o), Some(extra)) = (v.as_object_mut(), fields.as_object()) {
+        for (k, val) in extra {
+            if !val.is_null() {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(&repo);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(events_path(&repo)) {
+        let _ = writeln!(f, "{v}");
+    }
+}
+
+/// The same, driven straight from a phone frame. Copies only the fields we know how to read, so
+/// a client cannot grow the schema by sending extra keys.
+pub fn record_client_event(kind: &str, v: &serde_json::Value, ts: u64) {
+    record_event(kind, ts, serde_json::json!({
+        "session":  v.get("session").and_then(|x| x.as_str()),
+        "target":   v.get("id").and_then(|x| x.as_str()),
+        // What the words actually said when they were read. Without this the log points at a
+        // memo whose text has since been rewritten by a later run.
+        "version":  v.get("version").and_then(|x| x.as_str()),
+        "briefing": v.get("briefingVersion").and_then(|x| x.as_str()),
+        "pane":     v.get("paneId").and_then(|x| x.as_str()),
+        // How long it sat on screen before they acted. Answered in 8 seconds and answered after
+        // six hours are the same event in every other field, and completely different facts.
+        "shown_secs": v.get("shownSecs").and_then(|x| x.as_u64()),
+        "secs":     v.get("secs").and_then(|x| x.as_u64()),
+    }));
+}
 
 // ── Presence: when the captain was last actually looking ─────────────────────────────────
 //
@@ -1227,6 +1304,9 @@ pub fn archive_artifacts(repo: &Path, ts: u64) {
                 "kind": kind,
                 "pane": if pane.is_empty() { serde_json::Value::Null } else { serde_json::json!(pane) },
                 "words": body.split_whitespace().count(),
+                // The same id the phone was shown. This is the join: an event names a version,
+                // and the archive is where that version's full text still exists.
+                "version": version_of(&body),
                 "text": body,
             }));
         }
@@ -2334,6 +2414,9 @@ pub fn status_report(ts: u64) -> Result<String> {
         })
         .unwrap_or((0, 0));
     s.push_str(&format!("archive       {records} kept over {days} day(s) → {}\n", arch.display()));
+    let ev = std::fs::read_to_string(events_path(&repo)).unwrap_or_default();
+    let seen = ev.lines().filter(|l| l.contains("\"seen\"")).count();
+    s.push_str(&format!("events        {} recorded · {seen} impression(s)\n", ev.lines().count()));
     Ok(s)
 }
 

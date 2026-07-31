@@ -714,7 +714,21 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Ok(v) => v,
         Err(_) => return,
     };
+    // Judgements about what the manager said. Recorded before dispatch, and for `dismiss`/`snooze`
+    // that is the WHOLE handling — they change nothing on the host by design. A dismissal is the
+    // reader's opinion of a memo, not a request to delete it, and the agent owns that file.
+    //
+    // `seen` carries no side effect at all. It exists because an action log alone cannot tell a
+    // memo that was ignored from one that was never on screen: both are silence. Only the pairing
+    // of impressions with actions makes the log mean anything.
+    if let Some(kind @ ("dismiss" | "snooze" | "seen" | "answer" | "ask" | "jump" | "summarize")) =
+        v.get("t").and_then(|t| t.as_str())
+    {
+        crate::manager::record_client_event(kind, &v, crate::worklog::now_secs());
+    }
     match v.get("t").and_then(|t| t.as_str()) {
+        // Opinions, not commands — already recorded above, and there is nothing else to do.
+        Some("dismiss") | Some("snooze") | Some("seen") | Some("jump") => {}
         // LLM proxy — the phone asks, the host answers with its own key.
         Some(kind @ ("ask" | "summarize")) => {
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("session").to_string();

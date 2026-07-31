@@ -6483,6 +6483,66 @@ fn selfcheck() -> Result<()> {
                 "the archive kept deterministic output alongside the agent's");
         }
         println!("[selfcheck] manager: prose is archived by day, deduped on content ... PASS");
+        // The whole point of the event log is that an action can be resolved back to the exact
+        // words it was a judgement of — AFTER those words have been overwritten. So the check is
+        // not "an event was written": it is "dismiss the memo, let a later run rewrite it, and
+        // still recover what the reader actually read".
+        {
+            let dir = manager::session_dir("evtest", "inst-ev", 2_200_000).expect("no dir");
+            std::fs::create_dir_all(&dir)?;
+            let brief = dir.join("mission_briefing.md");
+            let day = repo.join("archive").join(format!("{}.jsonl", &manager::iso(2_200_000)[..10]));
+            let events = repo.join("events.jsonl");
+            let _ = std::fs::remove_file(&events);
+
+            let read = "---\nsource: agent\n---\nthe sweep finished at 0.91\n";
+            std::fs::write(&brief, read)?;
+            manager::archive_artifacts(&repo, 2_200_000);
+            let shown = manager::version_of("the sweep finished at 0.91");
+
+            // Somebody dismissed a memo while that briefing was on screen. The phone stamps the
+            // versions; nothing here is inferred from a clock.
+            manager::record_client_event("dismiss", &serde_json::json!({
+                "session": "evtest", "id": "card-evtest-3-failed-1",
+                "version": "memo-v1", "briefingVersion": shown, "shownSecs": 42,
+            }), 2_200_100);
+            // …and an impression, without which a dismissal cannot be told from never looking.
+            manager::record_client_event("seen", &serde_json::json!({
+                "session": "evtest", "id": "card-evtest-3-failed-1", "version": "memo-v1",
+            }), 2_200_050);
+
+            // A later run rewrites the briefing. The live file no longer holds what they read.
+            std::fs::write(&brief, "---\nsource: agent\n---\nnothing needs you\n")?;
+            manager::archive_artifacts(&repo, 2_200_200);
+            assert!(!std::fs::read_to_string(&brief)?.contains("0.91"),
+                "the live briefing still holds the old text — the test proves nothing");
+
+            let log: Vec<serde_json::Value> = std::fs::read_to_string(&events)?
+                .lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let d = log.iter().find(|v| v["kind"] == "dismiss").expect("no dismiss recorded");
+            assert_eq!(d["shown_secs"].as_u64(), Some(42), "how long it sat there was dropped");
+            assert!(log.iter().any(|v| v["kind"] == "seen"),
+                "impressions are not recorded, so ignored and unseen are indistinguishable");
+
+            // The join: follow the event's briefing version into the archive and get the words.
+            let arch: Vec<serde_json::Value> = std::fs::read_to_string(&day)?
+                .lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+            let hit = arch.iter().find(|v| v["version"] == d["briefing"])
+                .expect("the version on the event resolves to nothing in the archive");
+            assert_eq!(hit["text"].as_str(), Some("the sweep finished at 0.91"),
+                "resolved to the wrong text — the join is by identity, or it is worthless");
+
+            // And the guard that makes the log honest: an automatic prefetch is not a judgement.
+            // Rover fires `ask` for every row lacking a summary; recording those would fill the
+            // record with the manager asking itself questions.
+            let before = std::fs::read_to_string(&events)?.lines().count();
+            manager::record_client_event("ask", &serde_json::json!({
+                "session": "evtest", "id": "0", "byUser": false,
+            }), 2_200_300);
+            assert_eq!(std::fs::read_to_string(&events)?.lines().count(), before + 1,
+                "the host must still record what it is given — the byUser gate lives on the phone");
+        }
+        println!("[selfcheck] manager: an action resolves to the words it judged ... PASS");
     // ── mars pair preflight ─────────────────────────────────────────────────────────────
     // Pure logic, so it is testable without a tunnel, an account or a phone.
     #[cfg(feature = "web")]

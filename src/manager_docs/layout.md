@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 1 -->
+<!-- mars-doc-version: 2 -->
 # Layout
 
 ```
@@ -7,11 +7,10 @@
 │   ├── AGENTS.md                how to be the manager (start here)
 │   ├── docs/                    this guide
 │   ├── policy.md                autonomy grants — HUMAN-EDITED ONLY
-│   ├── index.md                 status of everything, human-readable   <- generated
-│   ├── index.json               the same, for Rover — one read         <- generated
-│   ├── timeline.md              append-only event log, oldest first    <- generated
+│   ├── timeline.md              ONLY memos raised — often absent       <- generated
 │   ├── inbox/                   stimuli waiting to be processed
 │   ├── archive/YYYY-MM-DD.jsonl everything you have ever written       <- generated
+│   ├── events.jsonl             what the captain did about it          <- generated
 │   └── memory/                  YOURS. Nothing else writes here.
 │       ├── beliefs.md           working memory, <=200 lines, REWRITTEN
 │       ├── projects.md          what each project is
@@ -44,6 +43,27 @@ requires you to — treat it as available evidence rather than another step in t
 
 Never write here. One writer, append-only, or the record is not a record.
 
+## The event log
+
+`events.jsonl` records what the captain did about what you said: `seen`, `dismiss`, `snooze`,
+`answer`, `ask`, `jump`. Each line names a `target` (the memo), a `version` (the exact words that
+were on screen), the `briefing` version above them, and `shown_secs` — how long it sat there
+before anyone moved.
+
+`seen` is the one that makes the rest mean anything. A memo nobody acted on and a memo nobody was
+ever shown look identical in an action log, and they are opposite facts: the first says you were
+wrong, the second says you were never read.
+
+The `version` is the join. Follow it into `archive/` and you get the exact text — including after
+a later run has overwritten the live file, which is the only case where the question is ever
+interesting.
+
+This is what makes your judgement checkable rather than merely confident. Dismissed in two
+seconds is a verdict on the memo. Answered after six hours is a verdict on its timing, not its
+content. Nothing yet asks you to read this; it is here so the question can be asked later.
+
+Never write here either.
+
 ## Why the directory is an id, not a name
 
 A session can be renamed. The directory is keyed by an immutable **id** and the current name lives
@@ -61,10 +81,13 @@ Read downward when you need detail, upward when you need context.
 
 ## Reading order on a cold start
 
-1. `index.md` — what is happening at all
-2. `memory/beliefs.md` — what you already concluded, and what the engineer has ignored
-3. `memory/projects.md` — what these projects are for
-4. the stimulus in `inbox/` — what changed since last time
+1. `memory/beliefs.md` — what you already concluded, and what the engineer has ignored
+2. `memory/projects.md` — what these projects are for
+3. the stimulus in `inbox/` — what changed since last time
+
+There is no aggregate index file. There used to be `index.md` and `index.json`, rewritten on a
+timer by every daemon; the phone computes that view on read now, so there is no copy to go stale
+and nothing to read here.
 
 Everything else is fetched on demand. Do not read a whole session tree speculatively; it is large
 and most of it is unchanged.
