@@ -6771,6 +6771,23 @@ fn selfcheck() -> Result<()> {
         }
         let _ = std::fs::remove_dir_all(&sandbox);
         println!("[selfcheck] bridge: fs paths are contained ... PASS");
+
+        // The bridge upgrades itself by exec'ing the binary on disk — no supervisor above it, so
+        // nothing would notice if it exec'd something that cannot start. The version probe is the
+        // only thing standing between a live bridge and a machine unreachable from the phone.
+        // (The exec itself is untestable here: a successful one replaces this process.)
+        {
+            let me = std::env::current_exe()?;
+            assert!(serve::candidate_ok(&me),
+                "the running binary failed its own version probe — the gate is broken shut");
+            // Exits non-zero: runs, but is not a working mars.
+            assert!(!serve::candidate_ok(std::path::Path::new("/usr/bin/false")),
+                "a binary that exits non-zero was accepted as an upgrade");
+            // Does not exist at all.
+            assert!(!serve::candidate_ok(std::path::Path::new("/nonexistent/mars")),
+                "a missing binary was accepted as an upgrade");
+        }
+        println!("[selfcheck] bridge: refuses to exec a binary that cannot run ... PASS");
     }
 
 

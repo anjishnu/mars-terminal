@@ -771,6 +771,31 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // leave no way to see that it had, let alone retry. It stays up, watches the daemon go
         // and come back, and re-resolves on the next connection like it already does for a
         // rename.
+        // Upgrade the BRIDGE itself onto the binary on disk, by replacing its own process image.
+        //
+        // The tempting alternative is a supervisor: give this a launchd job so "restart" is just
+        // "exit". Rejected, because it answers "who restarts the doorman" by adding a thing that
+        // needs its own correctness — and the plist on this machine is the proof that decays. It
+        // hardcodes `serve 0` for a session renamed days ago, and its KeepAlive is gated on a
+        // flag file that does not exist, so supervision has been silently off the whole time.
+        //
+        // exec() has nothing above it to drift: same pid, same argv, new code, nothing external
+        // involved. The listener closes across the exec and the new image rebinds within
+        // milliseconds; ngrok holds the public tunnel throughout, so the phone sees the same brief
+        // blip it already handles for a worker reboot.
+        Some("reboot") if v.get("target").and_then(|x| x.as_str()) == Some("bridge") => {
+            crate::manager::record_client_event("reboot-bridge", &v, crate::worklog::now_secs());
+            match replace_self() {
+                // Unreachable on success — exec does not return.
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = tx.send(format!(
+                        "{{\"t\":\"toast\",\"text\":{}}}",
+                        json_str(&format!("bridge upgrade refused: {e}"))
+                    ));
+                }
+            }
+        }
         Some("reboot") => {
             let session = v.get("session").and_then(|x| x.as_str()).unwrap_or_default().to_string();
             crate::manager::record_client_event("reboot", &v, crate::worklog::now_secs());
@@ -933,6 +958,43 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some(other) => crate::session::debug_log(&format!("[rover] intent not yet wired: {other}")),
         None => {}
     }
+}
+
+/// Replace this process with the `mars` on disk now. Returns only on refusal — a successful
+/// `exec` never comes back.
+///
+/// The version probe is the entire safety story and must come first. Exec'ing a binary that
+/// cannot start is the one failure here with no way back: the bridge is the phone's only route to
+/// this machine, and there is nothing above it to notice and retry. So the last act before the
+/// point of no return is to run the candidate and require it to work.
+/// Does this binary actually run? The gate that stands between a live bridge and a dead one.
+///
+/// Separated from the exec so it can be tested: the exec cannot be, because a successful one
+/// replaces the test process. This half carries all the judgement; the other half is one line.
+pub fn candidate_ok(exe: &Path) -> bool {
+    Command::new(exe)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn replace_self() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    if !candidate_ok(&exe) {
+        return Err(anyhow!("{} --version failed — keeping the bridge that works", exe.display()));
+    }
+    // Same argv, so whatever session and flags this bridge was started with are preserved.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    crate::session::debug_log("[rover] replacing bridge image with the binary on disk");
+    Err(anyhow!("exec failed: {}", Command::new(&exe).args(&args).exec()))
+}
+
+#[cfg(not(unix))]
+fn replace_self() -> Result<()> {
+    Err(anyhow!("in-place upgrade needs a unix exec; restart the bridge by hand"))
 }
 
 fn json_str(s: &str) -> String {
