@@ -219,6 +219,99 @@ fn remembered_instance() -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// `mars pair --supervise` — hand the bridge to launchd so it stops being a child of the session
+/// it serves.
+///
+/// This is not merely crash recovery, which is how it was first scoped. A bridge started by hand
+/// from a terminal is a child of THAT terminal — and if that terminal is a pane in the session
+/// being bridged, rebooting the session kills its own bridge and the tunnel with it. Observed
+/// exactly once and immediately: the phone lost the machine at the moment the reboot succeeded.
+///
+/// Under launchd the bridge's parent is launchd, so it is genuinely outside the blast radius
+/// rather than merely believed to be.
+pub fn supervise_main(session_arg: Option<String>) -> Result<()> {
+    let session = resolve_session(session_arg)?;
+    let home = crate::sys::paths::home_dir().ok_or_else(|| anyhow!("no home directory"))?;
+    let exe = std::env::current_exe()?;
+    let label = "com.mars.rover-bridge";
+    let plist = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
+    // The flag KeepAlive watches. Absent, launchd never starts the job at all — which is why
+    // supervision has been silently off on this machine for as long as the plist has existed.
+    let flag = home.join(".mars/serve.enabled");
+    let log = home.join(".mars/serve-agent.log");
+
+    if let Some(d) = plist.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    if let Some(d) = flag.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    std::fs::write(&flag, "1\n")?;
+
+    // `pair`, and the CURRENT session name. The plist shipped before this hardcoded `serve 0`,
+    // and session 0 had been renamed days earlier — so the one time launchd did start the bridge
+    // it bound to a name that no longer existed.
+    std::fs::write(&plist, format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{exe}</string>
+        <string>pair</string>
+        <string>{session}</string>
+    </array>
+    <!-- launchd agents get a bare PATH; ngrok is in Homebrew and mars in cargo's bin. -->
+    <key>EnvironmentVariables</key>
+    <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{cargo_bin}</string></dict>
+    <!-- Alive only while the flag exists, so `mars killall` deleting it is a real off switch. -->
+    <key>KeepAlive</key><dict><key>PathState</key><dict><key>{flag}</key><true/></dict></dict>
+    <key>RunAtLoad</key><true/>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>{log}</string>
+    <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"#,
+        exe = exe.display(),
+        cargo_bin = home.join(".cargo/bin").display(),
+        flag = flag.display(),
+        log = log.display(),
+    ))?;
+
+    let domain = format!("gui/{}", unsafe { libc::getuid() });
+    // Boot it out first so a changed plist is actually re-read; failure here is normal when it
+    // was not loaded, so it is ignored rather than reported as a problem.
+    let _ = Command::new("launchctl").args(["bootout", &format!("{domain}/{label}")]).output();
+    let out = Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist.display().to_string()])
+        .output()?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "launchctl bootstrap failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Report what launchd actually did rather than assuming the bootstrap took — the previous
+    // plist was "installed" and not running for days without anything saying so.
+    let state = Command::new("launchctl")
+        .args(["print", &format!("{domain}/{label}")])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let running = state.lines().any(|l| l.trim().starts_with("state = running"));
+    println!("  supervised   {}", plist.display());
+    println!("  session      {session}");
+    println!("  state        {}", if running { "running" } else { "loaded (starting)" });
+    println!("  logs         {}", log.display());
+    println!("\nthe bridge is launchd's child now, so a session reboot cannot take it down.");
+    Ok(())
+}
+
 pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
     let mut socket = session::socket_path(&session)?;

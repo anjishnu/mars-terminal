@@ -430,6 +430,12 @@ fn main() -> Result<()> {
             if has("--link") {
                 return serve::link_main(session);
             }
+            // Hand the bridge to launchd, so it is a child of launchd rather than of whatever
+            // terminal started it. Started by hand from a pane, it dies with the session it
+            // bridges — which is how a successful reboot took the phone's route down with it.
+            if has("--supervise") {
+                return serve::supervise_main(session);
+            }
             return if reset { serve::reset_main(session) } else { serve::serve_main(session) };
         }
         #[cfg(feature = "web")]
