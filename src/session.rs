@@ -1647,7 +1647,17 @@ pub fn stop_bridge() -> bool {
     let Ok(pid) = txt.trim().parse::<i32>() else { return false };
     #[cfg(unix)]
     unsafe {
-        libc::kill(pid, libc::SIGTERM);
+        // The process GROUP, not just the bridge. The bridge spawns ngrok as a child, and ngrok's
+        // free tier allows exactly one agent session — so an orphaned one holds that slot and
+        // every replacement bridge times out waiting for a tunnel it can never be given. Signalling
+        // the pid alone did precisely that: the bridge died, ngrok did not, and the session's
+        // fresh bridge could not start.
+        //
+        // `ensure_bridge` spawns it detached, which makes it a group leader, so the negative pid
+        // reaches ngrok too. Fall back to the bare pid if the group is gone.
+        if libc::kill(-pid, libc::SIGTERM) != 0 {
+            libc::kill(pid, libc::SIGTERM);
+        }
     }
     for _ in 0..30 {
         if !bridge_listening() {

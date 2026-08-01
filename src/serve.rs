@@ -462,10 +462,31 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     print_qr(&app_url);
     println!();
     println!("  \x1b[38;5;208mRover\x1b[0m — scan to pair · session \x1b[1m{session}\x1b[0m");
-    if std::env::var("MARS_NGROK_DOMAIN").ok().filter(|d| !d.trim().is_empty()).is_some() {
-        println!("  \x1b[38;5;35mstable endpoint\x1b[0m — this URL survives restarts; no re-scan needed");
+    // Report what was OBSERVED, not what was configured.
+    //
+    // This used to read the raw MARS_NGROK_DOMAIN env var and call anything else "ephemeral". Two
+    // ways to be wrong, and it managed both: it ignored `ngrok_domain()`, which also reads config,
+    // and — the real error — it inferred stability from whether Mars had been TOLD a domain. ngrok
+    // now gives free accounts a permanent one automatically, so a URL can be perfectly stable
+    // while Mars knows nothing about it, and the engineer is told to fix something that is not
+    // broken.
+    //
+    // Mars cannot know another product's account policy. It can know whether this is the same URL
+    // it saw last time, which is the thing the reader actually cares about.
+    let url_note = crate::sys::paths::home_dir().map(|h| h.join(".mars/serve.url"));
+    let previous = url_note.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+    let same_as_before = previous.as_deref().map(str::trim) == Some(endpoint.as_str());
+    if let Some(p) = &url_note {
+        let _ = std::fs::write(p, &endpoint);
+    }
+    if same_as_before {
+        println!("  \x1b[38;5;35mstable endpoint\x1b[0m — same URL as last start; paired phones reconnect with no re-scan");
+    } else if ngrok_domain().is_some() {
+        println!("  \x1b[38;5;35mpinned domain\x1b[0m — this URL is reserved and survives restarts");
+    } else if previous.is_some() {
+        println!("  \x1b[38;5;208mthe URL changed since last start\x1b[0m — paired phones need to re-scan");
     } else {
-        println!("  \x1b[38;5;244mephemeral URL\x1b[0m — set MARS_NGROK_DOMAIN=<your ngrok static domain> to pin it across restarts");
+        println!("  \x1b[38;5;244mfirst pairing\x1b[0m — the next start will report whether this URL held");
     }
     println!("  bridge live · Ctrl-C to stop");
     println!("  {app_url}");
