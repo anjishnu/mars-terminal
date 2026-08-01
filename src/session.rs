@@ -641,6 +641,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     let mut app = App::new(file)?;
     app.session_name = Some(name.to_string());
     app.session_instance_id = Some(session_instance_id);
+    // If a phone is paired to THIS session, make sure it has a bridge. Nothing else owns that:
+    // started by hand it dies with whatever terminal launched it, and under a supervisor it needs
+    // a plist and a PATH that both drift. The session knows, and the session is here.
+    ensure_bridge(&name);
+
     // A no-file session opens straight into a terminal (multiplexer default) — or, after a
     // reboot, back into the workspaces it had.
     //
@@ -1543,6 +1548,117 @@ fn state_dir() -> Option<PathBuf> {
 const MANAGER_TAIL: u64 = 20;
 const MANAGER_DELTA_CAP: u64 = 200;
 
+// ── The bridge belongs to the session ────────────────────────────────────────────────────
+//
+// Nothing used to own the bridge's existence. It was started by hand, and if that hand happened
+// to be a terminal inside the session it bridged, a reboot killed it — the phone lost the machine
+// at the moment the reboot succeeded. Handing it to launchd fixed the symptom and introduced a
+// plist, an enable flag and a hardcoded PATH: three pieces of configuration that drift, and the
+// PATH was wrong within the hour, producing panes where `claude` could not be run.
+//
+// So the session owns it instead. A daemon knows whether it is the paired session, and it was
+// spawned by `mars reboot` from the engineer's own binary — so it already has the right
+// environment, and there is nothing to reconstruct or keep in sync. Everything the bridge needs
+// is durable and on disk already: which session (this directory), the pairing token, the domain.
+//
+// The upgrade path then costs nothing. Reboot ends both; the new daemon starts a fresh bridge from
+// the binary on disk, and both are current with no supervisor, no exec trick and no second verb.
+
+/// One bridge, one port, one free ngrok tunnel — so exactly one session may own it, and which one
+/// is recorded rather than raced for.
+pub const BRIDGE_PORT: u16 = 8787;
+
+fn mars_home() -> Option<PathBuf> {
+    crate::sys::paths::home_dir().map(|h| h.join(".mars"))
+}
+
+/// The session DIRECTORY that a phone is paired to. The directory, not the name and not the
+/// instance: a name is renamed and an instance is minted afresh on every start, and this has to
+/// survive both.
+pub fn remember_paired_session(dir_id: &str) {
+    if let Some(d) = mars_home() {
+        let _ = std::fs::create_dir_all(&d);
+        let _ = std::fs::write(d.join("serve.session"), dir_id);
+    }
+}
+
+pub fn paired_session() -> Option<String> {
+    let s = std::fs::read_to_string(mars_home()?.join("serve.session")).ok()?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Is something already serving the bridge port? Connect rather than look for a process: the
+/// question is whether a phone would be answered, and only the socket knows that.
+pub fn bridge_listening() -> bool {
+    std::net::TcpStream::connect_timeout(
+        &([127, 0, 0, 1], BRIDGE_PORT).into(),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// Start a bridge for this session if it is the paired one and nothing is serving yet.
+///
+/// Detached on purpose. The daemon starts it but must not own it as a child — a bridge that dies
+/// with its parent is the failure this whole arrangement exists to remove. Being spawned here only
+/// decides WHEN it starts; after that it is independent, and the next daemon to boot will notice
+/// if it has gone and start another.
+pub fn ensure_bridge(name: &str) {
+    let Some(dir) = crate::manager::existing_session_dir_pub(name) else { return };
+    let Some(dir_id) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else { return };
+    if paired_session().as_deref() != Some(dir_id.as_str()) {
+        return; // somebody else's phone, or nothing paired yet
+    }
+    if bridge_listening() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("pair").arg(name);
+    // Its own log, because nobody is watching this one's stdout.
+    let log = mars_home()
+        .map(|d| d.join("serve-agent.log"))
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+    cmd.stdin(std::process::Stdio::null());
+    match log {
+        Some(f) => {
+            let f2 = f.try_clone().ok();
+            cmd.stdout(f);
+            match f2 {
+                Some(f2) => { cmd.stderr(f2); }
+                None => { cmd.stderr(std::process::Stdio::null()); }
+            }
+        }
+        None => { cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()); }
+    }
+    crate::sys::daemon::detach(&mut cmd);
+    let _ = cmd.spawn();
+}
+
+/// Ask the running bridge to stop, so the next one starts on the binary that is on disk now.
+///
+/// The pid file is written by the bridge itself; a bridge that died without cleaning up leaves a
+/// stale one, which is why this verifies the port went quiet rather than trusting the signal.
+pub fn stop_bridge() -> bool {
+    let Some(d) = mars_home() else { return false };
+    let pid_file = d.join("serve.pid");
+    let Ok(txt) = std::fs::read_to_string(&pid_file) else { return false };
+    let Ok(pid) = txt.trim().parse::<i32>() else { return false };
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    for _ in 0..30 {
+        if !bridge_listening() {
+            let _ = std::fs::remove_file(&pid_file);
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 /// What a session needs in order to come back as itself.
 ///
 /// A daemon owns its PTYs, so restarting it kills every process in every pane — nothing can save
@@ -1631,6 +1747,12 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
         );
     }
 
+    // The bridge goes too. It is a separate process running its own copy of the code, so leaving
+    // it up would upgrade the worker and silently keep serving the phone from yesterday's build.
+    // The new daemon starts a fresh one on boot, so this is a replacement rather than a loss.
+    if stop_bridge() {
+        println!("  bridge stopped — the new session will start one");
+    }
     // Graceful: the daemon flushes its state and removes its own socket. kill_main already waits
     // for the socket to disappear, which is the only reliable "it is really gone".
     kill_main(&name)?;

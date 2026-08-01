@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use crate::session::{self, ClientFrame, ServerFrame};
 use tungstenite::{accept, Error as WsError, Message};
 
-const DEFAULT_PORT: u16 = 8787;
+const DEFAULT_PORT: u16 = crate::session::BRIDGE_PORT;
 
 /// Resolve the session to bridge: explicit arg → `$MARS_SESSION` → the first live one.
 fn resolve_session(arg: Option<String>) -> Result<String> {
@@ -248,6 +248,34 @@ pub fn supervise_main(session_arg: Option<String>) -> Result<()> {
     }
     std::fs::write(&flag, "1\n")?;
 
+    // PATH is CAPTURED, not guessed.
+    //
+    // launchd hands its jobs a bare PATH, and everything downstream inherits it: the bridge, the
+    // `mars reboot` it spawns, the daemon that spawns, and every shell in every pane. A hardcoded
+    // list is a guess about where the engineer's tools live, and it was wrong immediately — the
+    // first supervised reboot produced a session where `claude` could not be run at all, because
+    // it lives in ~/.local/bin and the list did not say so.
+    //
+    // This command is being run from the engineer's own shell, so the correct PATH is right here
+    // in the environment. Take it, and union the essentials in case it is unusually bare — a
+    // supervised job that cannot find `ngrok` fails in a way nobody would connect to this.
+    let mut dirs: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    for must in [
+        "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        &home.join(".cargo/bin").display().to_string(),
+        &home.join(".local/bin").display().to_string(),
+    ] {
+        if !dirs.iter().any(|d| d == must) {
+            dirs.push(must.to_string());
+        }
+    }
+    let path = dirs.join(":");
+
     // `pair`, and the CURRENT session name. The plist shipped before this hardcoded `serve 0`,
     // and session 0 had been renamed days earlier — so the one time launchd did start the bridge
     // it bound to a name that no longer existed.
@@ -265,7 +293,7 @@ pub fn supervise_main(session_arg: Option<String>) -> Result<()> {
     </array>
     <!-- launchd agents get a bare PATH; ngrok is in Homebrew and mars in cargo's bin. -->
     <key>EnvironmentVariables</key>
-    <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{cargo_bin}</string></dict>
+    <dict><key>PATH</key><string>{path}</string></dict>
     <!-- Alive only while the flag exists, so `mars killall` deleting it is a real off switch. -->
     <key>KeepAlive</key><dict><key>PathState</key><dict><key>{flag}</key><true/></dict></dict>
     <key>RunAtLoad</key><true/>
@@ -277,7 +305,7 @@ pub fn supervise_main(session_arg: Option<String>) -> Result<()> {
 </plist>
 "#,
         exe = exe.display(),
-        cargo_bin = home.join(".cargo/bin").display(),
+        path = path,
         flag = flag.display(),
         log = log.display(),
     ))?;
@@ -356,6 +384,16 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
             "session '{session}' has neither a manager directory nor an instance id — is it an \
              older `mars`? Restart the session so the bridge can follow it."
         ));
+    }
+    // Record who this bridge serves and where to find it. The session directory is what a daemon
+    // checks on boot to decide whether it should be starting one; the pid is what `mars reboot`
+    // signals so the replacement runs the binary on disk rather than this one.
+    if !session_dir.is_empty() {
+        crate::session::remember_paired_session(&session_dir);
+    }
+    if let Some(h) = crate::sys::paths::home_dir() {
+        let _ = std::fs::create_dir_all(h.join(".mars"));
+        let _ = std::fs::write(h.join(".mars/serve.pid"), std::process::id().to_string());
     }
     // Remember it: this is what a later start reads when the name it was given has moved.
     remember_instance(&instance_id);

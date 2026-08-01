@@ -6816,6 +6816,44 @@ fn selfcheck() -> Result<()> {
                 "a missing binary was accepted as an upgrade");
         }
         println!("[selfcheck] bridge: refuses to exec a binary that cannot run ... PASS");
+
+        // The session owns the bridge, so the rule deciding WHICH session may start one has to be
+        // exact: there is a single port and a single free tunnel, and a race would hand the phone
+        // to whichever daemon happened to boot first.
+        {
+            // The pairing note lives under $HOME, NOT under the runtime dir the rest of this
+            // check is isolated by — so without this, the assertions below overwrite the
+            // engineer's live pairing and point their phone at a session that does not exist.
+            // Third time today that a `home_dir()` path escaped the harness; see the leak
+            // assertion at the end.
+            let real_home = std::env::var_os("HOME");
+            std::env::set_var("HOME", cfg_dir.join("bridgehome"));
+
+            let dir_id = "bridgeowner-dir";
+            session::remember_paired_session(dir_id);
+            assert_eq!(session::paired_session().as_deref(), Some(dir_id),
+                "the paired session did not survive a round trip");
+            // A DIFFERENT session must not adopt somebody else's phone: one port, one tunnel, so
+            // ownership has to be decided rather than raced for.
+            session::remember_paired_session("another-session-dir");
+            assert_ne!(session::paired_session().as_deref(), Some(dir_id),
+                "a session claimed a pairing that belongs to another");
+
+            match &real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+            // And prove the isolation held, rather than assuming it.
+            if let Some(h) = &real_home {
+                let live = std::path::Path::new(h).join(".mars/serve.session");
+                if let Ok(t) = std::fs::read_to_string(&live) {
+                    assert!(!t.contains("bridgeowner-dir") && !t.contains("another-session-dir"),
+                        "the selfcheck wrote a fixture into the real pairing note at {}",
+                        live.display());
+                }
+            }
+        }
+        println!("[selfcheck] bridge: exactly one session owns the pairing ... PASS");
     }
 
 
