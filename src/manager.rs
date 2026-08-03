@@ -810,6 +810,14 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                         Some((text, age)) => (text, "agent", Some(age)),
                         None => (workspace_summary(p), "computed", None),
                     };
+                    // The `Do` block, as buttons rather than as a sentence to retype. Read from
+                    // frontmatter with the SAME parser memos use — the format was already proven
+                    // there, and a second one would be a second thing to get wrong.
+                    let actions = dir.as_ref()
+                        .and_then(|d| std::fs::read_to_string(
+                            d.join("workspaces").join(format!("{}.md", p.pane_id))).ok())
+                        .and_then(|t| split_front(&t).map(|(f, _)| parse_actions(f)))
+                        .unwrap_or_default();
                     serde_json::json!({
                         "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
                         "kind": p.kind, "ageSecs": p.age_secs,
@@ -821,6 +829,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                         "summarySource": summary_source,
                         "summaryAgeSecs": summary_age,
                         "summaryVersion": version_of(&summary),
+                        "actions": actions,
                     })
                 }).collect::<Vec<_>>()).unwrap_or_default(),
             })
@@ -949,6 +958,13 @@ pub fn record_client_event(kind: &str, v: &serde_json::Value, ts: u64) {
         // How long it sat on screen before they acted. Answered in 8 seconds and answered after
         // six hours are the same event in every other field, and completely different facts.
         "shown_secs": v.get("shownSecs").and_then(|x| x.as_u64()),
+        // A proposed next step: which one, and what it was proposed FOR. Together with
+        // `act` vs `act_dismiss` this is the training signal — over time it says which
+        // kinds of suggestion get taken and which get waved away, which is the only
+        // evidence that can make the next set better.
+        "action":   v.get("actionId").and_then(|x| x.as_str()),
+        "label":    v.get("label").and_then(|x| x.as_str()),
+        "q":        v.get("q").and_then(|x| x.as_str()),
         "secs":     v.get("secs").and_then(|x| x.as_u64()),
     }));
 }

@@ -997,6 +997,47 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 let _ = cmd.spawn();
             }
         }
+        // Rover's chat. Routed through the same host-side proxy as `ask` for now, so the
+        // surface is usable before the Claude Code agent behind it exists — see
+        // design_ideas/rover_agent.md. Recorded either way: the questions people actually ask
+        // ARE the requirements document for that agent, and they only exist if logged.
+        Some("chat") => {
+            let q = v.get("q").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if q.trim().is_empty() {
+                return;
+            }
+            crate::manager::record_client_event("chat", &v, crate::worklog::now_secs());
+            let tx2 = tx.clone();
+            let _ = tx2.send("{\"t\":\"summary\",\"id\":\"chat\",\"summary\":{\"text\":\"…\",\"streaming\":true}}".to_string());
+            thread::spawn(move || {
+                let (answer, provenance, usable) = run_agent_ask(q);
+                let summary = if usable {
+                    format!("{{\"text\":{},\"computedBy\":{}}}", json_str(&answer), json_str(&provenance))
+                } else {
+                    "{\"text\":\"\",\"fallback\":true}".to_string()
+                };
+                let _ = tx2.send(format!("{{\"t\":\"summary\",\"id\":\"chat\",\"summary\":{}}}", summary));
+            });
+        }
+        // A proposed next step was taken, or waved away. Neither changes anything on the host —
+        // the point is the RECORD. An action nobody took and an action nobody was shown look
+        // identical without it, and they are opposite facts about whether the suggestion was any
+        // good.
+        Some("act") | Some("act_dismiss") => {
+            let kind = v.get("t").and_then(|x| x.as_str()).unwrap_or("act");
+            crate::manager::record_client_event(kind, &v, crate::worklog::now_secs());
+            // Taking an action still routes through the pane it belongs to; dismissing does not.
+            if kind == "act" {
+                if let (Some(pane), Some(keys)) = (
+                    v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()),
+                    v.get("keys").and_then(|x| x.as_str()),
+                ) {
+                    let _ = session::write_frame(writer, &ClientFrame::PaneInput {
+                        pane, data: keys.to_string(),
+                    });
+                }
+            }
+        }
         // LLM proxy — the phone asks, the host answers with its own key.
         Some(kind @ ("ask" | "summarize")) => {
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("session").to_string();

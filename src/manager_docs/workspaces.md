@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 13 -->
+<!-- mars-doc-version: 14 -->
 # Workspace notes
 
 **Read second**, after the briefing, when a row is tapped. One file per workspace at
@@ -23,6 +23,37 @@ source: agent
 - **Re-run that test alone** — is it deterministic?
 - Check whether the migration in workspace 2 touched the schema
 ```
+
+## Make the `Do` block tappable
+
+Whatever you put under `Do`, repeat as frontmatter so the phone can offer it as a button rather
+than as a sentence to read and retype. Same shape memos already use:
+
+```markdown
+---
+source: agent
+actions:
+  - {id: rerun, label: "Re-run that test alone", keys: "cargo test session -- --nocapture\r"}
+  - {id: schema, label: "Check the migration in workspace 2"}
+---
+```
+
+`keys` is what gets typed into that pane, ending in `\r`. **Omit `keys` entirely** for anything
+that is a suggestion rather than a command — a thought the captain should have is still worth
+offering, and it becomes a tappable note rather than an execution.
+
+Rules, and they matter more than the format:
+
+- **Never more than three, and prefer one.** Three plausible actions is a way of not choosing.
+- **Only what is genuinely open to them right now.** "Wait for it to finish" is not an action, and
+  neither is anything they cannot do from a phone.
+- **Nothing destructive without it being obvious in the label.** `keys` goes to a live terminal.
+- **Omit the block entirely when there is nothing to do.** An empty suggestion costs more than
+  silence: it teaches people the buttons are noise.
+
+Every tap and every dismissal is recorded. Suggestions that get waved away consistently are the
+signal that this block is being written badly — treat that as feedback about your judgement, not
+about the reader.
 
 Use markdown, and use it for meaning rather than decoration:
 
