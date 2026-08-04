@@ -1644,11 +1644,47 @@ pub fn ensure_bridge(name: &str) {
 ///
 /// The pid file is written by the bridge itself; a bridge that died without cleaning up leaves a
 /// stale one, which is why this verifies the port went quiet rather than trusting the signal.
+/// Whoever is actually listening on the bridge port, asked of the OS rather than remembered.
+///
+/// `serve.pid` is a cached copy of a process identity, and it goes stale. Found in the wild holding
+/// 95203 while the live bridge was 94100: `mars reboot` signalled a pid that no longer meant
+/// anything, reported success, and left a four-hour-old bridge serving the previous binary — which
+/// is the precise failure the reboot exists to prevent, wearing the appearance of having worked.
+///
+/// The port is the bridge's real identity: exactly one process can hold it, and that process IS the
+/// bridge by definition. The pid file stays as a fallback for a host with no `lsof`.
+fn bridge_pids() -> Vec<i32> {
+    std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{BRIDGE_PORT}"), "-sTCP:LISTEN"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.trim().parse::<i32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn stop_bridge() -> bool {
     let Some(d) = mars_home() else { return false };
     let pid_file = d.join("serve.pid");
-    let Ok(txt) = std::fs::read_to_string(&pid_file) else { return false };
-    let Ok(pid) = txt.trim().parse::<i32>() else { return false };
+    let recorded = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|t| t.trim().parse::<i32>().ok());
+    // The listener first, the remembered pid only if the OS told us nothing. Signalling both is
+    // deliberate: a bridge mid-restart may hold the port under a pid the file has not caught up to.
+    let mut pids = bridge_pids();
+    if let Some(p) = recorded {
+        if !pids.contains(&p) {
+            pids.push(p);
+        }
+    }
+    if pids.is_empty() {
+        return false;
+    }
+    for pid in pids {
     #[cfg(unix)]
     unsafe {
         // The process GROUP, not just the bridge. The bridge spawns ngrok as a child, and ngrok's
@@ -1662,6 +1698,7 @@ pub fn stop_bridge() -> bool {
         if libc::kill(-pid, libc::SIGTERM) != 0 {
             libc::kill(pid, libc::SIGTERM);
         }
+    }
     }
     for _ in 0..30 {
         if !bridge_listening() {
