@@ -2746,18 +2746,21 @@ pub fn rover_chat_stream(
         // to LOOK and nothing else; every effect is a proposal the engineer taps. An allow-list
         // rather than a deny-list, so a new tool in a future Claude Code is not silently granted.
         .arg("--allowedTools").arg("Read,Grep,Glob")
-        // A FAST model, deliberately. Measured on this machine, to first token: haiku 3.25s,
-        // the default 7–10s, sonnet 11.7s — and on a phone that is the whole difference between
-        // answering and appearing stuck.
+        // The same model the manager runs, at the same effort — one agent, one brain, and no
+        // reason for the two halves of Rover to reason differently about the same machine.
         //
-        // It is the right trade because of how the levels divide. The manager already did the
-        // thinking — it reads raw output on its own schedule and writes down what is true — and
-        // this reads those conclusions plus the workspace context handed to it in the prompt. It
-        // is summarising known facts, not deriving them, and that is work a fast model does well.
-        //
-        // MARS_ROVER_MODEL overrides for anyone who wants the slower, deeper answer.
+        // EFFORT is the lever, not the model tier. To first token, measured here:
+        //   sonnet-5 low     2.6s
+        //   sonnet-5 medium  3.6s   ← this
+        //   haiku-4-5        ~3-7s, and a weaker answer
+        //   fable-5 (default) 7-10s
+        //   sonnet-4-5       11.7s
+        // Reaching for a smaller model was the obvious move and the wrong one: capping effort on
+        // a good model beats swapping in a lesser one, and costs nothing in quality of judgement.
         .arg("--model")
-        .arg(std::env::var("MARS_ROVER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5".into()))
+        .arg(std::env::var("MARS_ROVER_MODEL").unwrap_or_else(|_| "claude-sonnet-5".into()))
+        .arg("--effort")
+        .arg(std::env::var("MARS_ROVER_EFFORT").unwrap_or_else(|_| "medium".into()))
         .arg("--append-system-prompt").arg(include_str!("manager_docs/rover_chat.md"))
         // The manager's memory: beliefs, projects, the archive. Shared by sharing the filesystem.
         .arg("--add-dir").arg(repo.display().to_string())
