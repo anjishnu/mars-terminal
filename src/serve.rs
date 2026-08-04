@@ -348,13 +348,25 @@ pub fn supervise_main(session_arg: Option<String>) -> Result<()> {
 ///
 /// The mark is gated on this, so the control appears when it can actually be used rather than
 /// sitting there looking broken for the first four seconds.
-static ROVER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 0 warming · 1 ready · 2 unavailable.
+///
+/// Three states rather than a boolean, because "not ready yet" and "this will never work" are
+/// opposite facts that a boolean renders identically — and the phone has to draw them differently:
+/// one is worth waiting through, the other is worth explaining.
+static ROVER_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static ROVER_RAMP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROVER_DETAIL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
-pub fn rover_status() -> (bool, u64) {
+pub fn rover_status() -> (&'static str, u64, String) {
+    let st = match ROVER_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => "ready",
+        2 => "unavailable",
+        _ => "warming",
+    };
     (
-        ROVER_READY.load(std::sync::atomic::Ordering::Relaxed),
+        st,
         ROVER_RAMP_MS.load(std::sync::atomic::Ordering::Relaxed),
+        ROVER_DETAIL.lock().map(|d| d.clone()).unwrap_or_default(),
     )
 }
 
@@ -366,10 +378,28 @@ fn warm_rover(session: String) {
         return;
     }
     thread::spawn(move || {
-        let ms = crate::manager::rover_warm(&session, crate::worklog::now_secs());
+        let (ms, err) = crate::manager::rover_warm(&session, crate::worklog::now_secs());
         ROVER_RAMP_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-        ROVER_READY.store(true, std::sync::atomic::Ordering::Relaxed);
-        crate::session::debug_log(&format!("[rover] agent warm in {ms}ms"));
+        match err {
+            None => {
+                ROVER_STATE.store(1, std::sync::atomic::Ordering::Relaxed);
+                crate::session::debug_log(&format!("[rover] agent warm in {ms}ms"));
+            }
+            Some(why) => {
+                // Keep it short — this is drawn on a phone, under a heading that already says
+                // which subsystem it is about.
+                let why = why.lines().next().unwrap_or("agent did not start").chars().take(120).collect::<String>();
+                if let Ok(mut d) = ROVER_DETAIL.lock() {
+                    *d = why.clone();
+                }
+                ROVER_STATE.store(2, std::sync::atomic::Ordering::Relaxed);
+                crate::session::debug_log(&format!("[rover] warm-up failed after {ms}ms: {why}"));
+                // Let the next connection try again. A failure here is often transient — a laptop
+                // that woke with no network yet — and latching it until the bridge restarts turns
+                // a bad minute into a dead feature for the rest of the session.
+                WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
     });
 }
 
@@ -1481,7 +1511,9 @@ fn manager_view_json(want: &str) -> String {
             "agentEnabled": v["agentEnabled"], "agentRuns": v["agentRuns"],
             // Rover's own readiness. The mark is gated on this so the control appears when it can
             // be used — a button that does nothing for four seconds teaches people it is broken.
-            "rover": { "ready": rover_status().0, "rampMs": rover_status().1 },
+            // `ready` is kept alongside `state` so a phone running an older bundle — which knows
+            // only the boolean — keeps working instead of losing the mark on a host upgrade.
+            "rover": { "state": rover_status().0, "ready": rover_status().0 == "ready", "rampMs": rover_status().1, "detail": rover_status().2 },
             "agentStaleSecs": v["agentStaleSecs"],
         }),
         _ => serde_json::json!({ "sessions": v["sessions"] }),

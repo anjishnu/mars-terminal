@@ -2861,7 +2861,13 @@ pub fn rover_chat_stream(
 
 /// How long a cold turn takes, so the phone can warm Rover on connection instead of making
 /// somebody wait for it after they have already asked.
-pub fn rover_warm(session: &str, ts: u64) -> u64 {
+/// Returns the ramp in ms, and the failure reason if the warm-up did not actually work.
+///
+/// The reason is the whole point. The warm-up used to discard its result, so a host with no
+/// `claude` on PATH — or an expired login — reported the agent ready, put the mark on the phone,
+/// and failed only once somebody asked it something. A control that appears and then does not work
+/// is worse than one that never appears, because it spends trust to deliver the same nothing.
+pub fn rover_warm(session: &str, ts: u64) -> (u64, Option<String>) {
     let t0 = std::time::Instant::now();
     // A TRIVIAL warm-up. It pays the ~1s of process start and auth and nothing else.
     //
@@ -2870,8 +2876,9 @@ pub fn rover_warm(session: &str, ts: u64) -> u64 {
     // went from 6.3s to 15.0s. Context size dominates here — more than the model, more than tool
     // calls — so the thread is kept small on purpose and each question carries only the one
     // workspace it is actually about.
-    let _ = rover_chat_stream(session, "Reply with exactly: ready", "", ts, |_| {}, |_| {});
-    t0.elapsed().as_millis() as u64
+    let (msg, ok) = rover_chat_stream(session, "Reply with exactly: ready", "", ts, |_| {}, |_| {});
+    let ms = t0.elapsed().as_millis() as u64;
+    (ms, if ok { None } else { Some(msg) })
 }
 
 /// Every session directory on disk, live or not — a target may name a pane in any of them.
