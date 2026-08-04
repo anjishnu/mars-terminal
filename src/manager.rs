@@ -2670,6 +2670,103 @@ pub fn signals(tail: &[String], delta: &[String]) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+// ── Rover's chat: a real Claude Code session ─────────────────────────────────────────────
+//
+// Not the LLM proxy this started as. The proxy borrowed `AgentConfig::from_env`, which is built
+// for the per-workspace MAP call — 512 tokens, cheapest model, no tools — and it billed the API
+// key, which on this machine has too little credit for anything but haiku.
+//
+// `claude -p` sidesteps all of it. It runs on the claude.ai subscription (the same scrub `run.sh`
+// does: an API key in the environment silently takes precedence and fails when empty), it can
+// actually READ the repo it is being asked about, and `--resume` gives the thread continuity that
+// a stateless proxy could never have.
+//
+// It shares the manager's memory by sharing its filesystem — beliefs and projects read directly,
+// notes appended to an inbox the manager folds in. One writer per file, as everywhere else.
+
+fn chat_thread_path(session: &str) -> Option<PathBuf> {
+    existing_session_dir(session).map(|d| d.join("chat.json"))
+}
+
+fn chat_thread_id(session: &str) -> Option<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(chat_thread_path(session)?).ok()?).ok()?;
+    v["thread"].as_str().filter(|s| !s.is_empty()).map(String::from)
+}
+
+fn remember_chat_thread(session: &str, thread: &str, ts: u64) {
+    if let Some(p) = chat_thread_path(session) {
+        let _ = std::fs::write(&p, serde_json::json!({
+            "thread": thread, "at": iso(ts), "at_ts": ts,
+        }).to_string());
+    }
+}
+
+/// One chat turn. Returns `(answer, ok)`.
+///
+/// Blocking and one-shot per message, exactly like a manager run — the agent's memory is on disk
+/// and in `--resume`, so nothing is lost by each turn being a fresh process.
+pub fn rover_chat(session: &str, message: &str, target: &str, ts: u64) -> (String, bool) {
+    let Some(repo) = repo_dir() else { return ("no manager repo".into(), false) };
+    let cwd = existing_session_dir(session)
+        .and_then(|d| std::fs::read_to_string(d.join("restore.json")).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["panes"][0]["cwd"].as_str().map(PathBuf::from))
+        .filter(|p| p.is_dir())
+        .or_else(dirs_home);
+
+    let mut prompt = String::new();
+    if !target.trim().is_empty() {
+        prompt.push_str(&format!("{target}\n\n"));
+    }
+    prompt.push_str(message);
+
+    let mut cmd = std::process::Command::new("claude");
+    // The env scrub is load-bearing, not hygiene: a key in the environment takes precedence over
+    // the subscription and fails outright when it has no credit — which is exactly the state this
+    // machine is in, and exactly why the proxy could not use a decent model.
+    cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.arg("-p").arg(&prompt)
+        .arg("--output-format").arg("json")
+        // Read-only. The chat reaches this machine from a phone over a public tunnel, so it gets
+        // to LOOK and nothing else; every effect is a proposal the engineer taps. An allow-list
+        // rather than a deny-list, so a new tool in a future Claude Code is not silently granted.
+        .arg("--allowedTools").arg("Read,Grep,Glob")
+        .arg("--append-system-prompt").arg(include_str!("manager_docs/rover_chat.md"))
+        // The manager's memory: beliefs, projects, the archive. Shared by sharing the filesystem.
+        .arg("--add-dir").arg(repo.display().to_string());
+    if let Some(t) = chat_thread_id(session) {
+        cmd.arg("--resume").arg(t);
+    }
+    if let Some(d) = &cwd {
+        cmd.current_dir(d);
+    }
+
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return (format!("could not start claude: {e}"), false),
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return (
+                if err.trim().is_empty() { "claude returned nothing".into() }
+                else { err.trim().chars().take(400).collect() },
+                false,
+            );
+        }
+    };
+    // Thread continuity: remember the id even on a failed turn, so the next message continues the
+    // same conversation rather than silently starting a second one beside it.
+    if let Some(id) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
+        remember_chat_thread(session, id, ts);
+    }
+    let text = v["result"].as_str().unwrap_or_default().trim().to_string();
+    let ok = !v["is_error"].as_bool().unwrap_or(false) && !text.is_empty();
+    (if text.is_empty() { "no answer".into() } else { text }, ok)
+}
+
 /// Every session directory on disk, live or not — a target may name a pane in any of them.
 fn read_all_session_dirs() -> Vec<PathBuf> {
     sessions_root()
