@@ -878,7 +878,32 @@ fn auth_result(txt: &str, valid: Option<&str>) -> AuthCheck {
 /// `(answer, provenance, usable)`: `usable == false` means the host has no working key
 /// (none set, or its limits/credits are expired) and the phone should use its fallback.
 fn run_agent_ask(question: String) -> (String, String, bool) {
-    let cfg = crate::agent::AgentConfig::from_env();
+    run_agent_ask_with(question, false)
+}
+
+/// `deep` widens the budget for Rover's chat.
+///
+/// `AgentConfig::from_env` was built for the per-workspace MAP call — a one-line summary, so
+/// `max_tokens: 512` and the cheapest model are exactly right there. Reusing it for a chat is why
+/// answers came back snappy and useless: the model is asked to reason about a workspace and then
+/// cut off mid-thought, with the fastest model available.
+///
+/// A chat is a different job. It is asked perhaps twice an hour, not once per pane per tick, so it
+/// can afford room to think — and an answer worth reading is the entire point of the surface.
+fn run_agent_ask_with(question: String, deep: bool) -> (String, String, bool) {
+    let mut cfg = crate::agent::AgentConfig::from_env();
+    if deep {
+        cfg.max_tokens = 2048;
+        // Only when nothing was pinned: an explicit LLM_MODEL is the engineer's choice and must
+        // not be quietly overridden by a heuristic about what a chat deserves.
+        // The MODEL is deliberately left alone.
+        //
+        // Upgrading it looked obvious and was wrong: on this machine `claude-sonnet-4-5` answers
+        // "your credit balance is too low" while `claude-haiku-4-5` works, so silently reaching
+        // for the better model would have turned a shallow chat into a broken one. A model the
+        // engineer has not pinned is not ours to choose on their behalf — set MARS_LLM_MODEL to
+        // change it, and know that it has to be a model your key can actually reach.
+    }
     if !cfg.is_configured() {
         return ("No LLM key on the host.".to_string(), "none".to_string(), false);
     }
@@ -1030,7 +1055,7 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let tx2 = tx.clone();
             let _ = tx2.send("{\"t\":\"summary\",\"id\":\"chat\",\"summary\":{\"text\":\"…\",\"streaming\":true}}".to_string());
             thread::spawn(move || {
-                let (answer, provenance, usable) = run_agent_ask(q);
+                let (answer, provenance, usable) = run_agent_ask_with(q, true);
                 let summary = if usable {
                     format!("{{\"text\":{},\"computedBy\":{}}}", json_str(&answer), json_str(&provenance))
                 } else {

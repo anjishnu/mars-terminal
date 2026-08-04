@@ -1699,10 +1699,50 @@ pub fn restore_path(name: &str) -> Option<std::path::PathBuf> {
 /// is keyed to `Mars-Mission` while its panes restore into `Mars-Mission/mars-terminal`, so a
 /// reboot would have resumed something else entirely and looked like it worked.
 fn claude_session_of(pid: i32) -> Option<String> {
-    let p = crate::sys::paths::home_dir()?
-        .join(".claude").join("sessions").join(format!("{pid}.json"));
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
-    v["sessionId"].as_str().filter(|s| !s.is_empty()).map(String::from)
+    let home = crate::sys::paths::home_dir()?;
+
+    // Two sources, because neither is complete on its own. Measured on this machine: of five live
+    // `claude` processes, only two had a `sessions/<pid>.json`, while the daemon roster carried
+    // ids for pids that file was missing. Checking one and trusting it would silently fall back to
+    // `--continue` for the rest, which is the wrong-conversation risk this exists to remove.
+    let direct = home.join(".claude").join("sessions").join(format!("{pid}.json"));
+    if let Some(id) = std::fs::read_to_string(&direct).ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["sessionId"].as_str().map(String::from))
+        .filter(|s| !s.is_empty())
+    {
+        return Some(id);
+    }
+
+    // The roster records the same thing per worker, and reaches processes the file above does not.
+    // Only the id is taken from it — its `cwd` disagrees with the session file for the very
+    // conversation this was written in, so it is not a field to rely on.
+    let roster: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join(".claude").join("daemon").join("roster.json")).ok()?,
+    ).ok()?;
+    let want = pid.to_string();
+    fn find(v: &serde_json::Value, want: &str) -> Option<String> {
+        match v {
+            serde_json::Value::Object(m) => {
+                let matches = m.get("pid").map(|p| match p {
+                    serde_json::Value::String(s) => s == want,
+                    serde_json::Value::Number(n) => n.to_string() == want,
+                    _ => false,
+                }).unwrap_or(false);
+                if matches {
+                    if let Some(id) = m.get("sessionId").and_then(|x| x.as_str()) {
+                        if !id.is_empty() {
+                            return Some(id.to_string());
+                        }
+                    }
+                }
+                m.values().find_map(|x| find(x, want))
+            }
+            serde_json::Value::Array(a) => a.iter().find_map(|x| find(x, want)),
+            _ => None,
+        }
+    }
+    find(&roster, &want)
 }
 
 /// Snapshot the session's shape. `panes` is `(cwd, running_a_coding_agent)` per workspace.
