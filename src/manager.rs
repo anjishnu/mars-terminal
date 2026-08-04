@@ -17,7 +17,7 @@
 //! wrong, so any bug found is a plumbing bug rather than a judgement one.
 
 use anyhow::Result;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// One pane as the board reports it.
@@ -2702,11 +2702,23 @@ fn remember_chat_thread(session: &str, thread: &str, ts: u64) {
     }
 }
 
-/// One chat turn. Returns `(answer, ok)`.
+/// One chat turn, streamed. `on_delta` is called with the answer so far as it arrives.
 ///
 /// Blocking and one-shot per message, exactly like a manager run — the agent's memory is on disk
 /// and in `--resume`, so nothing is lost by each turn being a fresh process.
-pub fn rover_chat(session: &str, message: &str, target: &str, ts: u64) -> (String, bool) {
+///
+/// Streaming is not a nicety at this latency. A bare turn costs ~4.3s of process start, auth and
+/// first token before anything can be said at all, and one that reads files reaches 13s. Held
+/// back until complete, that is a surface that looks broken; released as it arrives, the same
+/// answer starts appearing almost immediately.
+pub fn rover_chat_stream(
+    session: &str,
+    message: &str,
+    target: &str,
+    ts: u64,
+    mut on_delta: impl FnMut(&str),
+    mut on_stage: impl FnMut(&str),
+) -> (String, bool) {
     let Some(repo) = repo_dir() else { return ("no manager repo".into(), false) };
     let cwd = existing_session_dir(session)
         .and_then(|d| std::fs::read_to_string(d.join("restore.json")).ok())
@@ -2724,17 +2736,33 @@ pub fn rover_chat(session: &str, message: &str, target: &str, ts: u64) -> (Strin
     let mut cmd = std::process::Command::new("claude");
     // The env scrub is load-bearing, not hygiene: a key in the environment takes precedence over
     // the subscription and fails outright when it has no credit — which is exactly the state this
-    // machine is in, and exactly why the proxy could not use a decent model.
+    // machine is in, and why the LLM proxy could not use a decent model.
     cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
     cmd.arg("-p").arg(&prompt)
-        .arg("--output-format").arg("json")
+        .arg("--output-format").arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--verbose")
         // Read-only. The chat reaches this machine from a phone over a public tunnel, so it gets
         // to LOOK and nothing else; every effect is a proposal the engineer taps. An allow-list
         // rather than a deny-list, so a new tool in a future Claude Code is not silently granted.
         .arg("--allowedTools").arg("Read,Grep,Glob")
+        // A FAST model, deliberately. Measured on this machine, to first token: haiku 3.25s,
+        // the default 7–10s, sonnet 11.7s — and on a phone that is the whole difference between
+        // answering and appearing stuck.
+        //
+        // It is the right trade because of how the levels divide. The manager already did the
+        // thinking — it reads raw output on its own schedule and writes down what is true — and
+        // this reads those conclusions plus the workspace context handed to it in the prompt. It
+        // is summarising known facts, not deriving them, and that is work a fast model does well.
+        //
+        // MARS_ROVER_MODEL overrides for anyone who wants the slower, deeper answer.
+        .arg("--model")
+        .arg(std::env::var("MARS_ROVER_MODEL").unwrap_or_else(|_| "claude-haiku-4-5".into()))
         .arg("--append-system-prompt").arg(include_str!("manager_docs/rover_chat.md"))
         // The manager's memory: beliefs, projects, the archive. Shared by sharing the filesystem.
-        .arg("--add-dir").arg(repo.display().to_string());
+        .arg("--add-dir").arg(repo.display().to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     if let Some(t) = chat_thread_id(session) {
         cmd.arg("--resume").arg(t);
     }
@@ -2742,29 +2770,105 @@ pub fn rover_chat(session: &str, message: &str, target: &str, ts: u64) -> (Strin
         cmd.current_dir(d);
     }
 
-    let out = match cmd.output() {
-        Ok(o) => o,
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => return (format!("could not start claude: {e}"), false),
     };
-    let v: serde_json::Value = match serde_json::from_slice(&out.stdout) {
-        Ok(v) => v,
-        Err(_) => {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return (
-                if err.trim().is_empty() { "claude returned nothing".into() }
-                else { err.trim().chars().take(400).collect() },
-                false,
-            );
-        }
+    let Some(stdout) = child.stdout.take() else {
+        return ("claude produced no output stream".into(), false)
     };
-    // Thread continuity: remember the id even on a failed turn, so the next message continues the
-    // same conversation rather than silently starting a second one beside it.
-    if let Some(id) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
-        remember_chat_thread(session, id, ts);
+
+    let mut text = String::new();
+    let mut err: Option<String> = None;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        match v["type"].as_str() {
+            // The id arrives in the FIRST event, before any answer — so a turn that dies halfway
+            // still leaves a thread the next message continues rather than starting beside.
+            Some("system") => {
+                if let Some(id) = v["session_id"].as_str().filter(|s| !s.is_empty()) {
+                    remember_chat_thread(session, id, ts);
+                }
+            }
+            // What it is DOING. The wait is not generation — measured on this machine, text
+            // arrives at 7.22s and finishes at 7.24s, so the answer streams in 20ms and the seven
+            // seconds before it are thinking and reading files. Tokens alone therefore fix almost
+            // nothing; saying which file it opened is what makes the wait legible.
+            Some("assistant") => {
+                for block in v["message"]["content"].as_array().into_iter().flatten() {
+                    if block["type"] != "tool_use" {
+                        continue;
+                    }
+                    let tool = block["name"].as_str().unwrap_or("");
+                    let what = block["input"]["file_path"].as_str()
+                        .or_else(|| block["input"]["pattern"].as_str())
+                        .or_else(|| block["input"]["path"].as_str())
+                        .unwrap_or("");
+                    let short = what.rsplit('/').next().unwrap_or(what);
+                    on_stage(&match (tool, short) {
+                        ("Read", f) if !f.is_empty() => format!("reading {f}"),
+                        ("Grep", p) if !p.is_empty() => format!("searching for {p}"),
+                        ("Glob", p) if !p.is_empty() => format!("looking for {p}"),
+                        (t, _) => format!("{}…", t.to_lowercase()),
+                    });
+                }
+            }
+            Some("stream_event") => {
+                let ev = &v["event"];
+                // TEXT deltas only. The model also streams `thinking` and `signature` deltas, and
+                // forwarding those would put its private reasoning on the engineer's phone.
+                if ev["type"] == "content_block_delta" && ev["delta"]["type"] == "text_delta" {
+                    if let Some(t) = ev["delta"]["text"].as_str() {
+                        text.push_str(t);
+                        on_delta(&text);
+                    }
+                }
+            }
+            Some("result") => {
+                if v["is_error"].as_bool().unwrap_or(false) {
+                    err = v["result"].as_str().map(|s| s.to_string());
+                }
+                // The result carries the complete text; prefer it over the accumulation, which can
+                // miss a delta if the stream hiccuped.
+                if let Some(r) = v["result"].as_str().filter(|s| !s.trim().is_empty()) {
+                    text = r.to_string();
+                }
+            }
+            _ => {}
+        }
     }
-    let text = v["result"].as_str().unwrap_or_default().trim().to_string();
-    let ok = !v["is_error"].as_bool().unwrap_or(false) && !text.is_empty();
-    (if text.is_empty() { "no answer".into() } else { text }, ok)
+    let status = child.wait().ok();
+    let text = text.trim().to_string();
+    if let Some(e) = err {
+        return (e.chars().take(400).collect(), false);
+    }
+    if text.is_empty() {
+        let msg = child.stderr.take()
+            .map(|mut s| { let mut b = String::new(); let _ = s.read_to_string(&mut b); b })
+            .unwrap_or_default();
+        let msg = msg.trim();
+        return (
+            if msg.is_empty() { format!("claude exited {status:?} with no answer") }
+            else { msg.chars().take(400).collect() },
+            false,
+        );
+    }
+    (text, true)
+}
+
+/// How long a cold turn takes, so the phone can warm Rover on connection instead of making
+/// somebody wait for it after they have already asked.
+pub fn rover_warm(session: &str, ts: u64) -> u64 {
+    let t0 = std::time::Instant::now();
+    // A TRIVIAL warm-up. It pays the ~1s of process start and auth and nothing else.
+    //
+    // Priming it with the manager's memory was tried and is measurably worse: reading beliefs.md
+    // into the thread made every later turn re-process that context, and the first real question
+    // went from 6.3s to 15.0s. Context size dominates here — more than the model, more than tool
+    // calls — so the thread is kept small on purpose and each question carries only the one
+    // workspace it is actually about.
+    let _ = rover_chat_stream(session, "Reply with exactly: ready", "", ts, |_| {}, |_| {});
+    t0.elapsed().as_millis() as u64
 }
 
 /// Every session directory on disk, live or not — a target may name a pane in any of them.

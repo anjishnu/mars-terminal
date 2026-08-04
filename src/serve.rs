@@ -340,6 +340,39 @@ pub fn supervise_main(session_arg: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Is Rover's agent up, and what did it cost to get there?
+///
+/// A cold turn is ~4.3s of process start, auth and first token before a word can be said. Paying
+/// that AFTER somebody has asked is the whole of "why is this thing slow"; paying it when the
+/// phone connects spends it while they are still reading the briefing.
+///
+/// The mark is gated on this, so the control appears when it can actually be used rather than
+/// sitting there looking broken for the first four seconds.
+static ROVER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ROVER_RAMP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn rover_status() -> (bool, u64) {
+    (
+        ROVER_READY.load(std::sync::atomic::Ordering::Relaxed),
+        ROVER_RAMP_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Warm the agent in the background. Idempotent: a second phone connecting must not start a
+/// second warm-up, which would spend a whole turn to learn something already known.
+fn warm_rover(session: String) {
+    static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        let ms = crate::manager::rover_warm(&session, crate::worklog::now_secs());
+        ROVER_RAMP_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+        ROVER_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::session::debug_log(&format!("[rover] agent warm in {ms}ms"));
+    });
+}
+
 pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
     let mut socket = session::socket_path(&session)?;
@@ -831,7 +864,15 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                     handle_client_msg(&mut writer, &action_tx, socket, &txt);
                 } else {
                     match auth_result(&txt, valid.as_deref()) {
-                        AuthCheck::Ok => authed = true,
+                        AuthCheck::Ok => {
+                            authed = true;
+                            // A phone is genuinely here. Spend the ~4.3s ramp NOW, while they are
+                            // still reading the briefing, rather than after they have asked
+                            // something and are watching a halo breathe.
+                            if let Some(n) = socket.file_stem().map(|s| s.to_string_lossy().to_string()) {
+                                warm_rover(n);
+                            }
+                        }
                         AuthCheck::Bad => break, // wrong token → refuse now
                         AuthCheck::Other => {}   // hello/subscribe before auth → keep waiting
                     }
@@ -1056,8 +1097,27 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 // A real Claude Code session on the subscription, not the summary-shaped LLM proxy:
                 // it reads the repo, shares the manager's memory, and `--resume` keeps the
                 // thread rather than starting fresh on every message.
-                let (answer, usable) = crate::manager::rover_chat(
-                    &sess, &q, &ctx, crate::worklog::now_secs());
+                // Forward each delta as it lands. A turn costs ~4.3s before its first token and
+                // up to 13s when it reads files; held back until complete that is a surface that
+                // looks broken, and released as it arrives the same answer starts almost at once.
+                let tx3 = tx2.clone();
+                let tx4 = tx2.clone();
+                let (answer, usable) = crate::manager::rover_chat_stream(
+                    &sess, &q, &ctx, crate::worklog::now_secs(),
+                    |so_far| {
+                        let _ = tx3.send(format!(
+                            "{{\"t\":\"summary\",\"id\":\"chat\",\"summary\":{{\"text\":{},\"streaming\":true}}}}",
+                            json_str(so_far)
+                        ));
+                    },
+                    |stage| {
+                        // A separate id so a stage never overwrites the answer being typed.
+                        let _ = tx4.send(format!(
+                            "{{\"t\":\"summary\",\"id\":\"chat-stage\",\"summary\":{{\"text\":{},\"streaming\":true}}}}",
+                            json_str(stage)
+                        ));
+                    },
+                );
                 let provenance = "claude code".to_string();
                 let summary = if usable {
                     format!("{{\"text\":{},\"computedBy\":{}}}", json_str(&answer), json_str(&provenance))
@@ -1419,6 +1479,9 @@ fn manager_view_json(want: &str) -> String {
         "manager.memos" => serde_json::json!({ "memos": v["memos"] }),
         "manager.health" => serde_json::json!({
             "agentEnabled": v["agentEnabled"], "agentRuns": v["agentRuns"],
+            // Rover's own readiness. The mark is gated on this so the control appears when it can
+            // be used — a button that does nothing for four seconds teaches people it is broken.
+            "rover": { "ready": rover_status().0, "rampMs": rover_status().1 },
             "agentStaleSecs": v["agentStaleSecs"],
         }),
         _ => serde_json::json!({ "sessions": v["sessions"] }),
