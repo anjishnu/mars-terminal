@@ -462,6 +462,23 @@ impl Term {
         first.rsplit('/').next().unwrap_or(first).to_string()
     }
 
+    /// The pid of the foreground process group, when a command is running.
+    ///
+    /// Kept because a pid is a JOIN KEY, not just a number: Claude Code records each live session
+    /// at `~/.claude/sessions/<pid>.json`, so this is what turns "a coding agent is running here"
+    /// into "and here is exactly which conversation it is".
+    pub fn foreground_pid(&self) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            let leader = self.master.process_group_leader()?;
+            (Some(leader as u32) != self.shell_pid).then_some(leader)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// The NAME of the foreground command, when one is running (`claude`, `cargo`, …).
     ///
     /// Same source as `foreground_busy` — the PTY's foreground process group — resolved to a

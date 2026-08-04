@@ -664,11 +664,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
         if panes.is_empty() {
             app.open_terminal();
         } else {
-            for (i, (cwd, agent)) in panes.iter().enumerate() {
+            for (i, (cwd, agent, chat)) in panes.iter().enumerate() {
                 if i > 0 {
                     app.new_tab();
                 }
-                app.restore_workspace(std::path::Path::new(cwd), *agent);
+                app.restore_workspace(std::path::Path::new(cwd), *agent, chat.as_deref());
             }
             app.clear_startup_cwd();
         }
@@ -1019,7 +1019,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // The session's shape, refreshed on the same tick as the snapshot. A reboot reads
                 // this to come back as itself; writing it here rather than on shutdown means a
                 // daemon that is killed outright still leaves one behind.
-                let shape: Vec<(String, bool)> = app
+                let shape: Vec<(String, bool, Option<String>)> = app
                     .tabs
                     .iter()
                     .filter(|t| !t.hidden)
@@ -1032,7 +1032,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         // Was a coding agent running here? Ask the process table for the pane's
                         // foreground command — `last_command` only knows what MARS typed, so a
                         // `claude` the engineer started by hand is invisible to it.
-                        Some((cwd, term.foreground_command().as_deref() == Some("claude")))
+                        let agent = term.foreground_command().as_deref() == Some("claude");
+                        // The conversation id, while the process is still alive to be asked. After
+                        // the reboot there is nothing left to ask.
+                        let chat = agent.then(|| term.foreground_pid().and_then(claude_session_of)).flatten();
+                        Some((cwd, agent, chat))
                     })
                     .collect();
                 if let Some(n) = app.session_name.as_deref() {
@@ -1684,13 +1688,30 @@ pub fn restore_path(name: &str) -> Option<std::path::PathBuf> {
     crate::manager::existing_session_dir_pub(name).map(|d| d.join("restore.json"))
 }
 
+/// Which Claude Code conversation is running under this pid, if any.
+///
+/// Claude Code writes `~/.claude/sessions/<pid>.json` for every live session, holding its
+/// `sessionId`. A pane's foreground process group leader IS that pid, so this turns "an agent is
+/// running here" into "and it is exactly this conversation".
+///
+/// That distinction is the difference between `--continue` and `--resume`. `--continue` reopens
+/// the most recent conversation IN A DIRECTORY, which is only the right one by luck: this session
+/// is keyed to `Mars-Mission` while its panes restore into `Mars-Mission/mars-terminal`, so a
+/// reboot would have resumed something else entirely and looked like it worked.
+fn claude_session_of(pid: i32) -> Option<String> {
+    let p = crate::sys::paths::home_dir()?
+        .join(".claude").join("sessions").join(format!("{pid}.json"));
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()?;
+    v["sessionId"].as_str().filter(|s| !s.is_empty()).map(String::from)
+}
+
 /// Snapshot the session's shape. `panes` is `(cwd, running_a_coding_agent)` per workspace.
-pub fn write_restore(name: &str, panes: &[(String, bool)]) {
+pub fn write_restore(name: &str, panes: &[(String, bool, Option<String>)]) {
     let Some(p) = restore_path(name) else { return };
     let body = serde_json::json!({
         "at_ts": crate::worklog::now_secs(),
-        "panes": panes.iter().map(|(cwd, agent)| serde_json::json!({
-            "cwd": cwd, "agent": agent,
+        "panes": panes.iter().map(|(cwd, agent, chat)| serde_json::json!({
+            "cwd": cwd, "agent": agent, "chat": chat,
         })).collect::<Vec<_>>(),
     });
     if let Ok(t) = serde_json::to_string_pretty(&body) {
@@ -1698,14 +1719,18 @@ pub fn write_restore(name: &str, panes: &[(String, bool)]) {
     }
 }
 
-pub fn read_restore(name: &str) -> Vec<(String, bool)> {
+pub fn read_restore(name: &str) -> Vec<(String, bool, Option<String>)> {
     let Some(p) = restore_path(name) else { return Vec::new() };
     let Ok(txt) = std::fs::read_to_string(p) else { return Vec::new() };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return Vec::new() };
     v["panes"].as_array().map(|a| {
         a.iter().filter_map(|p| {
             let cwd = p["cwd"].as_str()?.to_string();
-            (!cwd.is_empty()).then(|| (cwd, p["agent"].as_bool().unwrap_or(false)))
+            (!cwd.is_empty()).then(|| (
+                cwd,
+                p["agent"].as_bool().unwrap_or(false),
+                p["chat"].as_str().filter(|s| !s.is_empty()).map(String::from),
+            ))
         }).collect()
     }).unwrap_or_default()
 }
@@ -1749,7 +1774,7 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
              (A session started before this feature has no manifest; the next reboot will have one.)"
         );
     } else {
-        let agents = panes.iter().filter(|(_, a)| *a).count();
+        let agents = panes.iter().filter(|(_, a, _)| *a).count();
         println!(
             "rebooting '{name}' — {} workspace(s) to restore{}",
             panes.len(),

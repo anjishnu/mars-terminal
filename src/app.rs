@@ -5190,7 +5190,7 @@ impl App {
     /// The agent line goes through `send_bytes`, which queues behind the prompt probe and flushes
     /// only once the shell is genuinely reading — the mechanism `nudge_manager` learned to use
     /// after a turn typed into a not-yet-ready terminal vanished without trace.
-    pub fn restore_workspace(&mut self, cwd: &std::path::Path, agent: bool) {
+    pub fn restore_workspace(&mut self, cwd: &std::path::Path, agent: bool, chat: Option<&str>) {
         // `open_terminal` takes its cwd from here; setting it is the whole of "restore the
         // directory". Cleared by the caller once the last workspace is up.
         self.startup_cwd = Some(cwd.to_path_buf());
@@ -5201,10 +5201,17 @@ impl App {
         let id = self.focused_pane_id();
         if let Some(PaneContent::Terminal(tid)) = self.panes.get(&id).map(|p| p.content.clone()) {
             if let Some(t) = self.terms.get_mut(&tid) {
-                // `--continue` resumes the most recent conversation IN THIS DIRECTORY, which is
-                // why getting the cwd right above is what restores the right conversation. No
-                // session id to record, and nothing that can go stale.
-                t.send_bytes(b"claude --continue\r");
+                // `--resume <id>` when the id is known, because `--continue` reopens the most
+                // recent conversation IN THIS DIRECTORY and that is only the right one by luck:
+                // this very session is keyed to `Mars-Mission` while its panes live in
+                // `Mars-Mission/mars-terminal`, so `--continue` would confidently restore a
+                // different conversation. `--continue` stays as the fallback for a pane whose id
+                // was never captured.
+                let line = match chat {
+                    Some(id) => format!("claude --resume {id}\r"),
+                    None => "claude --continue\r".to_string(),
+                };
+                t.send_bytes(line.as_bytes());
             }
         }
     }

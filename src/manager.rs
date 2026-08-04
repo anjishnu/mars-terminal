@@ -2670,6 +2670,86 @@ pub fn signals(tail: &[String], delta: &[String]) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+/// Every session directory on disk, live or not — a target may name a pane in any of them.
+fn read_all_session_dirs() -> Vec<PathBuf> {
+    sessions_root()
+        .and_then(|r| std::fs::read_dir(r).ok())
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default()
+}
+
+/// Everything known about one targeted thing, as plain text for a prompt.
+///
+/// The chat is only as good as this. A model asked "why did it fail?" with nothing attached will
+/// produce a fluent guess, which is worse than no answer — so this gathers what is actually true:
+/// the manager's own note, and the pane's most recent output.
+///
+/// Deliberately bounded. The tail is capped and the note is already short by contract, so an
+/// answer costs the same whether the pane printed ten lines or ten million — the manager's own
+/// discipline, applied one level over.
+pub fn target_context(kind: &str, id: &str) -> String {
+    if kind == "memo" {
+        // A memo carries its whole substance in its own file; nothing else to gather.
+        for dir in read_all_session_dirs() {
+            for e in std::fs::read_dir(dir.join("memos")).into_iter().flatten().flatten() {
+                let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+                let Some((front, body)) = split_front(&text) else { continue };
+                if front_field(front, "id").as_deref() == Some(id)
+                    || e.path().file_stem().map(|s| s.to_string_lossy() == id).unwrap_or(false)
+                {
+                    return format!("MEMO\n{}", body.trim());
+                }
+            }
+        }
+        return String::new();
+    }
+    // A workspace: its note, then what its pane has actually printed.
+    let mut out = String::new();
+    for dir in read_all_session_dirs() {
+        let note = dir.join("workspaces").join(format!("{id}.md"));
+        if let Ok(text) = std::fs::read_to_string(&note) {
+            if let Some((_, body)) = split_front(&text) {
+                out.push_str(&format!("WHAT THE MANAGER LAST WROTE ABOUT IT\n{}\n\n", body.trim()));
+            }
+        }
+        // The newest snapshot is the only one worth reading — older ones describe a board that
+        // has since moved, which is exactly what makes a stale answer sound confident.
+        let snaps = dir.join("snapshots");
+        let newest = std::fs::read_dir(&snaps).ok().and_then(|rd| {
+            let mut f: Vec<PathBuf> = rd.flatten().map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json")).collect();
+            f.sort();
+            f.pop()
+        });
+        let Some(newest) = newest else { continue };
+        let Ok(v) = std::fs::read_to_string(&newest)
+            .ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .ok_or(()) else { continue };
+        for w in v["workspaces"].as_array().into_iter().flatten() {
+            if w["paneId"].as_str() != Some(id) && w["id"].as_str() != Some(id) {
+                continue;
+            }
+            out.push_str(&format!(
+                "STATE\nname: {}\nverdict: {}\nidle for: {}s\n\n",
+                w["name"].as_str().unwrap_or("?"),
+                w["verdict"].as_str().unwrap_or("?"),
+                w["ageSecs"].as_u64().unwrap_or(0),
+            ));
+            let tail: Vec<&str> = w["output"]["tail"].as_array().into_iter().flatten()
+                .filter_map(|l| l.as_str()).collect();
+            if !tail.is_empty() {
+                let from = tail.len().saturating_sub(30);
+                out.push_str(&format!("WHAT ITS SCREEN SHOWS NOW\n{}\n\n", tail[from..].join("\n")));
+            }
+            let sig = &w["output"]["signals"];
+            if sig.is_object() && !sig.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                out.push_str(&format!("EXTRACTED SIGNALS\n{sig}\n\n"));
+            }
+        }
+    }
+    out
+}
+
 /// Declared intent. `goals.json` and `mission.json` have existed unread this whole time, which is
 /// why memo priority has been a guess: importance is relative to a goal, and the agent had none.
 pub fn goals_json() -> serde_json::Value {

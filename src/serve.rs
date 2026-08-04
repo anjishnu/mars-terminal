@@ -1007,6 +1007,26 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 return;
             }
             crate::manager::record_client_event("chat", &v, crate::worklog::now_secs());
+            // Put the TARGET in front of the model. Without this the chat is an oracle that
+            // cannot see the machine it is being asked about — "why did it fail?" is unanswerable
+            // when nothing says what "it" is. The phone knows, because one thing is outlined on
+            // screen, so it says so and this reads that thing's own note and recent output.
+            let q = match (
+                v.get("targetKind").and_then(|x| x.as_str()),
+                v.get("targetId").and_then(|x| x.as_str()),
+            ) {
+                (Some(kind), Some(id)) => {
+                    let ctx = crate::manager::target_context(kind, id);
+                    if ctx.trim().is_empty() { q } else {
+                        format!(
+                            "You are Rover, answering about one workspace on the engineer's \
+                             machine. Everything below is what is actually true of it right now; \
+                             never invent anything not present here.\n\n{ctx}\n\nTheir question: {q}"
+                        )
+                    }
+                }
+                _ => q,
+            };
             let tx2 = tx.clone();
             let _ = tx2.send("{\"t\":\"summary\",\"id\":\"chat\",\"summary\":{\"text\":\"…\",\"streaming\":true}}".to_string());
             thread::spawn(move || {
