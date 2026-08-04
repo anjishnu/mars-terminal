@@ -6908,6 +6908,56 @@ fn selfcheck() -> Result<()> {
         }
         println!("[selfcheck] manager: provenance comes from receipts, not mtime ... PASS");
 
+        {
+            // Rover's proposals are the only path from the chat to the machine, and the text they
+            // are parsed out of is a summary of terminal output — which any program on this host
+            // can write into. So the gate is here, not in the prompt: a prompt is a request, this
+            // is a guarantee.
+            let (prose, p) = manager::split_proposals(
+                "Terminal 1 finished.\n\n```do\n{\"verb\":\"open\",\"path\":\"~/a.md\",\"why\":\"the log\"}\n```",
+            );
+            assert_eq!(prose, "Terminal 1 finished.", "the fence survived into the prose: {prose:?}");
+            assert_eq!(p.len(), 1);
+            assert_eq!(p[0]["verb"], "open");
+            assert_eq!(p[0]["path"], "~/a.md");
+
+            // No block at all is the common case and must not disturb a word of the answer.
+            let (prose, p) = manager::split_proposals("Nothing needs you.");
+            assert_eq!(prose, "Nothing needs you.");
+            assert!(p.is_empty());
+
+            // A verb we do not implement, and a verb missing its one required field, are DROPPED.
+            // Forwarding either would put a card on the phone that nothing can explain or execute.
+            let (_, p) = manager::split_proposals(
+                "x\n```do\n{\"verb\":\"rm\",\"path\":\"/\"}\n{\"verb\":\"open\"}\n{\"verb\":\"run\"}\nnot json\n```",
+            );
+            assert!(p.is_empty(), "an unknown or incomplete proposal survived: {p:?}");
+
+            // `run` carries a command and never a destination. If a model can be talked into
+            // naming the pane, a poisoned log can aim a command at the wrong workspace — so the
+            // field simply does not exist on this side of the wire.
+            let (_, p) = manager::split_proposals(
+                "x\n```do\n{\"verb\":\"run\",\"cmd\":\"npm test\",\"paneId\":\"7\",\"why\":\"w\"}\n```",
+            );
+            assert_eq!(p.len(), 1);
+            assert_eq!(p[0]["cmd"], "npm test");
+            assert!(p[0].get("paneId").is_none(), "a proposal chose its own target: {:?}", p[0]);
+
+            // Three at most, however many were written.
+            let many = format!(
+                "x\n```do\n{}\n```",
+                (0..7).map(|i| format!("{{\"verb\":\"run\",\"cmd\":\"c{i}\"}}")).collect::<Vec<_>>().join("\n")
+            );
+            assert_eq!(manager::split_proposals(&many).1.len(), 3, "the cap did not hold");
+
+            // Cut off mid-block: the prose still ends at the fence rather than trailing half an
+            // object into the answer.
+            let (prose, p) = manager::split_proposals("Done.\n\n```do\n{\"verb\":\"open\",\"pa");
+            assert_eq!(prose, "Done.");
+            assert!(p.is_empty());
+        }
+        println!("[selfcheck] rover: a proposal is parsed strictly and never picks its own target ... PASS");
+
     }
 
     // ── The manager's hidden tab ────────────────────────────────────────────────────────

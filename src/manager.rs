@@ -2861,6 +2861,61 @@ pub fn rover_chat_stream(
 
 /// How long a cold turn takes, so the phone can warm Rover on connection instead of making
 /// somebody wait for it after they have already asked.
+/// Split a ```do fence off the end of an answer into proposals the phone can render as buttons.
+///
+/// Returns the prose with the block removed, and one JSON object per accepted line. Rover cannot
+/// execute anything, so this is the entire mechanism by which it reaches the machine: it writes a
+/// suggestion, this turns it into a card, and a human's finger is the only thing that runs it.
+///
+/// Deliberately strict, because the model is summarising output that any program on the host can
+/// write into — a proposal is untrusted text that merely arrived by a trusted route:
+///
+/// - Unknown verbs and missing required fields are DROPPED, not passed along for the phone to
+///   puzzle over. A card nobody can explain is worse than no card.
+/// - `run` carries a command and nothing else. Where it runs is decided by what the captain has
+///   selected on their phone, so the one parameter worth keeping away from the model is aim.
+/// - Three at most. The cap is here rather than only in the prompt because a prompt is a request
+///   and this is a guarantee.
+pub fn split_proposals(answer: &str) -> (String, Vec<serde_json::Value>) {
+    let Some(start) = answer.rfind("```do") else { return (answer.to_string(), Vec::new()) };
+    let rest = &answer[start + 5..];
+    let body = match rest.find("```") {
+        Some(end) => &rest[..end],
+        // An unterminated fence still means the prose ended here — the model was cut off mid-block,
+        // and showing the captain half a JSON object would be worse than showing none.
+        None => rest,
+    };
+    let mut out = Vec::new();
+    for (i, line) in body.lines().map(str::trim).filter(|l| !l.is_empty()).enumerate() {
+        if out.len() >= 3 {
+            break;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let get = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty());
+        let why = get("why").unwrap_or("").to_string();
+        let id = format!("p{i}");
+        match v.get("verb").and_then(|x| x.as_str()) {
+            Some("open") => {
+                if let Some(path) = get("path") {
+                    out.push(serde_json::json!({ "id": id, "verb": "open", "path": path, "why": why }));
+                }
+            }
+            Some("workspace") => {
+                out.push(serde_json::json!({
+                    "id": id, "verb": "workspace", "name": get("name").unwrap_or(""), "why": why
+                }));
+            }
+            Some("run") => {
+                if let Some(cmd) = get("cmd") {
+                    out.push(serde_json::json!({ "id": id, "verb": "run", "cmd": cmd, "why": why }));
+                }
+            }
+            _ => {}
+        }
+    }
+    (answer[..start].trim_end().to_string(), out)
+}
+
 /// Returns the ramp in ms, and the failure reason if the warm-up did not actually work.
 ///
 /// The reason is the whole point. The warm-up used to discard its result, so a host with no

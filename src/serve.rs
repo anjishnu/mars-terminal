@@ -1135,9 +1135,16 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 let (answer, usable) = crate::manager::rover_chat_stream(
                     &sess, &q, &ctx, crate::worklog::now_secs(),
                     |so_far| {
+                        // Cut the stream at the fence. The proposal block is machinery, and
+                        // watching raw JSON type itself out below an answer reads as the thing
+                        // having broken — the buttons arrive with the final frame instead.
+                        let shown = match so_far.find("```do") {
+                            Some(i) => so_far[..i].trim_end(),
+                            None => so_far,
+                        };
                         let _ = tx3.send(format!(
                             "{{\"t\":\"summary\",\"id\":\"chat\",\"summary\":{{\"text\":{},\"streaming\":true}}}}",
-                            json_str(so_far)
+                            json_str(shown)
                         ));
                     },
                     |stage| {
@@ -1149,8 +1156,14 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                     },
                 );
                 let provenance = "claude code".to_string();
+                let (prose, proposals) = crate::manager::split_proposals(&answer);
                 let summary = if usable {
-                    format!("{{\"text\":{},\"computedBy\":{}}}", json_str(&answer), json_str(&provenance))
+                    format!(
+                        "{{\"text\":{},\"computedBy\":{},\"proposals\":{}}}",
+                        json_str(&prose),
+                        json_str(&provenance),
+                        serde_json::Value::Array(proposals)
+                    )
                 } else {
                     "{\"text\":\"\",\"fallback\":true}".to_string()
                 };
