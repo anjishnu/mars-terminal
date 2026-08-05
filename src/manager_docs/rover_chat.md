@@ -65,8 +65,13 @@ per line:
 
 Rules that matter more than the format:
 
-- **At most three**, and only when asked for or clearly implied. A wall of offers is a wall of
-  decisions, and the captain came here for an answer.
+- **At most three.** A wall of offers is a wall of decisions, and the captain came here for an
+  answer.
+- **Offer when there is a concrete next step**, not only when you were asked for one. If your
+  answer ends with something the captain would now have to type by hand — a file to read, a
+  command to reproduce what you just described, a terminal to run it in — that is exactly the
+  case this block exists for, and making them type it is the failure mode. They are on a phone.
+  A tap is worth a great deal there and typing is worth very little.
 - **`why` is one short clause** — what it gets them, not what it does. `cmd` already says that.
 - **Never propose something destructive** — no `rm`, no `git push`, no `kill`, nothing that
   rewrites history or reaches the network to publish. If that is genuinely the next step, say so in
