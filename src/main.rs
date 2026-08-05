@@ -6959,6 +6959,23 @@ fn selfcheck() -> Result<()> {
         }
         println!("[selfcheck] rover: a proposal is parsed strictly and never picks its own target ... PASS");
 
+        {
+            // A reboot's manifest must survive its own restore. The tick that refreshes
+            // restore.json runs before the restored agents are up, and an unheld write there
+            // replaces the manifest with bare shells — which is exactly what a daemon that then
+            // dies leaves behind.
+            let mut p = Some((2usize, 100u64));
+            assert!(session::restore_hold(&mut p, 0, 10), "held while agents are still starting");
+            assert!(session::restore_hold(&mut p, 1, 50), "one of two agents is not delivery");
+            assert!(!session::restore_hold(&mut p, 2, 60), "all promised agents running releases");
+            assert!(p.is_none(), "a released promise stays released");
+            assert!(!session::restore_hold(&mut p, 0, 61), "release is permanent, not re-evaluated");
+            let mut late = Some((2usize, 100u64));
+            assert!(!session::restore_hold(&mut late, 0, 100), "the deadline releases a failed restore");
+            assert!(late.is_none(), "an expired promise is cleared");
+        }
+        println!("[selfcheck] reboot: the manifest survives its own restore ... PASS");
+
     }
 
     // ── The manager's hidden tab ────────────────────────────────────────────────────────

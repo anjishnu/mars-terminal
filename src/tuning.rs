@@ -168,6 +168,11 @@ pub struct Tuning {
     /// Seconds after which agent-written prose is considered stale and the phone stops
     /// preferring it. Guards against a dead agent silently serving an old world forever.
     pub manager_agent_stale_secs: u64,
+    /// How long after a reboot the restore manifest stays read-only while the restored agents
+    /// come up. Until every promised agent is observed running (or this deadline passes), the
+    /// tick that normally refreshes the manifest holds off — so a daemon that dies mid-restore
+    /// leaves the manifest it was restoring FROM, not a degraded copy of its half-restored self.
+    pub restore_hold_secs: u64,
     /// Minimum seconds between Rover MAP calls (the per-workspace summary). One
     /// changed pane is (re)summarized per interval, so a busy board fans out over
     /// several intervals instead of hammering the model. Only active while a phone
@@ -268,6 +273,7 @@ impl Default for Tuning {
                   --add-dir ~/.mars/sessions --permission-mode acceptEdits"
                     .into(),
             manager_agent_stale_secs: 2700,
+            restore_hold_secs: 300,
             rover_map_min_secs: 1,
             foreground_sample_secs: 4,
             rover_brief_min_secs: 12,
@@ -538,6 +544,10 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "How old agent-written prose may be before the phone stops trusting it and falls \
              back. Should comfortably exceed manager_agent_secs, or a healthy agent reads as \
              stale between its own turns.")),
+        ("restore_hold_secs", knob(json!(d.restore_hold_secs),
+            "How long after a reboot the restore manifest stays read-only while restored agents \
+             start. Long enough for a claude resume on a slow morning; short enough that a \
+             restore that genuinely failed stops shadowing reality within minutes.")),
         ("mobile_pane_interval_ms", knob(json!(d.mobile_pane_interval_ms),
             "How often the watched pane's live screen is pushed to the phone, in ms. Separate \
              from the board's cadence because this one is felt as typing latency. Identical \

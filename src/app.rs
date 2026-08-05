@@ -412,6 +412,13 @@ pub struct App {
     pub palette: Option<Palette>,
     pub status_msg: Option<String>,
     pub should_quit: bool,
+    /// A reboot's outstanding promise: (agent panes the manifest said to restore, deadline_ts).
+    /// While set, the restore manifest is READ-ONLY to this process — the tick that normally
+    /// refreshes it holds off until the promised agents are observed running or the deadline
+    /// passes. Without this, the first tick after a reboot (agents still starting, so detected
+    /// absent) rewrote the manifest as bare shells — and a daemon that then died took the real
+    /// one with it.
+    pub restore_promise: Option<(usize, u64)>,
     pub keys: KeyBindings,
     pub frecency: HashMap<String, u32>,
     // ── Non-modal editing state ──
@@ -703,6 +710,7 @@ impl App {
             palette: None,
             status_msg: None,
             should_quit: false,
+            restore_promise: None,
             keys,
             frecency: state.frecency,
             pending_prefix: Vec::new(),
@@ -5256,7 +5264,10 @@ impl App {
                     Some(id) => format!("claude --resume {id}\r"),
                     None => "claude --continue\r".to_string(),
                 };
-                t.send_bytes(line.as_bytes());
+                // Marker-gated, not prompt-gated: the glyph heuristic fires on a prompt that is
+                // drawn but not yet reading, and this line vanishing silently is the difference
+                // between the conversation coming back and a bare shell wearing its hint.
+                t.send_bytes_marker_gated(line.as_bytes());
             }
         }
     }

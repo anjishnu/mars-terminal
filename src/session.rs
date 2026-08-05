@@ -671,6 +671,13 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 app.restore_workspace(std::path::Path::new(cwd), *agent, chat.as_deref());
             }
             app.clear_startup_cwd();
+            // The manifest just consumed becomes read-only until its promise is delivered —
+            // see `restore_hold` for the release conditions.
+            let promised = panes.iter().filter(|(_, agent, _)| *agent).count();
+            if promised > 0 {
+                app.restore_promise =
+                    Some((promised, crate::worklog::now_secs() + app.tuning.restore_hold_secs));
+            }
         }
     }
 
@@ -1039,8 +1046,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         Some((cwd, agent, chat))
                     })
                     .collect();
-                if let Some(n) = app.session_name.as_deref() {
-                    crate::session::write_restore(n, &shape);
+                let agents_now = shape.iter().filter(|(_, agent, _)| *agent).count();
+                if !restore_hold(&mut app.restore_promise, agents_now, now) {
+                    if let Some(n) = app.session_name.as_deref() {
+                        crate::session::write_restore(n, &shape);
+                    }
                 }
                 let output = serde_json::Value::Object(out);
                 let _ = crate::manager::tick_session(
@@ -1780,6 +1790,20 @@ fn claude_session_of(pid: i32) -> Option<String> {
         }
     }
     find(&roster, &want)
+}
+
+/// Whether the restore manifest is still read-only: a reboot promised `want` agent panes and
+/// they are not all observed running yet. Releases — permanently, by clearing the promise —
+/// the moment reality catches up OR the deadline passes: a restore that genuinely failed must
+/// not shadow the live truth forever, only long enough that a crash mid-restore cannot replace
+/// the manifest being restored with a degraded copy of the attempt.
+pub fn restore_hold(promise: &mut Option<(usize, u64)>, agents_now: usize, now: u64) -> bool {
+    if let Some((want, deadline)) = *promise {
+        if agents_now >= want || now >= deadline {
+            *promise = None;
+        }
+    }
+    promise.is_some()
 }
 
 /// Snapshot the session's shape. `panes` is `(cwd, running_a_coding_agent)` per workspace.

@@ -42,6 +42,12 @@ actions:
 that is a suggestion rather than a command — a thought the captain should have is still worth
 offering, and it becomes a tappable note rather than an execution.
 
+The best `keys` action is the exact command that UNBLOCKS the pane — the rerun, the missing
+install, the resume, the retry with the flag the error asked for. Offer it at the moment it is
+the obvious next step, phrased so the label alone says what will happen. On the phone these run
+under a deliberate long-press, and the record of which get taken is what earns their automation
+later — a suggestion taken every time is a suggestion that should eventually run itself.
+
 Rules, and they matter more than the format:
 
 - **Never more than three, and prefer one.** Three plausible actions is a way of not choosing.

@@ -26,6 +26,12 @@ struct StartupInput {
     marker: String,
     probe_interval: Duration,
     last_probe: Option<Instant>,
+    // When set, only a SEEN marker releases the queue — the prompt-glyph shortcut is skipped.
+    // The glyph heuristic fires on prompts that are drawn but not yet reading (zsh instant
+    // prompt), and input written then vanishes silently. For interactive typing that latency
+    // trade is right; for a restored `claude --resume` it is how a conversation fails to come
+    // back while looking like it was typed.
+    require_marker: bool,
 }
 
 /// How much raw PTY output each pane retains for phone scrollback. ~512 KB is thousands of
@@ -336,6 +342,7 @@ pub fn spawn(
             marker,
             probe_interval: startup_probe_interval,
             last_probe: None,
+            require_marker: false,
         }),
         exit_code,
         notify_exit,
@@ -382,7 +389,8 @@ impl Term {
         if self.startup_input.is_none() {
             return;
         }
-        if self.prompt_visible() {
+        let marker_only = self.startup_input.as_ref().is_some_and(|s| s.require_marker);
+        if !marker_only && self.prompt_visible() {
             let bytes = self.startup_input.take().map(|startup| startup.bytes);
             if let Some(bytes) = bytes {
                 self.write_input(&bytes);
@@ -425,6 +433,16 @@ impl Term {
             return;
         }
         self.write_input(bytes);
+    }
+
+    /// Queue bytes that must not be lost: released only once the marker probe has ROUND-TRIPPED,
+    /// never on the prompt-glyph shortcut. For a restored agent line, a dropped byte is a
+    /// conversation that fails to come back while looking typed.
+    pub fn send_bytes_marker_gated(&mut self, bytes: &[u8]) {
+        if let Some(startup) = self.startup_input.as_mut() {
+            startup.require_marker = true;
+        }
+        self.send_bytes(bytes);
     }
 
     fn write_input(&mut self, bytes: &[u8]) {
