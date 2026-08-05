@@ -1337,6 +1337,12 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let want = v.get("t").and_then(|t| t.as_str()).unwrap_or_default().to_string();
             let _ = tx.send(manager_view_json(&want));
         }
+        // The archive, read-only: what the manager said, kept, by day. The phone browses it —
+        // old briefings, workspace notes and memos that have since been rewritten or pruned.
+        Some("manager.archive") => {
+            let day = v.get("day").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let _ = tx.send(manager_archive_json(&day));
+        }
         Some("fs.read") => {
             let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
             let _ = tx.send(fs_read_json(path));
@@ -1555,6 +1561,58 @@ fn manager_view_json(want: &str) -> String {
     out["t"] = serde_json::Value::String(want.to_string());
     out["generated_ts"] = serde_json::json!(ts);
     out.to_string()
+}
+
+/// How many archive entries one answer carries. A day is tens of lines; the cap only matters if
+/// something floods the file, and then it is exactly what stops the flood reaching the phone.
+const ARCHIVE_MAX_ENTRIES: usize = 200;
+
+/// One archive day, newest entries first, plus the list of days that exist. The requested day is
+/// matched against the ENUMERATED list, never joined into a path — a string from a phone must
+/// not aim, same rule as everywhere else on this boundary. Unknown or empty → the newest day.
+fn manager_archive_json(day: &str) -> String {
+    let ts = crate::worklog::now_secs();
+    let Some(repo) = crate::manager::repo_dir() else {
+        return serde_json::json!({ "t": "manager.archive", "error": "no manager repo", "generated_ts": ts }).to_string();
+    };
+    let dir = repo.join("archive");
+    let mut days: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                return None;
+            }
+            p.file_stem().map(|s| s.to_string_lossy().to_string())
+        })
+        .filter(|s| s.len() == 10 && s.chars().all(|c| c.is_ascii_digit() || c == '-'))
+        .collect();
+    days.sort();
+    days.reverse();
+    let pick = if days.iter().any(|d| d == day) {
+        day.to_string()
+    } else {
+        days.first().cloned().unwrap_or_default()
+    };
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    if !pick.is_empty() {
+        for line in std::fs::read_to_string(dir.join(format!("{pick}.jsonl")))
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .take(ARCHIVE_MAX_ENTRIES)
+        {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                entries.push(v);
+            }
+        }
+    }
+    serde_json::json!({
+        "t": "manager.archive", "days": days, "day": pick, "entries": entries, "generated_ts": ts,
+    })
+    .to_string()
 }
 
 fn fs_read_json(raw: &str) -> String {

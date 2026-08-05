@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 13 -->
+<!-- mars-doc-version: 14 -->
 # Memos
 
 **Read last**, behind a closed folder, after the briefing and the board. By the time anyone opens
@@ -40,6 +40,21 @@ actions:
 It failed at 00:12, 00:26 and 00:38, each time on the same assertion. Nothing else in the run
 changed between them, so this is unlikely to be flakiness.
 ```
+
+## Write the body for handoff
+
+The captain can ASSIGN a memo: one press starts a fresh worker agent whose entire brief is your
+memo file. So write the body as if a competent stranger will pick it up cold — because one will:
+
+- **The goal in one sentence.** Not the symptom — what "fixed" looks like.
+- **The evidence, by exact path.** The failing command, the file and line, the pane whose output
+  matters. A worker can read this machine; give it addresses, not descriptions.
+- **The first step.** The command you would run first, or the file you would open. The difference
+  between a briefing and an observation is that a briefing starts somewhere.
+
+A memo that only records ("the auth test is flaky") is still worth writing — but one that can be
+handed off ("flaky since 00:12, assertion at tests/auth.rs:84, start by running
+`cargo test auth -- --nocapture` twice") turns a phone tap into delegated work.
 
 ## Fields
 

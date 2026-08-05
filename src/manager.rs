@@ -1321,11 +1321,12 @@ pub fn archive_artifacts(repo: &Path, ts: u64) {
     let mut latest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for line in std::fs::read_to_string(&day).unwrap_or_default().lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        // Memos key on their title (their identity outlives a pane); everything else on pane.
         let key = format!(
             "{}\u{1}{}\u{1}{}",
             v["session_id"].as_str().unwrap_or_default(),
             v["kind"].as_str().unwrap_or_default(),
-            v["pane"].as_str().unwrap_or_default()
+            v["title"].as_str().or_else(|| v["pane"].as_str()).unwrap_or_default()
         );
         latest.insert(key, v["text"].as_str().unwrap_or_default().to_string());
     }
@@ -1357,6 +1358,46 @@ pub fn archive_artifacts(repo: &Path, ts: u64) {
                     continue;
                 }
                 want.push(("workspace", pane, p));
+            }
+        }
+
+        // Memos too. Their files are rewritten and pruned in place, so the archive is the only
+        // place an old memo can still be read — and unlike the prose above, a reflex-written
+        // memo is still a judgement worth keeping, so no source filter here.
+        if let Ok(ms) = std::fs::read_dir(sdir.join("memos")) {
+            for m in ms.flatten() {
+                let p = m.path();
+                let ok = p.file_name().and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".md") && !n.starts_with('.'));
+                if !ok {
+                    continue;
+                }
+                let Some(text) = std::fs::read_to_string(&p).ok() else { continue };
+                let Some((front, body)) = split_front(&text) else { continue };
+                let title = front_field(front, "title")
+                    .or_else(|| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                    .unwrap_or_default();
+                let headline = front_field(front, "headline").unwrap_or_default();
+                let body = body.trim();
+                if body.is_empty() {
+                    continue;
+                }
+                let full = if headline.is_empty() { body.to_string() } else { format!("{headline}\n\n{body}") };
+                let key = format!("{sid}\u{1}memo\u{1}{title}");
+                if latest.get(&key).map(|t| t == &full).unwrap_or(false) {
+                    continue;
+                }
+                latest.insert(key, full.clone());
+                fresh.push(serde_json::json!({
+                    "at": iso(ts), "at_ts": ts,
+                    "session": name, "session_id": sid,
+                    "kind": "memo",
+                    "pane": front_field(front, "pane").map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+                    "title": title,
+                    "words": full.split_whitespace().count(),
+                    "version": version_of(&full),
+                    "text": full,
+                }));
             }
         }
 
