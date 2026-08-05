@@ -1156,7 +1156,27 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                     },
                 );
                 let provenance = "claude code".to_string();
-                let (prose, proposals) = crate::manager::split_proposals(&answer);
+                let (prose, mut proposals) = crate::manager::split_proposals(&answer);
+                // Ground `open` offers before they reach a thumb: resolve the path with the same
+                // rules the eventual fs.read will use, and drop the offer if that fails. A card
+                // for a file that will not open teaches the captain the button is decorative —
+                // and the model DOES hallucinate paths, so the check has to live here, not in
+                // the prompt.
+                proposals.retain(|p| {
+                    if p.get("verb").and_then(|x| x.as_str()) != Some("open") {
+                        return true;
+                    }
+                    match p.get("path").and_then(|x| x.as_str()).map(resolve_path) {
+                        Some(Ok(rp)) if rp.is_file() => true,
+                        _ => {
+                            crate::session::debug_log(&format!(
+                                "[rover] dropped open offer for a path that will not read: {:?}",
+                                p.get("path")
+                            ));
+                            false
+                        }
+                    }
+                });
                 let summary = if usable {
                     format!(
                         "{{\"text\":{},\"computedBy\":{},\"proposals\":{}}}",
