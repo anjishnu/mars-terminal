@@ -566,6 +566,14 @@ pub struct App {
     /// The (TermId, tail_hash) currently out to the model, so the landing result
     /// is stored against the tail it was actually computed from.
     rover_map_inflight: Option<(TermId, u64)>,
+    /// The last MAP failure per workspace: what went wrong, and the tick it happened on.
+    ///
+    /// Two jobs, both learned from one incident. It BACKS OFF — a pane whose upgrade just failed
+    /// is not retried on the next tick, because "still tier-0" was the only retry condition and a
+    /// dead endpoint therefore got hammered forever. And it is REPORTABLE — the row can say the
+    /// summary is stale because the model could not be reached, instead of showing a deterministic
+    /// line that looks like a considered answer.
+    rover_map_failed: std::collections::HashMap<TermId, (String, u64)>,
     /// REDUCE result: the composed live mission briefing pushed to the phone.
     pub rover_brief: Option<String>,
     /// Whether the current `rover_brief` is the deterministic placeholder (host
@@ -757,6 +765,7 @@ impl App {
             bg_busy: false,
             rover_summaries: HashMap::new(),
             rover_map_inflight: None,
+            rover_map_failed: std::collections::HashMap::new(),
             rover_brief: None,
             rover_brief_fallback: false,
             rover_brief_sig: 0,
@@ -1133,12 +1142,26 @@ impl App {
                         // phone shows it instantly AND escalates to Lovable; a
                         // model-produced line carries its real provenance and no flag.
                         row["summary"] = if sum.provider == "tier-0" {
-                            serde_json::json!({
-                                "text": sum.text,
-                                "computedBy": "",
-                                "fallback": true,
-                                "ts": ts,
-                            })
+                            // A tier-0 line that FAILED to upgrade is not the same as one waiting
+                            // its turn, and the phone has no way to tell them apart on its own.
+                            // Naming the reason is what stops a deterministic line from reading as
+                            // a considered answer — the same honesty `mars ls` already applies to
+                            // a failed watch.
+                            match self.rover_map_failed.get(t) {
+                                Some((err, _)) => serde_json::json!({
+                                    "text": sum.text,
+                                    "computedBy": "",
+                                    "fallback": true,
+                                    "staleReason": err,
+                                    "ts": ts,
+                                }),
+                                None => serde_json::json!({
+                                    "text": sum.text,
+                                    "computedBy": "",
+                                    "fallback": true,
+                                    "ts": ts,
+                                }),
+                            }
                         } else {
                             serde_json::json!({
                                 "text": sum.text,
@@ -5952,6 +5975,18 @@ impl App {
                         }
                     };
                     self.rover_summaries.insert(term_id, RoverSummary { text, tail_hash: hash, provider });
+                    self.rover_map_failed.remove(&term_id); // recovered — clear the back-off
+                    self.needs_redraw = true;
+                }
+                AgentEvent::RoverSummaryFailed { term_id, error } => {
+                    // Release the pane's slot so a later success is not confused for a stray, then
+                    // record the loss: the back-off reads the tick, the board reads the reason.
+                    if matches!(self.rover_map_inflight, Some((id, _)) if id == term_id) {
+                        self.rover_map_inflight = None;
+                    }
+                    let first = error.lines().next().unwrap_or("").trim();
+                    let first: String = first.chars().take(160).collect();
+                    self.rover_map_failed.insert(term_id, (first, self.frame_tick));
                     self.needs_redraw = true;
                 }
                 AgentEvent::RoverBrief { text } => {
@@ -6789,6 +6824,19 @@ impl App {
                 .unwrap_or(false);
             if !stale {
                 continue;
+            }
+            // BACK OFF after a loss. "Still tier-0" was the only condition, so an unreachable
+            // endpoint was retried on every eligible tick forever — measured at 16,552 failed
+            // calls across two days. Wait an order of magnitude longer than the normal interval
+            // before trying that pane again; a success clears this immediately, so a recovered
+            // network costs one interval, not a restart.
+            if let Some((_, at)) = self.rover_map_failed.get(&id) {
+                let backoff = (self.tuning.rover_map_min_secs * 10 * 1000
+                    / self.tuning.poll_interval_ms.max(1))
+                .max(1);
+                if self.frame_tick.saturating_sub(*at) < backoff {
+                    continue;
+                }
             }
             let tail = self.terminal_tail(id, self.tuning.agent_scrollback_context);
             if tail.trim().is_empty() {

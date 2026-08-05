@@ -644,6 +644,7 @@ fn ask_cli(question: String) -> Result<()> {
             | agent::AgentEvent::ShiftDone
             | agent::AgentEvent::Goals { .. }
             | agent::AgentEvent::RoverSummary { .. }
+            | agent::AgentEvent::RoverSummaryFailed { .. }
             | agent::AgentEvent::RoverBrief { .. }
             | agent::AgentEvent::ShellTranslation { .. } => return Ok(()),
             agent::AgentEvent::Error(e) => anyhow::bail!("agent error: {}", e),

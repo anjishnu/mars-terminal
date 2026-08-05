@@ -106,6 +106,11 @@ pub enum AgentEvent {
     /// Rover MAP: one-line summary of one workspace's RAW tail, keyed by term id,
     /// with provider provenance. Cached on the app and pushed in the board frame.
     RoverSummary { term_id: usize, text: String, provider: String },
+    /// Rover MAP: the call LOST. Silence used to be the only signal, and it is indistinguishable
+    /// from "not tried yet" — so the row kept its deterministic tier-0 line, the next tick saw a
+    /// tier-0 line and fired again, and a DNS outage turned into 16,552 failed calls in two days
+    /// with nothing on any surface saying the upgrade had ever been attempted.
+    RoverSummaryFailed { term_id: usize, error: String },
     /// Rover REDUCE: the composed mission briefing over the cached per-workspace
     /// summaries, pushed live to a subscribed phone via the Briefing frame.
     RoverBrief { text: String },
@@ -622,14 +627,26 @@ pub fn rover_summarize(cfg: AgentConfig, term_id: usize, tail: String, tx: mpsc:
             messages.push(p); // VOICE-ish: the line is read on a phone glance
         }
         messages.push(serde_json::json!({ "role": "user", "content": tail }));
-        if let Ok(text) = chat(&cfg, messages, "summarize") {
-            let line = text.trim().lines().next().unwrap_or("").trim().to_string();
-            if !line.is_empty() {
-                let _ = tx.send(AgentEvent::RoverSummary {
-                    term_id,
-                    text: line,
-                    provider: provenance(&cfg),
-                });
+        // REPORT the loss, never swallow it. Both arms of the old `if let Ok(_)`/`if !empty`
+        // dropped their failure on the floor, which is what let a two-day outage stay invisible.
+        match chat(&cfg, messages, "summarize") {
+            Ok(text) => {
+                let line = text.trim().lines().next().unwrap_or("").trim().to_string();
+                if line.is_empty() {
+                    let _ = tx.send(AgentEvent::RoverSummaryFailed {
+                        term_id,
+                        error: "model returned an empty summary".into(),
+                    });
+                } else {
+                    let _ = tx.send(AgentEvent::RoverSummary {
+                        term_id,
+                        text: line,
+                        provider: provenance(&cfg),
+                    });
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(AgentEvent::RoverSummaryFailed { term_id, error: e.to_string() });
             }
         }
         let _ = tx.send(AgentEvent::BgDone); // always release the gate
