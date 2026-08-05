@@ -173,6 +173,11 @@ pub struct Tuning {
     /// several intervals instead of hammering the model. Only active while a phone
     /// is subscribed and a key is configured.
     pub rover_map_min_secs: u64,
+    /// Minimum seconds between samples of each board pane's FOREGROUND COMMAND (what the
+    /// phone's board labels an agent pane with). Every sample spawns `ps`, so this is a
+    /// process-per-pane-per-interval cost and must not be read per board push — the push
+    /// cadence is far faster than anything a running command changes at.
+    pub foreground_sample_secs: u64,
     /// Minimum seconds between Rover REDUCE calls (the mission briefing composed
     /// from the summaries). It only re-runs when a summary/verdict actually
     /// changed; this bounds how often a burst of map updates re-briefs.
@@ -264,6 +269,7 @@ impl Default for Tuning {
                     .into(),
             manager_agent_stale_secs: 2700,
             rover_map_min_secs: 1,
+            foreground_sample_secs: 4,
             rover_brief_min_secs: 12,
             palette: Palette::mission_control(),
         }
@@ -545,6 +551,11 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "Minimum seconds between Rover per-workspace summary (MAP) calls. One \
              changed workspace is re-summarized per interval; idle workspaces are \
              never re-summarized. Only fires while a phone is subscribed.")),
+        ("foreground_sample_secs", knob(json!(d.foreground_sample_secs),
+            "Minimum seconds between samples of each board pane's foreground command \
+             (used to label agent panes on the phone). Each sample spawns `ps` per \
+             pane, so lowering this costs processes; raising it only delays how fast a \
+             pane's label catches up. Only sampled while a phone is subscribed.")),
         ("rover_brief_min_secs", knob(json!(d.rover_brief_min_secs),
             "Minimum seconds between Rover mission-briefing (REDUCE) calls, which \
              compose the briefing from the cached summaries. Re-runs only when a \
@@ -709,6 +720,7 @@ pub fn load() -> Tuning {
             get_u64(&map, "terminal_line_log_bytes", t.terminal_line_log_bytes as u64).max(64 * 1024) as usize;
         t.rover_map_min_secs = get_u64(&map, "rover_map_min_secs", t.rover_map_min_secs).max(1);
         t.rover_brief_min_secs = get_u64(&map, "rover_brief_min_secs", t.rover_brief_min_secs).max(1);
+        t.foreground_sample_secs = get_u64(&map, "foreground_sample_secs", t.foreground_sample_secs).max(1);
         if let Some(list) = map.get("project_ignore").and_then(|e| e.value.as_array()) {
             let dirs: Vec<String> =
                 list.iter().filter_map(|v| v.as_str().map(String::from)).collect();

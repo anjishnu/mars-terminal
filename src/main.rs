@@ -7012,6 +7012,49 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] manager: hidden tab is invisible to rotation, bar and board ... PASS");
     }
 
+    // 62. The board says what a pane is RUNNING, so an agent reads as one.
+    //
+    // The daemon has always known (`Terminal::foreground_command`), but nothing carried it to the
+    // phone — a `claude` mid-task and an unfinished `ls` produced identical rows. The sample is a
+    // `ps` per pane, so it is cached and slow-timed; what matters here is the wire contract and
+    // that a pane which goes quiet LOSES the label rather than keeping a stale one.
+    {
+        let mut app = App::new(None)?;
+        app.rover_active = true;
+        app.open_terminal();
+        let tid = match app.focused_pane().content {
+            pane::PaneContent::Terminal(t) => t,
+            _ => panic!("open_terminal did not focus a terminal pane"),
+        };
+
+        let board = app.mobile_board_json();
+        assert!(!board.contains("\"cmd\""),
+            "an unsampled pane already claimed a running command: {board}");
+
+        app.fg_commands.insert(tid, "claude".into());
+        let board = app.mobile_board_json();
+        let v: serde_json::Value = serde_json::from_str(&board)?;
+        let row = v["rows"].as_array().and_then(|r| r.first()).cloned().unwrap_or_default();
+        assert_eq!(row["cmd"].as_str(), Some("claude"),
+            "the board dropped the pane's foreground command: {board}");
+
+        // Quiet again → the label goes. A row still saying `claude` after the agent exited is a
+        // worse answer than a row that says nothing.
+        app.fg_commands.remove(&tid);
+        let board = app.mobile_board_json();
+        assert!(!board.contains("\"cmd\""),
+            "the command label outlived the command: {board}");
+
+        // Nobody watching → nothing sampled. The label exists for the phone, and a desktop that
+        // no one is glancing at must not pay a process per pane for it.
+        app.rover_active = false;
+        app.fg_commands.insert(tid, "claude".into());
+        app.maybe_sample_foreground();
+        assert!(app.fg_commands.is_empty(),
+            "foreground sampling kept state with no phone subscribed");
+        println!("[selfcheck] rover: the board says what a pane is running ... PASS");
+    }
+
     let _ = std::fs::remove_file(&worklog_default);
     std::env::remove_var("MARS_WORKLOG");
 

@@ -566,6 +566,18 @@ pub struct App {
     /// The (TermId, tail_hash) currently out to the model, so the landing result
     /// is stored against the tail it was actually computed from.
     rover_map_inflight: Option<(TermId, u64)>,
+    /// What each board pane is actually RUNNING (`claude`, `cargo`, …), sampled.
+    ///
+    /// Mars has always been able to answer this — `Terminal::foreground_command()` asks the PTY's
+    /// foreground process group — but the only caller was the restore writer, so the phone's board
+    /// could not tell an agent pane from a `ls` that had not finished. `last_command` is not a
+    /// substitute: it records what MARS typed, so a `claude` the engineer started by hand is
+    /// invisible to it.
+    ///
+    /// Cached because the answer costs a `ps` PROCESS. The board is built by a `&self` method on
+    /// the push cadence, which must stay pure and cheap; this is filled on a slow timer instead,
+    /// and a running command changes far slower than the board is pushed.
+    pub fg_commands: std::collections::HashMap<TermId, String>,
     /// The last MAP failure per workspace: what went wrong, and the tick it happened on.
     ///
     /// Two jobs, both learned from one incident. It BACKS OFF — a pane whose upgrade just failed
@@ -766,6 +778,7 @@ impl App {
             rover_summaries: HashMap::new(),
             rover_map_inflight: None,
             rover_map_failed: std::collections::HashMap::new(),
+            fg_commands: std::collections::HashMap::new(),
             rover_brief: None,
             rover_brief_fallback: false,
             rover_brief_sig: 0,
@@ -1126,6 +1139,15 @@ impl App {
                     // nothing had ever told it which one that was, so the rule was dead text.
                     "focused": s.pane_id == self.focused_pane_id(),
                 });
+                // What this pane is RUNNING. The board could say a workspace was busy but never
+                // what it was busy with, so a coding agent mid-task and a slow `ls` were the same
+                // row. Sent as the command name rather than an `isAgent` flag: it is the honest
+                // fact, it costs the same, and the phone can decide which names deserve a mark.
+                if let Some(PaneContent::Terminal(t)) = self.panes.get(&s.pane_id).map(|p| &p.content) {
+                    if let Some(cmd) = self.fg_commands.get(t) {
+                        row["cmd"] = serde_json::json!(cmd);
+                    }
+                }
                 if blocked {
                     row["blocked"] = serde_json::json!({
                         "prompt": prompt,
@@ -6005,6 +6027,7 @@ impl App {
         // per-workspace MAP, then the REDUCE that composes the briefing from it.
         // After the higher-priority watch verdicts, so a phone glance never starves
         // the desktop's own supervision.
+        self.maybe_sample_foreground();
         self.maybe_rover_map();
         self.maybe_rover_brief();
 
@@ -6764,6 +6787,34 @@ impl App {
                 }
             })
             .collect()
+    }
+
+    /// Sample what each board pane is running, on a slow timer, for the phone's board.
+    ///
+    /// Only while a phone is subscribed: this exists to label rows on Rover, and every pass costs
+    /// one `ps` per board pane. A desktop that nobody is glancing at should not be paying for it.
+    ///
+    /// Panes that have gone quiet are DROPPED rather than left holding their last command — a row
+    /// still labelled `claude` after the agent exited is a worse answer than an unlabelled one.
+    pub fn maybe_sample_foreground(&mut self) {
+        if !self.rover_active {
+            self.fg_commands.clear();
+            return;
+        }
+        let ticks = (self.tuning.foreground_sample_secs * 1000
+            / self.tuning.poll_interval_ms.max(1))
+        .max(1);
+        if self.frame_tick % ticks != 0 {
+            return;
+        }
+        let ids = self.rover_terminal_surfaces();
+        self.fg_commands.retain(|id, _| ids.contains(id));
+        for id in ids {
+            match self.terms.get(&id).and_then(|t| t.foreground_command()) {
+                Some(cmd) => { self.fg_commands.insert(id, cmd); }
+                None => { self.fg_commands.remove(&id); } // at a prompt: nothing is running
+            }
+        }
     }
 
     /// Rover MAP (daemon-side, incremental): (re)summarize the ONE workspace

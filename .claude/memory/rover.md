@@ -44,8 +44,25 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   screen in **colour**: the daemon serialises with vt100 **`rows_formatted`** (per-row ANSI SGR,
   not `contents()`), and the phone parses SGR into styled spans in **`src/rover/ansi.ts`** —
   **no xterm** (it broke the Lovable build via a zod v3/v4 clash; we only display, never emulate).
-- **Live typing**: the dive has a hidden `<textarea>` sink — non-printable keys mapped in
-  `nonPrintable()` (onKeyDown), printable/IME via onInput — each keystroke → `{t:"key",paneId,data}`.
+- **Typing into a pane** (corrected 2026-08-04 — the old "hidden `<textarea>` sink in the dive"
+  note described `RawScreen.tsx` and is no longer true of the shipped surface): the ONLY
+  production path is `CommandComposer` (`ui/Command.tsx`). `TerminalSurface.tsx`'s own
+  `{t:"key"}` send is gated behind `import.meta.env.DEV && hash.includes("probe=1")`, so the
+  dive itself is read-only in a deployed build. `ui/KeyBar.tsx` is DEAD CODE — nothing imports
+  it; the real key list is `RAW_KEYS` in `Command.tsx`, frecency-sorted, so a newly added key
+  sorts to zero and sits below anything you've used (it looks missing without scrolling).
+- **Wire path**: `{t:"key",paneId}` → bridge parses paneId as `usize` → `ClientFrame::PaneInput`
+  → `App::write_to_pane` → `send_bytes`. A paneId that fails `parse::<usize>()` falls through to
+  `ClientFrame::Paste`, which goes to the **focused** pane — a silent misroute (`serve.rs` emits
+  a literal `"main"` on the attach-mode rung, so this is reachable). Non-terminal panes are a
+  silent no-op.
+- **OPEN BUG — text into a Claude Code pane composes but never submits.** `write_to_pane` writes
+  raw bytes; the desktop paste path (`App::paste_text`, `app.rs` ~2064) wraps in `ESC[200~`/
+  `ESC[201~` when `t.screen().bracketed_paste()`. Unmarked, Claude Code applies its own burst
+  heuristic and swallows the following CR as a literal newline. `Command.tsx: toPane()` tries to
+  dodge this with a 180ms gap before the Enter — insufficient. Real fix is to bracket the text
+  and send the CR as a separate key; `answer` (`y\n`) and `act` (`cmd\n`) must NOT be bracketed,
+  their newline is the submit. Attempted 2026-08-04, reverted unmerged at the engineer's request.
 - **Session rename**: phone sends `{t:"rename",name}`; the bridge carries `ClientFrame::Rename` on a
   FRESH connection (the subscribe writer would get closed) → daemon fs-renames → next board snapshot
   returns the new name. Registry mirror via `renameSession(daemonId,name)`.
@@ -55,6 +72,17 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   (was Day), **Hacker** (was Phosphor), Amber. Old ids migrated on load (`THEME_ALIASES`).
 - **PWA**: `public/rover.webmanifest` (scope `/rover`) + terracotta-circle-on-black icons
   (`rover-icon-{192,512,maskable}.png`, `apple-touch-icon.png`), linked in `routes/__root.tsx`.
+- **ALWAYS bump `CACHE = "rover-vNN"` in `public/sw.js` when shipping anything a phone renders.**
+  The service worker re-installs only when its OWN bytes change, so without a bump it never
+  re-activates and never purges: the change is live on the server and invisible on the device.
+  Cost this a whole debug round on 2026-08-04 — the code was confirmed in the pushed source AND
+  in the built bundle while the phone still showed the old menu. Two app launches to land (an
+  update activates on the launch AFTER the one that fetches it).
+- **iOS gets only half of the keyboard compensation.** `interactive-widget=resizes-content`
+  (`routes/__root.tsx`) is Android/Chrome only; iOS Safari overlays the keyboard and SCROLLS the
+  visual viewport instead. Track `visualViewport.offsetTop` and translate the frame by it, not
+  just `.height` — `RoverApp.tsx` does both now. `offsetTop` stays 0 on Android, so it needs no
+  platform sniff. The frame carries `zoom: scale`, so viewport pixels are ÷scale.
 - **Routing**: 1 paired session → its briefing is home (fleet is a menu item); 0 or many → fleet hub.
   A QR scan always routes through the loading screen (RoverProvider keyed on daemonId → remount).
 
