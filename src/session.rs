@@ -1549,6 +1549,16 @@ pub(crate) fn isolate_session_daemon_env(command: &mut std::process::Command) {
         "MARS_SESSION_ID",
         "MARS_AUTH_SOCK",
         "MARS_BROKER_CAPABILITY",
+        // Claude Code's own session markers. A daemon started from inside a Claude session (a
+        // reboot typed into an agent pane, an agent-run install) inherits them, and every claude
+        // it then spawns believes it is a CHILD session: transcript saving off, no session file,
+        // no id — which is why restore.json captured chat:"" and a reboot resumed fresh
+        // conversations instead of the ones it promised. The daemon outlives whatever started
+        // it; its environment must too.
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SSE_PORT",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDECODE",
     ] {
         command.env_remove(name);
     }
@@ -1891,11 +1901,19 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
         );
     }
 
-    // The bridge goes too. It is a separate process running its own copy of the code, so leaving
-    // it up would upgrade the worker and silently keep serving the phone from yesterday's build.
-    // The new daemon starts a fresh one on boot, so this is a replacement rather than a loss.
-    if stop_bridge() {
-        println!("  bridge stopped — the new session will start one");
+    // The bridge goes too — but ONLY when this session is the paired one. It is a separate
+    // process running its own copy of the code, so leaving it up would upgrade the worker and
+    // silently keep serving the phone from yesterday's build; the new daemon starts a fresh one
+    // on boot, so for the paired session this is a replacement rather than a loss. For any OTHER
+    // session it was pure loss: `ensure_bridge` on the rebooted daemon would see "somebody
+    // else's phone" and start nothing, so rebooting an unpaired session cut the phone off and
+    // printed a promise nobody was going to keep.
+    let this_dir = crate::manager::existing_session_dir_pub(&name)
+        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()));
+    if this_dir.as_deref() == paired_session().as_deref() && this_dir.is_some() {
+        if stop_bridge() {
+            println!("  bridge stopped — the new session will start one");
+        }
     }
     // Graceful: the daemon flushes its state and removes its own socket. kill_main already waits
     // for the socket to disappear, which is the only reliable "it is really gone".
