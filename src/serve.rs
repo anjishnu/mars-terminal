@@ -762,6 +762,70 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(40))).ok();
     let mut ws = accept(stream).map_err(|e| anyhow!("ws handshake failed: {e}"))?;
 
+    // ── Phase 1: authenticate, and learn WHICH session this phone wants ─────────────────────
+    //
+    // One machine has one bridge (one port, one tunnel) but may run many sessions — and a QR for
+    // a second session used to route to whichever session the bridge was bound to, so 'replyguy'
+    // paired fine and then showed daemon-restart's board. The phone's hello now carries `s`, and
+    // the daemon is dialed AFTER auth, per connection, for the session actually asked for. An
+    // older phone sends no `s` and gets the bridge's own session, exactly as before.
+    let valid = read_token();
+    let mut wanted: Option<String> = None;
+    let auth_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if Instant::now() > auth_deadline {
+            return Ok(()); // never presented a valid token → refuse
+        }
+        match ws.read() {
+            Ok(Message::Text(txt)) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if v.get("t").and_then(|t| t.as_str()) == Some("hello") {
+                        wanted = v.get("s").and_then(|s| s.as_str()).map(String::from).filter(|s| !s.is_empty());
+                    }
+                }
+                match auth_result(&txt, valid.as_deref()) {
+                    AuthCheck::Ok => break,
+                    AuthCheck::Bad => {
+                        // A beat before refusing: the token is 128 bits so brute force is a
+                        // fantasy, but a guessing loop gets nothing for free either.
+                        thread::sleep(Duration::from_millis(250));
+                        return Ok(());
+                    }
+                    AuthCheck::Other => {} // subscribe before auth → keep waiting
+                }
+            }
+            Ok(Message::Close(_)) => return Ok(()),
+            Ok(_) => {}
+            Err(WsError::Io(e))
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return Ok(()),
+        }
+    }
+
+    // ── Phase 2: resolve the daemon for the REQUESTED session, then bridge ──────────────────
+    let socket_buf: std::path::PathBuf = match &wanted {
+        Some(name) => {
+            let p = session::socket_path(name).ok();
+            match p.filter(|p| session::identify(p).is_some()) {
+                Some(p) => p,
+                None => {
+                    // Refuse LOUDLY: an empty board wearing the right name is the failure mode
+                    // that makes a misrouted bridge indistinguishable from a broken phone.
+                    let _ = ws.send(Message::Text(format!(
+                        "{{\"t\":\"bye\",\"message\":{}}}",
+                        json_str(&format!("session '{name}' is not running on this machine"))
+                    )));
+                    return Ok(());
+                }
+            }
+        }
+        None => socket.to_path_buf(),
+    };
+    let socket: &std::path::Path = &socket_buf;
+
     // Dial the daemon as a READ-ONLY subscriber (non-takeover) — a phone glancing in
     // must not kick the person at the keyboard. The daemon pushes structured Board /
     // Briefing frames; it does not become the owning client.
