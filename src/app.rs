@@ -419,6 +419,9 @@ pub struct App {
     /// absent) rewrote the manifest as bare shells — and a daemon that then died took the real
     /// one with it.
     pub restore_promise: Option<(usize, u64)>,
+    /// Why `should_quit` was set. A daemon that exits headlessly leaves this as its note — the
+    /// August 5 death printed only "ended cleanly", which made the post-mortem a guessing game.
+    pub quit_reason: Option<String>,
     pub keys: KeyBindings,
     pub frecency: HashMap<String, u32>,
     // ── Non-modal editing state ──
@@ -711,6 +714,7 @@ impl App {
             status_msg: None,
             should_quit: false,
             restore_promise: None,
+            quit_reason: None,
             keys,
             frecency: state.frecency,
             pending_prefix: Vec::new(),
@@ -2511,6 +2515,7 @@ impl App {
     fn request_quit(&mut self) {
         let dirty = self.buffers.values().filter(|b| b.modified).count();
         if dirty == 0 {
+            self.quit_reason.get_or_insert_with(|| "quit requested".into());
             self.should_quit = true;
         } else {
             self.start_prompt(
@@ -2821,6 +2826,7 @@ impl App {
     pub fn close_tab(&mut self) {
         let force = std::mem::take(&mut self.force_close_confirm);
         if self.tabs.len() == 1 {
+            self.quit_reason.get_or_insert_with(|| "last tab closed".into());
             self.request_quit(); // quit has its own dirty-buffer gate
             return;
         }
@@ -3463,6 +3469,7 @@ impl App {
                 let unsaved = self.save_all();
                 self.close_prompt();
                 if unsaved.is_empty() {
+                    self.quit_reason.get_or_insert_with(|| "quit confirmed (save all)".into());
                     self.should_quit = true;
                 } else {
                     self.status_msg = Some(format!(
@@ -3473,6 +3480,7 @@ impl App {
             }
             KeyCode::Char('q') | KeyCode::Char('!') => {
                 self.close_prompt();
+                self.quit_reason.get_or_insert_with(|| "quit confirmed (discard)".into());
                 self.should_quit = true;
             }
             KeyCode::Esc | KeyCode::Char('n') => self.close_prompt(),

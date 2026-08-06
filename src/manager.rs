@@ -145,7 +145,10 @@ fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
         let Ok(text) = std::fs::read_to_string(&p) else { continue };
         let Some((front, _)) = split_front(&text) else { continue };
         out.push(OpenCard {
-            id: front_field(front, "id").unwrap_or_default(),
+            // Synthesize from the filename when the frontmatter has no id: an empty id
+            // duplicated React keys on the phone, wrote acts as "assign-", and made dismissal
+            // identity meaningless. The stem is stable for the file's whole life.
+            id: front_field(front, "id").filter(|s| !s.is_empty()).unwrap_or_else(|| stem.clone()),
             file: p,
             session: front_field(front, "session").unwrap_or_default(),
             pane: front_field(front, "pane").unwrap_or_default(),

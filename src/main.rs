@@ -366,9 +366,10 @@ fn main() -> Result<()> {
             // stderr is the session log file (set up by `mars new`).
             eprintln!("[mars] session '{name}' starting (pid {})", std::process::id());
             let result = session::server_main(&name, args.next());
+            let at = manager::iso(worklog::now_secs());
             match &result {
-                Ok(_) => eprintln!("[mars] session '{name}' ended cleanly"),
-                Err(e) => eprintln!("[mars] session '{name}' died: {e}"),
+                Ok(_) => eprintln!("[mars] {at} session '{name}' ended cleanly"),
+                Err(e) => eprintln!("[mars] {at} session '{name}' died: {e}"),
             }
             return result;
         }

@@ -836,6 +836,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             }
             Ok(SrvEvent::Kill) => {
                 app.autosave();
+                app.quit_reason.get_or_insert_with(|| "kill frame (mars kill / reboot)".into());
                 app.should_quit = true; // forced: `mars kill` skips the dirty guard
             }
             Ok(SrvEvent::OpenFile(path)) => {
@@ -1173,6 +1174,13 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             if let Some((s, _)) = client.take() {
                 let _ = send_exit(&s, "session ended");
             }
+            // The death note, timestamped. "ended cleanly" alone made the August 5 exit a
+            // forensic dead end — every quit now says what asked for it and when.
+            eprintln!(
+                "[mars] {} quitting: {}",
+                crate::manager::iso(crate::worklog::now_secs()),
+                app.quit_reason.as_deref().unwrap_or("unknown — should_quit set without a reason")
+            );
             break;
         }
     }
