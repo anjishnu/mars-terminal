@@ -938,9 +938,23 @@ fn auth_result(txt: &str, valid: Option<&str>) -> AuthCheck {
         return AuthCheck::Other;
     }
     match (valid, v.get("token").and_then(|t| t.as_str())) {
-        (Some(a), Some(b)) if a == b => AuthCheck::Ok,
+        (Some(a), Some(b)) if ct_eq(a.as_bytes(), b.as_bytes()) => AuthCheck::Ok,
         _ => AuthCheck::Bad,
     }
+}
+
+/// Constant-time equality for the pairing token. `==` on strings returns at the first differing
+/// byte, and this check faces a PUBLIC tunnel URL — a remote caller who can time rejections can
+/// grow a matching prefix byte by byte. Compare every byte regardless, fold the differences, and
+/// let the length difference poison the result the same way.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
 }
 
 /// The LLM proxy: run the agent on the HOST, with the key that's already in this
@@ -1886,67 +1900,6 @@ pub fn print_checks(group: &str, checks: &[Check]) {
     }
 }
 
-// ── Guided fixes ─────────────────────────────────────────────────────────────────────────
-//
-// We open pages, take a paste, and write config. We never install software: putting things on
-// someone's machine is their call, so `brew install …` is printed rather than run.
-
-fn open_page(url: &str) {
-    println!("  \x1b[38;5;244mopening {url}\x1b[0m");
-    let _ = std::process::Command::new("open").arg(url).status();
-}
-
-fn prompt(label: &str) -> Option<String> {
-    use std::io::Write;
-    print!("  {label} ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return None;
-    }
-    let t = line.trim().to_string();
-    (!t.is_empty()).then_some(t)
-}
-
-/// Walk the two gaps that are ours to close. Returns the checks as they stand afterwards, so the
-/// caller re-reads reality rather than assuming the fix worked.
-pub fn guided_bridge_setup(checks: &[Check]) -> Result<()> {
-    let failed = |n: &str| checks.iter().any(|c| c.name == n && c.failed());
-    let skipped = |n: &str| checks.iter().any(|c| c.name == n && matches!(c.state, CheckState::Skip(_)));
-
-    if failed("authtoken") {
-        println!();
-        println!("  ngrok needs an authtoken before it can open a tunnel. Free, about a minute.");
-        open_page("https://dashboard.ngrok.com/get-started/your-authtoken");
-        if let Some(token) = prompt("Paste your authtoken (Enter to skip):") {
-            let st = std::process::Command::new("ngrok")
-                .args(["config", "add-authtoken", &token])
-                .status();
-            match st {
-                Ok(s) if s.success() => println!("  \x1b[38;5;35m✓\x1b[0m authtoken     saved"),
-                _ => println!("  \x1b[38;5;208m✗\x1b[0m authtoken     ngrok rejected it"),
-            }
-        }
-    }
-
-    if skipped("stable URL") {
-        println!();
-        println!("  A static domain keeps this QR working across restarts — free, one per account.");
-        open_page("https://dashboard.ngrok.com/domains");
-        if let Some(d) = prompt("Paste your domain (Enter to skip):") {
-            let d = d.trim().trim_start_matches("https://").trim_end_matches('/').to_string();
-            if d.contains('.') && !d.contains(' ') {
-                set_ngrok_domain(&d)?;
-                println!("  \x1b[38;5;35m✓\x1b[0m stable URL    saved to ~/.mars/config.json");
-            } else {
-                println!("  \x1b[38;5;208m✗\x1b[0m stable URL    that does not look like a domain");
-            }
-        } else {
-            println!("  \x1b[38;5;244m·\x1b[0m ephemeral — this QR stops working when the bridge restarts");
-        }
-    }
-    Ok(())
-}
 
 /// Exercise the public path before showing a QR.
 ///

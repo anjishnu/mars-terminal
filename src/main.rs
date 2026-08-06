@@ -6977,6 +6977,22 @@ fn selfcheck() -> Result<()> {
         }
         println!("[selfcheck] reboot: the manifest survives its own restore ... PASS");
 
+        #[cfg(feature = "web")]
+        {
+            // The pairing token faces a public tunnel URL, so equality must not leak a matching
+            // prefix through early return. Shape checks, mutation-minded: every byte counts, both
+            // lengths count, and a prefix is never a match.
+            assert!(serve::ct_eq(b"secret-token", b"secret-token"));
+            assert!(!serve::ct_eq(b"secret-token", b"secret-tokeX"), "the last byte must count");
+            assert!(!serve::ct_eq(b"Xecret-token", b"secret-token"), "the first byte must count");
+            assert!(!serve::ct_eq(b"secret", b"secret-token"), "a matching prefix is not a match");
+            assert!(!serve::ct_eq(b"secret-token", b"secret"), "length asymmetry either way");
+            assert!(serve::ct_eq(b"", b""));
+            assert!(!serve::ct_eq(b"", b"x"));
+        }
+        #[cfg(feature = "web")]
+        println!("[selfcheck] bridge: token equality has constant-time shape ... PASS");
+
     }
 
     // ── The manager's hidden tab ────────────────────────────────────────────────────────
