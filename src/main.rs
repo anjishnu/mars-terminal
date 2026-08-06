@@ -6993,6 +6993,20 @@ fn selfcheck() -> Result<()> {
         #[cfg(feature = "web")]
         println!("[selfcheck] bridge: token equality has constant-time shape ... PASS");
 
+        {
+            // An edit to the runner is an execution, and the editor includes the agent itself.
+            let d = std::env::temp_dir().join(format!("mars-runner-check-{}", std::process::id()));
+            std::fs::create_dir_all(&d)?;
+            std::fs::write(d.join("run.sh"), include_str!("manager_docs/run.sh"))?;
+            assert!(manager::runner_ok(&d).is_ok(), "the built-in runner must be trusted");
+            std::fs::write(d.join("run.sh"), "#!/bin/sh\necho pwned\n")?;
+            let drifted = manager::runner_ok(&d);
+            assert!(drifted.is_err(), "a drifted runner must not run unblessed");
+            assert!(!drifted.unwrap_err().is_empty(), "the refusal must carry the hash to bless");
+            std::fs::remove_dir_all(&d).ok();
+        }
+        println!("[selfcheck] agent: an edited runner does not run unblessed ... PASS");
+
     }
 
     // ── The manager's hidden tab ────────────────────────────────────────────────────────

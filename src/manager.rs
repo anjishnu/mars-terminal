@@ -2522,6 +2522,18 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
             let _ = std::fs::write(&batch, v.to_string());
         }
     }
+    // The runner is the one file whose EDIT is an EXECUTION: the agent writes freely inside its
+    // scope, run.sh lives there, and this line runs it. Gate it before the spawn — see
+    // `runner_ok` for why the blessing lives outside the agent's reach.
+    if let Err(h) = runner_ok(&repo) {
+        let msg = format!(
+            "run.sh differs from the built-in and is not blessed — refusing to run the agent.\n\
+             If you edited it deliberately:  echo {h} > ~/.mars/runner.approved\n\
+             If you did not: delete ~/.mars/manager/run.sh and it re-materializes clean."
+        );
+        eprintln!("{msg}");
+        return Ok(msg);
+    }
     println!("running batch {name} …");
     let started = std::time::Instant::now();
     let out = std::process::Command::new("sh")
@@ -2535,6 +2547,30 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
     }
     score_runs(&repo, ts + secs + 1);
     Ok(format!("turn finished in {secs}s (exit {})", out.status))
+}
+
+/// May run.sh be exec'd? The runner is editable on purpose ("changed with an editor instead of a
+/// rebuild") — but the agent that runs under acceptEdits can edit it too, and an edit to the
+/// runner IS arbitrary shell on the next tick. So a drifted runner needs a blessing that lives
+/// where the agent's edits cannot: ~/.mars/runner.approved holds the hash of the human-approved
+/// text, OUTSIDE the agent's --add-dir scope and its cwd. Any file-based blessing inside the
+/// scope would be written by the same actor it gates.
+///
+/// Ok when the runner matches the built-in copy or the blessed hash; Err(current_hash) so the
+/// caller can print the exact blessing command.
+pub fn runner_ok(repo: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(repo.join("run.sh")).unwrap_or_default();
+    if text == include_str!("manager_docs/run.sh") {
+        return Ok(());
+    }
+    let h = version_of(&text);
+    let blessed = crate::sys::paths::home_dir()
+        .and_then(|hm| std::fs::read_to_string(hm.join(".mars/runner.approved")).ok())
+        .map(|s| s.trim().to_string());
+    if blessed.as_deref() == Some(h.as_str()) {
+        return Ok(());
+    }
+    Err(h)
 }
 
 /// Why the agent is or is not about to run. Every gate, in one place, instead of five files.

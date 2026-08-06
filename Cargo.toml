@@ -2,7 +2,7 @@
 # `mars` is taken on crates.io, so the package/crate name is `mars-terminal`.
 # The installed binary stays `mars` regardless (see [[bin]] below).
 name = "mars-terminal"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 # The dependency tree pulls edition2024 crates → a modern toolchain is required.
 # Declaring it makes cargo say "requires rustc 1.85" instead of a cryptic dep error.

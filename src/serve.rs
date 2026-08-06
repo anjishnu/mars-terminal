@@ -926,6 +926,25 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Model calls cost real quota and this socket faces a public tunnel URL — an authenticated
+/// caller still gets a ceiling. One fixed window shared by every model-spending intent
+/// (chat/ask/summarize): generous for two thumbs, ruinous for a loop. Refusals are said out
+/// loud on the same channel the answer would have used, never silently dropped.
+pub fn llm_spend_allowed() -> bool {
+    const MAX_PER_MIN: u32 = 12;
+    static WINDOW: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+    let now = crate::worklog::now_secs() / 60;
+    let Ok(mut w) = WINDOW.lock() else { return false };
+    if now != w.0 {
+        *w = (now, 0);
+    }
+    if w.1 >= MAX_PER_MIN {
+        return false;
+    }
+    w.1 += 1;
+    true
+}
+
 enum AuthCheck { Ok, Bad, Other }
 /// Classify a pre-auth inbound frame: the phone's `{t:"auth",token}` matching the valid token, an
 /// auth carrying the WRONG token, or anything else (a hello/subscribe sent before the auth frame).
@@ -1116,6 +1135,12 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             if q.trim().is_empty() {
                 return;
             }
+            if !llm_spend_allowed() {
+                let _ = tx.send(
+                    "{\"t\":\"summary\",\"id\":\"chat\",\"summary\":{\"text\":\"Easy, captain — that's the model-call ceiling for this minute. Ask again shortly.\",\"computedBy\":\"rate-limit\"}}".to_string(),
+                );
+                return;
+            }
             crate::manager::record_client_event("chat", &v, crate::worklog::now_secs());
             // Put the TARGET in front of the model. Without this the chat is an oracle that
             // cannot see the machine it is being asked about — "why did it fail?" is unanswerable
@@ -1232,6 +1257,13 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 v.get("q").and_then(|x| x.as_str()).unwrap_or("").to_string()
             };
             if q.trim().is_empty() {
+                return;
+            }
+            if !llm_spend_allowed() {
+                let _ = tx.send(format!(
+                    "{{\"t\":\"summary\",\"id\":{},\"summary\":{{\"text\":\"rate limit — try again in a minute\",\"computedBy\":\"rate-limit\"}}}}",
+                    json_str(&id)
+                ));
                 return;
             }
             let tx2 = tx.clone();
