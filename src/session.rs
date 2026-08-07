@@ -1293,6 +1293,15 @@ fn client_connection(
                             break;
                         }
                     }
+                    // End the session from a subscriber (the phone's end_session card). Kill
+                    // was only honoured as a connection's FIRST frame — the `mars kill` path —
+                    // so the bridge's forwarded Kill was read here and silently dropped: the
+                    // card charged red, the daemon shrugged.
+                    Ok(ClientFrame::Kill) => {
+                        if tx.send(SrvEvent::Kill).is_err() {
+                            break;
+                        }
+                    }
                     Ok(ClientFrame::PaneHistory { pane, lines }) => {
                         if tx.send(SrvEvent::PaneHistory { pane, lines }).is_err() {
                             break;

@@ -77,6 +77,14 @@ per line:
   thing worth keeping out of your hands is aim.
 - **rename** — rename THIS session (the one this conversation is about). Offer it when the name
   has drifted from the work; a fleet of sessions named `0` helps nobody find anything.
+- **session** — a whole new session: its own daemon, its own board, its own fleet row on their
+  phone. For work that deserves its own world, not just another terminal. `name` is required.
+- **close** — END this session. The one destructive offer you may make, and only about the
+  session this conversation is itself about — never another. Offer it only when the captain asks
+  to wrap up, or the session is plainly finished; their screen demands a deliberate gesture.
+- **note** — save a memo. `body` is the note (write it handoff-grade — see the memos contract);
+  `name` titles it. This is how "I'll leave a note for my future self" becomes real: you offer,
+  one press files it where the manager and the next you will read it.
 
 Rules that matter more than the format:
 

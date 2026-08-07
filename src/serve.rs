@@ -1402,6 +1402,42 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some("new_terminal") => {
             let _ = session::write_frame(writer, &ClientFrame::NewTerminal);
         }
+        // A whole new session: spawn its daemon here (the bridge is the same binary), and the
+        // multiplexed routing serves it the moment its socket answers. The phone adds its own
+        // fleet row — nothing else to do host-side.
+        Some("new_session") => {
+            if let Some(name) = v.get("name").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                let msg = match session::spawn_daemon(name, None) {
+                    Ok(()) => format!("session '{name}' is up"),
+                    Err(e) => format!("could not start '{name}': {e}"),
+                };
+                let _ = tx.send(format!("{{\"t\":\"toast\",\"text\":{}}}", json_str(&msg)));
+            }
+        }
+        // END the connection's own session — the phone's card carries the deliberate gesture,
+        // and the aim is fixed by construction: only the session this socket serves can be
+        // ended. The daemon flushes state on Kill (autosave before should_quit), same as
+        // `mars kill`.
+        Some("end_session") => {
+            crate::manager::record_client_event("end_session", &v, crate::worklog::now_secs());
+            let _ = session::write_frame(writer, &ClientFrame::Kill);
+        }
+        // Save a memo the agent OFFERED. Written by the bridge on the captain's press — the
+        // agent itself still cannot touch the manager's files. Title-slugged alongside the
+        // manager's own memos, so the feed, the archive and assignment all pick it up.
+        Some("memo.note") => {
+            let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let title = v.get("name").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("note").to_string();
+            let session_name = socket.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            if !body.is_empty() && !session_name.is_empty() {
+                let msg = match crate::manager::write_captain_note(&session_name, &title, &body) {
+                    Ok(()) => "note saved to memos".to_string(),
+                    Err(e) => format!("could not save the note: {e}"),
+                };
+                crate::manager::record_client_event("memo.note", &v, crate::worklog::now_secs());
+                let _ = tx.send(format!("{{\"t\":\"toast\",\"text\":{}}}", json_str(&msg)));
+            }
+        }
         // Rename the session from the phone — reflected on the host. Carried on a FRESH
         // short-lived connection: the daemon closes the stream that sends Rename, so using
         // our subscribe writer would drop the live board. The daemon does the fs-rename and

@@ -2549,6 +2549,37 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
     Ok(format!("turn finished in {secs}s (exit {})", out.status))
 }
 
+/// A note the captain chose to keep (offered by Rover, saved by a press). Written alongside the
+/// manager's own memos so the feed, the archive and assignment treat it as a first-class card —
+/// but by THIS process on the captain's press, never by the agent's own hand.
+pub fn write_captain_note(session: &str, title: &str, body: &str) -> anyhow::Result<()> {
+    let dir = existing_session_dir_pub(session)
+        .ok_or_else(|| anyhow::anyhow!("no session directory for '{session}'"))?
+        .join("memos");
+    std::fs::create_dir_all(&dir)?;
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(48)
+        .collect();
+    let slug = if slug.is_empty() { "note".to_string() } else { slug };
+    let ts = crate::worklog::now_secs();
+    let text = format!(
+        "---\nid: {slug}\nv: 1\ncreated: {}\ncreated_ts: {ts}\nsource: captain\nseverity: info\n\
+         session: \"{session}\"\npane: \"\"\nkind: note\ntitle: {slug}\npriority: 45\n\
+         headline: \"{}\"\nexpired: false\n---\n{}\n",
+        iso(ts),
+        title.replace('"', "'"),
+        body,
+    );
+    std::fs::write(dir.join(format!("{slug}.md")), text)?;
+    Ok(())
+}
+
 /// May run.sh be exec'd? The runner is editable on purpose ("changed with an editor instead of a
 /// rebuild") — but the agent that runs under acceptEdits can edit it too, and an edit to the
 /// runner IS arbitrary shell on the next tick. So a drifted runner needs a blessing that lives
@@ -2996,6 +3027,29 @@ pub fn split_proposals(answer: &str) -> (String, Vec<serde_json::Value>) {
             Some("rename") => {
                 if let Some(name) = get("name") {
                     out.push(serde_json::json!({ "id": id, "verb": "rename", "name": name, "why": why }));
+                }
+            }
+            // A whole NEW session (its own daemon, its own board) — the multiplexed bridge
+            // serves it the moment it exists, and the phone grows a fleet row for it.
+            Some("session") => {
+                if let Some(name) = get("name") {
+                    out.push(serde_json::json!({ "id": id, "verb": "session", "name": name, "why": why }));
+                }
+            }
+            // END this session. The one destructive verb, and it carries no aim by
+            // construction: only the session this conversation is about can be ended, and the
+            // captain's card says its name in red before the gesture that means it.
+            Some("close") => {
+                out.push(serde_json::json!({ "id": id, "verb": "close", "why": why }));
+            }
+            // A memo, offered instead of written: the agent may not touch the manager's files,
+            // but the captain saving a note is one press. This is the "leave a note for your
+            // future self" promise from the persona doc, made mechanical.
+            Some("note") => {
+                if let Some(body) = get("body") {
+                    out.push(serde_json::json!({
+                        "id": id, "verb": "note", "name": get("name").unwrap_or("note"), "body": body, "why": why
+                    }));
                 }
             }
             _ => {}
