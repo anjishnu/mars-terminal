@@ -68,3 +68,17 @@ failure smells like encoding rather than logic.
   shows; don't conclude "works" from selfcheck when the user is on an attached session.
 - FIX: `mars kill <name> && mars <name>` — the session's goals/worklog persist to disk and
   reload. Standalone (no session): just quit and relaunch. See [[sessions-daemon]].
+
+## GOTCHA: `cargo install` failed silently for days behind a pipe (2026-08-07)
+- `cargo install ... 2>&1 | tail -N && codesign ...` masks failure twice over: the
+  pipeline's exit is TAIL's (always 0), so `&&` proceeds, and codesign refreshes the
+  binary's mtime — every staleness heuristic (mtime vs process start) then says "fresh"
+  while the binary is old. Several "installed" claims were false before this was caught.
+- Root cause of the underlying failure: `cargo install` RE-RESOLVES dependencies and
+  ignores Cargo.lock unless given `--locked`; a broken upstream release (zune-jpeg
+  0.5.15, macro-expansion compile error) poisoned installs while `cargo build` stayed
+  green on the lockfile pin.
+- RULES: always `cargo install --path . --features web --force --locked`; never pipe the
+  install through tail — capture to a log file and check `$?` explicitly; verify content
+  not mtime: `strings ~/.cargo/bin/mars | grep -c '<new-string>'` PLUS a control string
+  that must be ≥1 (a 0 on both means strings extraction failed, not staleness).
