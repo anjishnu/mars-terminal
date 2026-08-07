@@ -103,9 +103,25 @@ this loop at all. Four targets, in the order an attacker would want them:
 - Memos — the agent can write board content, which is what memos *are*, so this is not blocked and
   cannot be. The impact is phishing: a memo that says "run this to fix it". It funnels back into
   Attack A's defence, a human reading a command before holding a button.
-- `prompt.md` / `AGENTS.md` in `~/.mars/manager` — the agent can rewrite its own standing
-  instructions, which turns one successful injection into a persistent one. **Known gap**, see
-  below.
+- `prompt.md` / `AGENTS.md` / `docs/**` in `~/.mars/manager` — rewriting its own standing orders
+  would turn one successful injection into a permanent one, since the prompt is re-read every run.
+  **Blocked, three ways:** the runner denies the agent the tool to edit them; Mars compares each
+  against the built-in before every tick and refuses to run on unblessed drift; and a doc claiming
+  a version number that is not ours is overwritten rather than trusted, which closes the trick of
+  writing `mars-doc-version: 999` to become immune to every future release.
+
+**Attack D — aim a worker at your repository.** An assigned worker runs `acceptEdits` in your
+actual source tree with the memo as its entire brief, so a forged memo is instructions to an agent
+that writes code. Shell still gates, and nobody is watching that pane to approve it — which means
+the realistic payload is not code that runs now but **files that execute without being run**: a
+build script, a CI workflow, a git hook, a manifest whose dependencies bring their own build
+scripts. Those fire on your next build, push, or commit. Mars publishes to crates.io, so a
+`build.rs` edit reaches users' machines rather than only yours.
+
+Assigned workers therefore carry an explicit deny list covering `build.rs`, `Makefile`,
+`package.json`, `Cargo.toml`, `.github/workflows/**`, `.git/hooks/**`, `.envrc` and `.claude/**`
+(the last because the first thing a blocked agent proposes is writing itself an allow rule). Deny
+rules outrank the permission mode in every mode, and Bash cannot be used to route around them.
 
 **Attack C — terminal output into the pickables tray.** Any program that prints to a pane can put a
 URL or a backticked command into the phone's chip tray. Chips **copy to the clipboard and never
@@ -117,13 +133,16 @@ convert every program's stdout into a one-tap command.
 
 Stated plainly because a gap you know about is cheaper than one a user discovers:
 
-1. **The manager agent can rewrite its own instructions** (`prompt.md`, `AGENTS.md`), so a single
-   injection can persist across ticks. The fix is to give those files the same blessing treatment
-   as `run.sh`, or to stop seeding them as editable files at all.
+1. **A worker's edits land directly in your working tree.** The deny list stops the
+   executes-without-being-run class, but ordinary source edits still arrive unreviewed. Running
+   assigned workers in a git worktree or on a branch would turn every worker into a diff you merge,
+   which is the durable answer and the next thing to build.
 2. **No per-device revocation and no token expiry.** The only lever is rotating the single token.
 3. **No visibility into who is connected or who has been knocking.**
 4. **A memo carries no provenance.** Nothing distinguishes "the agent concluded this" from "the
    agent was told to write this by text it read," which is exactly the distinction a reader needs.
+5. **A memo's body is a worker's whole brief, but you approve it from a headline.** The reviewed
+   surface is smaller than the executed one.
 
 ## Out of scope
 

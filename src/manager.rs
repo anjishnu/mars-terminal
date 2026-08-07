@@ -1796,7 +1796,12 @@ fn doc_superseded(path: &Path, ours: &str) -> bool {
     }
     let Some(mine) = version(ours) else { return false };
     match std::fs::read_to_string(path).ok().as_deref().and_then(version) {
-        Some(theirs) => theirs < mine,
+        // NOT `theirs < mine`. A file claiming a HIGHER version than the binary that seeds it was
+        // never repaired again — so writing `mars-doc-version: 999` into a doc made the edit
+        // survive every future release, which is immortality granted by a comparison operator. A
+        // version that is not ours is a version we did not write, whichever direction it points.
+        // An ordinary hand-edit keeps its version number and is still left alone.
+        Some(theirs) => theirs != mine,
         None => false,
     }
 }
@@ -2545,6 +2550,24 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
         }
         return Ok(msg);
     }
+    // The same gate for the agent's standing orders. The runner is the file whose EDIT is an
+    // EXECUTION; these are the files whose edit is a new set of INSTRUCTIONS, re-read on every
+    // run — a slower path to the same place, and the one an injected agent reaches for once the
+    // runner is closed to it.
+    if let Err((which, h)) = guarded_docs_ok(&repo) {
+        let msg = format!(
+            "{which} differs from the built-in and is not blessed — refusing to run the agent.\n\
+             The agent reads untrusted terminal output; running it on instructions that may have \
+             come from there is the one failure with no recoverable state.\n\
+             If you edited it deliberately:  echo {h} >> ~/.mars/manager.approved\n\
+             If you did not: delete ~/.mars/manager/{which} and it re-materializes clean."
+        );
+        eprintln!("{msg}");
+        if let Some(s) = crate::session::paired_session() {
+            let _ = write_captain_note(&s, "agent-orders-blocked", &msg);
+        }
+        return Ok(msg);
+    }
     println!("running batch {name} …");
     let started = std::time::Instant::now();
     let out = std::process::Command::new("sh")
@@ -2608,6 +2631,62 @@ pub fn write_captain_note(session: &str, title: &str, body: &str) -> anyhow::Res
 ///
 /// Ok when the runner matches the built-in copy or the blessed hash; Err(current_hash) so the
 /// caller can print the exact blessing command.
+/// The agent's standing orders, and the built-in copy each one must still match.
+///
+/// `policy.md` is deliberately absent: it grants autonomy and is the human's to edit, so drift
+/// there is expected and gating on it would nag forever. It is protected the other way — the
+/// runner denies the agent the tool to write it.
+pub const GUARDED_DOCS: &[(&str, &str)] = &[
+    ("AGENTS.md", include_str!("manager_docs/AGENTS.md")),
+    ("prompt.md", include_str!("manager_docs/prompt.md")),
+    ("docs/layout.md", include_str!("manager_docs/layout.md")),
+    ("docs/cards.md", include_str!("manager_docs/cards.md")),
+    ("docs/memos.md", include_str!("manager_docs/memos.md")),
+    ("docs/briefing.md", include_str!("manager_docs/briefing.md")),
+    ("docs/workspaces.md", include_str!("manager_docs/workspaces.md")),
+    ("docs/receipts.md", include_str!("manager_docs/receipts.md")),
+    ("docs/memory.md", include_str!("manager_docs/memory.md")),
+    ("docs/tools.md", include_str!("manager_docs/tools.md")),
+];
+
+/// Which standing order has drifted, and the hash that would bless it. Pure — the blessed list is
+/// passed in — so the selfcheck can exercise it without writing to the real `~/.mars`.
+pub fn docs_drift(repo: &Path, blessed: &[String]) -> Option<(String, String)> {
+    for (rel, built_in) in GUARDED_DOCS {
+        let Ok(text) = std::fs::read_to_string(repo.join(rel)) else { continue };
+        if text == *built_in {
+            continue;
+        }
+        let h = version_of(&text);
+        if !blessed.iter().any(|b| b == &h) {
+            return Some(((*rel).to_string(), h));
+        }
+    }
+    None
+}
+
+/// Hashes the human has approved. One file, appended to, read by both gates — a blessing is a
+/// blessing whether it covers the runner or an instruction doc.
+fn blessed_hashes() -> Vec<String> {
+    let Some(home) = crate::sys::paths::home_dir() else { return Vec::new() };
+    ["manager.approved", "runner.approved"]
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(home.join(".mars").join(f)).ok())
+        .flat_map(|s| s.lines().map(|l| l.trim().to_string()).collect::<Vec<_>>())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// May the agent run on these instructions? Same shape as `runner_ok`, for the same reason: the
+/// prompt is as load-bearing as the runner. An agent running on rewritten orders is not a smaller
+/// agent, it is somebody else's.
+pub fn guarded_docs_ok(repo: &Path) -> Result<(), (String, String)> {
+    match docs_drift(repo, &blessed_hashes()) {
+        Some(d) => Err(d),
+        None => Ok(()),
+    }
+}
+
 pub fn runner_ok(repo: &Path) -> Result<(), String> {
     let text = std::fs::read_to_string(repo.join("run.sh")).unwrap_or_default();
     if text == include_str!("manager_docs/run.sh") {
