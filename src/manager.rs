@@ -2578,13 +2578,21 @@ pub fn write_captain_note(session: &str, title: &str, body: &str) -> anyhow::Res
         .take(48)
         .collect();
     let slug = if slug.is_empty() { "note".to_string() } else { slug };
+    // The headline is the one field that carries the title through verbatim, and the frontmatter
+    // reader is line-based (`front_field`), not a YAML parser — so a newline in a title is a new
+    // frontmatter KEY, not a wrapped value, and the quotes around it do not contain anything.
+    // Today the forgery is mostly inert because first-match-wins and every field that matters is
+    // emitted above this one; that is an accident of ordering, not a defence, and it stops being
+    // true the moment somebody rearranges the template. Flatten instead, so the safety is a
+    // property of the value rather than of where it sits.
+    let headline = title.replace(['\n', '\r'], " ").replace('"', "'");
     let ts = crate::worklog::now_secs();
     let text = format!(
         "---\nid: {slug}\nv: 1\ncreated: {}\ncreated_ts: {ts}\nsource: captain\nseverity: info\n\
          session: \"{session}\"\npane: \"\"\nkind: note\ntitle: {slug}\npriority: 45\n\
          headline: \"{}\"\nexpired: false\n---\n{}\n",
         iso(ts),
-        title.replace('"', "'"),
+        headline,
         body,
     );
     std::fs::write(dir.join(format!("{slug}.md")), text)?;

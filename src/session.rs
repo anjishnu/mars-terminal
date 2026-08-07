@@ -1847,6 +1847,24 @@ pub fn write_restore(name: &str, panes: &[(String, bool, Option<String>)]) {
     }
 }
 
+/// Is this a conversation id, or is it a payload wearing one?
+///
+/// The restored id is interpolated into `claude --resume {id}\r` and TYPED INTO A LIVE SHELL, so
+/// a `chat` field containing a carriage return is arbitrary shell on the next reboot. That is not
+/// hypothetical: the manager agent runs `acceptEdits` over `~/.mars/sessions` with nobody at the
+/// keyboard, and it reads pane output that any program on the host can write — so "text on a
+/// screen" reaches this string without a human ever reviewing it, and `mars reboot` then types
+/// it. The human confirms the reboot, never the payload.
+///
+/// Claude Code ids are UUIDs. Anything else is refused rather than sanitized: a real id has no
+/// reason to hold a space, a quote, or a control character, so there is nothing to preserve by
+/// escaping and everything to lose by getting the escaping subtly wrong.
+pub fn valid_chat_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub fn read_restore(name: &str) -> Vec<(String, bool, Option<String>)> {
     let Some(p) = restore_path(name) else { return Vec::new() };
     let Ok(txt) = std::fs::read_to_string(p) else { return Vec::new() };
@@ -1857,7 +1875,16 @@ pub fn read_restore(name: &str) -> Vec<(String, bool, Option<String>)> {
             (!cwd.is_empty()).then(|| (
                 cwd,
                 p["agent"].as_bool().unwrap_or(false),
-                p["chat"].as_str().filter(|s| !s.is_empty()).map(String::from),
+                // A rejected id degrades to `--continue`, which restores by directory: the
+                // documented fallback for a pane whose id was never captured, and the right
+                // landing place for one whose id cannot be trusted.
+                p["chat"].as_str().filter(|s| {
+                    let ok = valid_chat_id(s);
+                    if !ok {
+                        debug_log(&format!("[restore] refused a chat id that is not one: {s:?}"));
+                    }
+                    ok
+                }).map(String::from),
             ))
         }).collect()
     }).unwrap_or_default()

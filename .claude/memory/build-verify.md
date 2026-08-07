@@ -82,3 +82,13 @@ failure smells like encoding rather than logic.
   install through tail — capture to a log file and check `$?` explicitly; verify content
   not mtime: `strings ~/.cargo/bin/mars | grep -c '<new-string>'` PLUS a control string
   that must be ≥1 (a 0 on both means strings extraction failed, not staleness).
+
+## GOTCHA: cargo reported "Fresh" for edited sources (2026-08-07)
+- Symptom: edits saved to disk, `cargo build` exits 0 with "Finished in 0.5s", and the binary does
+  NOT contain the new code. `-v` shows `Fresh mars-terminal` even after `touch`ing every source —
+  the fingerprint was stale, not the mtimes. Same failure FAMILY as the install-behind-a-pipe bug:
+  a green build that built nothing.
+- FIX: `cargo clean -p mars-terminal` then rebuild (~11s; it does not re-fetch deps).
+- DETECT: after any build you intend to verify behaviour against, check CONTENT not exit code —
+  `strings target/debug/mars | grep -c '<a string from the edit>'` with a control string. This is
+  the same probe as the install check above; use it for both.
