@@ -713,12 +713,16 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
     let briefs: &[(String, String)] = &all;
     let mut cards: Vec<serde_json::Value> = Vec::new();
     for (name, dir) in &dirs {
+        // The DIRECTORY id rides on every card: it is the durable session identity (names are
+        // renamed, dirs are not), and it is what the bridge scopes a phone's view by.
+        let dir_id = dir.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
         let dir = dir.join("memos");
         for c in read_open_cards(&dir) {
             let text = std::fs::read_to_string(&c.file).unwrap_or_default();
             let (front, body) = split_front(&text).unwrap_or(("", ""));
             cards.push(serde_json::json!({
                 "id": c.id,
+                "dir": dir_id,
                 "path": c.file.to_string_lossy(),
                 "title": c.title, "priority": c.priority,
                 "severity": c.severity, "headline": c.headline, "session": c.session,
@@ -782,6 +786,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
             let narrative_version = version_of(&narrative);
             serde_json::json!({
                 "name": n,
+                "dir": dir.as_ref().and_then(|d| d.file_name().map(|x| x.to_string_lossy().to_string())),
                 "briefing": b,
                 "narrative": narrative,
                 "narrativeSource": narrative_source,

@@ -192,7 +192,7 @@ pub fn install_panic_restore() {
 
 // ── Socket paths ─────────────────────────────────────────────────────────────
 
-fn socket_dir() -> Result<PathBuf> {
+pub fn socket_dir() -> Result<PathBuf> {
     let base = std::env::var_os(RUNTIME_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);

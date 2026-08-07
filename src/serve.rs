@@ -1420,6 +1420,26 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some("new_terminal") => {
             let _ = session::write_frame(writer, &ClientFrame::NewTerminal);
         }
+        // Every live session on this host: the phone's fleet page renders the truth instead of
+        // its own bookkeeping. Enumerate the socket dir and identify each — dead sockets are
+        // filtered by the probe itself.
+        Some("sessions.list") => {
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            if let Ok(dir) = session::socket_dir() {
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        if p.extension().and_then(|x| x.to_str()) != Some("sock") {
+                            continue;
+                        }
+                        if let Some((name, _, attached)) = session::identify(&p) {
+                            out.push(serde_json::json!({ "name": name, "attached": attached }));
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(serde_json::json!({ "t": "sessions.list", "sessions": out }).to_string());
+        }
         // A whole new session: spawn its daemon here (the bridge is the same binary), and the
         // multiplexed routing serves it the moment its socket answers. The phone adds its own
         // fleet row — nothing else to do host-side.
@@ -1492,7 +1512,8 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // run tally.
         Some("manager.board") | Some("manager.memos") | Some("manager.health") => {
             let want = v.get("t").and_then(|t| t.as_str()).unwrap_or_default().to_string();
-            let _ = tx.send(manager_view_json(&want));
+            let session_name = socket.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+            let _ = tx.send(manager_view_json(&want, &session_name));
         }
         // The archive, read-only: what the manager said, kept, by day. The phone browses it —
         // old briefings, workspace notes and memos that have since been rewritten or pruned.
@@ -1695,12 +1716,40 @@ fn fs_list_json(raw: &str) -> String {
 /// Slice the computed view for one verb. Computing the whole thing and slicing is deliberate:
 /// it is a couple of kilobytes over a couple of dozen small files, so three separate walks would
 /// buy nothing but three code paths to keep in step.
-fn manager_view_json(want: &str) -> String {
+/// Which session's daemon currently holds the manager lock — the "who is doing the thinking"
+/// debug fact. The lock records an instance id; resolving it to a live session name is the same
+/// identity walk the bridge does, and `null` fields mean the lock is stale or free.
+fn agent_home_json() -> serde_json::Value {
+    let lock = crate::sys::paths::home_dir()
+        .and_then(|h| std::fs::read_to_string(h.join(".mars/manager/agent.lock")).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+    let Some(lock) = lock else { return serde_json::Value::Null };
+    let owner = lock["owner"].as_str().unwrap_or_default().to_string();
+    let session = session::socket_for_instance(&owner).map(|(name, _)| name);
+    serde_json::json!({ "owner": owner, "session": session, "at_ts": lock["ts"] })
+}
+
+fn manager_view_json(want: &str, session: &str) -> String {
     let Some(repo) = crate::manager::repo_dir() else {
         return serde_json::json!({ "t": want, "error": "no manager repo" }).to_string();
     };
     let ts = crate::worklog::now_secs();
-    let v = crate::manager::view(&repo, ts, MANAGER_STALE_SECS);
+    let mut v = crate::manager::view(&repo, ts, MANAGER_STALE_SECS);
+    // CONTEXT ISOLATION. The manager is one agent over many sessions, and its view aggregates
+    // them all — but this connection serves exactly ONE session, and showing it another's memos
+    // or briefing is how boards started bleeding into each other once the bridge multiplexed.
+    // Scope by the durable DIRECTORY id, not the name: renames left stale dirs whose names
+    // collide, and a name match with a fallback is how the wrong briefing got picked.
+    let dir_id = crate::manager::existing_session_dir_pub(session)
+        .and_then(|d| d.file_name().map(|x| x.to_string_lossy().to_string()));
+    if let Some(dir_id) = &dir_id {
+        if let Some(memos) = v["memos"].as_array_mut() {
+            memos.retain(|c| c["dir"].as_str() == Some(dir_id.as_str()));
+        }
+        if let Some(sessions) = v["sessions"].as_array_mut() {
+            sessions.retain(|e| e["dir"].as_str() == Some(dir_id.as_str()));
+        }
+    }
     let body = match want {
         "manager.memos" => serde_json::json!({ "memos": v["memos"] }),
         "manager.health" => serde_json::json!({
@@ -1710,6 +1759,9 @@ fn manager_view_json(want: &str) -> String {
             // `ready` is kept alongside `state` so a phone running an older bundle — which knows
             // only the boolean — keeps working instead of losing the mark on a host upgrade.
             "rover": { "state": rover_status().0, "ready": rover_status().0 == "ready", "rampMs": rover_status().1, "detail": rover_status().2 },
+            // WHERE the manager runs: the lock's owner is an instance id; resolve it to the
+            // session currently holding it, so the sidebar can say which daemon does the work.
+            "agentHome": agent_home_json(),
             "agentStaleSecs": v["agentStaleSecs"],
         }),
         _ => serde_json::json!({ "sessions": v["sessions"] }),
