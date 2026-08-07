@@ -666,7 +666,15 @@ pub fn reset_main(session_arg: Option<String>) -> Result<()> {
 /// and therefore the paired phone's stored endpoint and the QR — stay identical across every
 /// `mars serve` restart. Without it, ngrok mints a fresh random URL each run, and the phone has
 /// to re-scan every time the daemon bounces.
-fn start_tunnel(local_port: u16) -> Result<(std::process::Child, String)> {
+fn start_tunnel(local_port: u16) -> Result<(Option<std::process::Child>, String)> {
+    // ADOPT before spawning. A free ngrok account allows ONE agent session, and a bridge that
+    // died (or exec-replaced itself) can leave its ngrok child running with the tunnel intact —
+    // in which case a fresh spawn cannot get a slot and times out, which serially killed every
+    // bridge restart one night. If a live agent already fronts a tunnel, use it.
+    if let Some(url) = running_tunnel_url() {
+        crate::session::debug_log(&format!("[rover] adopting the running ngrok tunnel {url}"));
+        return Ok((None, url));
+    }
     let domain = std::env::var("MARS_NGROK_DOMAIN").ok().filter(|d| !d.trim().is_empty());
     let mut args: Vec<String> = vec!["http".into(), local_port.to_string()];
     if let Some(d) = &domain {
@@ -710,10 +718,15 @@ fn start_tunnel(local_port: u16) -> Result<(std::process::Child, String)> {
     });
 
     match rx.recv_timeout(Duration::from_secs(25)) {
-        Ok(url) => Ok((child, url)),
+        Ok(url) => Ok((Some(child), url)),
         Err(_) => {
             let _ = child.kill();
-            Err(anyhow!("timed out waiting for an ngrok tunnel URL — is your authtoken set? (`ngrok config add-authtoken …`)"))
+            Err(anyhow!(
+                "timed out waiting for an ngrok tunnel URL — is your authtoken set? \
+                 (`ngrok config add-authtoken …`) An orphaned `ngrok` from a dead bridge can also \
+                 hold the account's one agent slot while answering on no API port — `pgrep ngrok` \
+                 and kill it, then retry."
+            ))
         }
     }
 }
@@ -924,16 +937,18 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
         }
     });
 
-    // Pairing enforcement: the phone must present the current token (its `{t:"auth"}` frame)
-    // before we stream anything, and a rotated token (`mars serve --reset`) is picked up within a
-    // second and drops the socket. No token file at all → open (backward-compatible).
+    // Auth already happened — phase 1 gated this connection before the daemon was even dialed.
+    // What remains of enforcement here is ROTATION: a token reset (`mars serve --reset`) is
+    // picked up within a second and drops the socket.
     let valid = read_token();
-    // NEVER fail open. `serve_main` mints a token before listening, so a missing file means the
-    // file was deleted or unreadable — refuse rather than serve an unauthenticated socket, which
-    // now fronts arbitrary-path filesystem READ AND WRITE over a public tunnel.
-    let mut authed = false;
-    let auth_deadline = Instant::now() + Duration::from_secs(5);
     let mut last_token_check = Instant::now();
+
+    // A phone is genuinely here, aimed at this resolved session. Spend the ~4.3s agent ramp NOW,
+    // while they are still reading the briefing, rather than after they have asked something and
+    // are watching a halo breathe.
+    if let Some(n) = socket.file_stem().map(|s| s.to_string_lossy().to_string()) {
+        warm_rover(n);
+    }
 
     loop {
         // Reset: if the persisted token was rotated out from under us, drop this phone.
@@ -943,39 +958,17 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                 break;
             }
         }
-        if authed {
-            // Flush any daemon output waiting in the channel.
-            while let Ok(msg) = rx.try_recv() {
-                ws.send(Message::Text(msg))?;
-            }
-        } else if Instant::now() > auth_deadline {
-            break; // never presented a valid token → refuse
+        // Flush any daemon output waiting in the channel.
+        while let Ok(msg) = rx.try_recv() {
+            ws.send(Message::Text(msg))?;
         }
         // Read one inbound WS message (times out via the socket read timeout).
         match ws.read() {
             Ok(Message::Text(txt)) => {
-                if authed {
-                    handle_client_msg(&mut writer, &action_tx, socket, &txt);
-                } else {
-                    match auth_result(&txt, valid.as_deref()) {
-                        AuthCheck::Ok => {
-                            authed = true;
-                            // A phone is genuinely here. Spend the ~4.3s ramp NOW, while they are
-                            // still reading the briefing, rather than after they have asked
-                            // something and are watching a halo breathe.
-                            if let Some(n) = socket.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                                warm_rover(n);
-                            }
-                        }
-                        AuthCheck::Bad => break, // wrong token → refuse now
-                        AuthCheck::Other => {}   // hello/subscribe before auth → keep waiting
-                    }
-                }
+                handle_client_msg(&mut writer, &action_tx, socket, &txt);
             }
             Ok(Message::Binary(b)) => {
-                if authed {
-                    handle_client_msg(&mut writer, &action_tx, socket, &String::from_utf8_lossy(&b));
-                }
+                handle_client_msg(&mut writer, &action_tx, socket, &String::from_utf8_lossy(&b));
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
