@@ -821,8 +821,11 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     // ── Phase 2: resolve the daemon for the REQUESTED session, then bridge ──────────────────
     let socket_buf: std::path::PathBuf = match &wanted {
         Some(name) => {
-            let p = session::socket_path(name).ok();
-            match p.filter(|p| session::identify(p).is_some()) {
+            // Name-direct first; then the DIRECTORY resolver — a session renamed at the desk
+            // keeps its directory's birth name, which is exactly the name the phone paired
+            // under, so a stale `s` still finds the live session instead of a refusal.
+            let direct = session::socket_path(name).ok().filter(|p| session::identify(p).is_some());
+            match direct.or_else(|| session::socket_for_session_dir(name).map(|(_, p)| p)) {
                 Some(p) => p,
                 None => {
                     // Refuse LOUDLY: an empty board wearing the right name is the failure mode
