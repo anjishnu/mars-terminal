@@ -3021,21 +3021,10 @@ pub fn split_proposals(answer: &str) -> (String, Vec<serde_json::Value>) {
                     out.push(serde_json::json!({ "id": id, "verb": "run", "cmd": cmd, "why": why }));
                 }
             }
-            // Rename THIS session — the one the phone is connected to. No aim to take: the
-            // target is the connection's own session, and the rename intent already exists on
-            // the phone (the side menu's ✎). Nameless renames are dropped like pathless opens.
-            Some("rename") => {
-                if let Some(name) = get("name") {
-                    out.push(serde_json::json!({ "id": id, "verb": "rename", "name": name, "why": why }));
-                }
-            }
-            // A whole NEW session (its own daemon, its own board) — the multiplexed bridge
-            // serves it the moment it exists, and the phone grows a fleet row for it.
-            Some("session") => {
-                if let Some(name) = get("name") {
-                    out.push(serde_json::json!({ "id": id, "verb": "session", "name": name, "why": why }));
-                }
-            }
+            // `rename` and `session` were verbs briefly and were WITHDRAWN by the captain's
+            // ruling: session lifecycle belongs to the fleet page's own controls, not to the
+            // conversation. The parser drops them like any unknown verb, which also disarms an
+            // older bridge's doc still advertising them.
             // END this session. The one destructive verb, and it carries no aim by
             // construction: only the session this conversation is about can be ended, and the
             // captain's card says its name in red before the gesture that means it.

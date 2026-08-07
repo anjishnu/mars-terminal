@@ -6958,13 +6958,13 @@ fn selfcheck() -> Result<()> {
             assert_eq!(prose, "Done.");
             assert!(p.is_empty());
 
-            // rename: carried with a name, dropped without one — same contract as open's path.
+            // rename/session were WITHDRAWN from the vocabulary — the parser must drop them
+            // even when an older doc still advertises them.
             let (_, p) = manager::split_proposals(
-                "Ok.\n\n```do\n{\"verb\":\"rename\",\"name\":\"auth-fix\",\"why\":\"drifted\"}\n{\"verb\":\"rename\",\"why\":\"nameless\"}\n```",
+                "Ok.\n\n```do\n{\"verb\":\"rename\",\"name\":\"auth-fix\"}\n{\"verb\":\"session\",\"name\":\"x\"}\n{\"verb\":\"note\",\"body\":\"kept\"}\n```",
             );
-            assert_eq!(p.len(), 1, "a nameless rename must be dropped");
-            assert_eq!(p[0]["verb"], "rename");
-            assert_eq!(p[0]["name"], "auth-fix");
+            assert_eq!(p.len(), 1, "withdrawn verbs must be dropped");
+            assert_eq!(p[0]["verb"], "note");
         }
         println!("[selfcheck] rover: a proposal is parsed strictly and never picks its own target ... PASS");
 
