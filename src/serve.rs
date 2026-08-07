@@ -100,12 +100,24 @@ fn write_token(tok: &str) {
     if let Some(p) = token_file() {
         if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
         let _ = std::fs::write(&p, tok);
+        // 0600, and RETROACTIVELY: files written before this line existed inherited the umask
+        // (world-readable), and SECURITY.md promises user-only. Applied on every write and on
+        // every ensure, so one bridge start heals an old file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 /// Read the persisted token, minting + storing one on first use. Propagates a minting failure
 /// rather than serving: a bridge that cannot produce a credential must not accept connections.
 fn ensure_token() -> Result<String> {
-    if let Some(t) = read_token() { return Ok(t); }
+    if let Some(t) = read_token() {
+        // Re-assert 0600 on the existing file — see write_token.
+        write_token(&t);
+        return Ok(t);
+    }
     let t = mint_token()?;
     write_token(&t);
     Ok(t)
@@ -991,7 +1003,10 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
 /// (chat/ask/summarize): generous for two thumbs, ruinous for a loop. Refusals are said out
 /// loud on the same channel the answer would have used, never silently dropped.
 pub fn llm_spend_allowed() -> bool {
-    const MAX_PER_MIN: u32 = 12;
+    // 20, not 12: Mission Control legitimately prefetches one summarize per workspace on board
+    // load, so an 8-workspace board plus a few chat turns brushed the old ceiling in its first
+    // minute — the limit exists to stop loops, not to tax opening the app.
+    const MAX_PER_MIN: u32 = 20;
     static WINDOW: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
     let now = crate::worklog::now_secs() / 60;
     let Ok(mut w) = WINDOW.lock() else { return false };
@@ -1825,6 +1840,12 @@ fn fs_lines_plain(text: &str) -> serde_json::Value {
 }
 
 fn fs_write_json(raw: &str, content: &str, base_mtime: Option<u64>) -> String {
+    // Reads are capped; writes were not — a hostile paired device could fill the disk through
+    // this seam one frame at a time. 2MB is generous for anything a phone legitimately edits.
+    const FS_WRITE_MAX_BYTES: usize = 2 * 1024 * 1024;
+    if content.len() > FS_WRITE_MAX_BYTES {
+        return fs_error_json(raw, "too-large", "write exceeds the 2MB cap for phone edits");
+    }
     let path = match resolve_path(raw) {
         Ok(p) => p,
         Err(e) => return fs_error_json(raw, io_code(&e), &e.to_string()),

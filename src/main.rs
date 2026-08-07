@@ -6985,6 +6985,30 @@ fn selfcheck() -> Result<()> {
         }
         println!("[selfcheck] reboot: the manifest survives its own restore ... PASS");
 
+        {
+            // The doorman's identity seam: a session's DIRECTORY is durable, its name is not.
+            // The resolver must read the CURRENT name through the directory on every call —
+            // caching the name is exactly how a rename strands a bridge.
+            let root = manager::sessions_root().expect("sessions root");
+            let dir = root.join("__selfcheck_resolver__");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("meta.json"), r#"{"name":"__sc_before__"}"#)?;
+            assert_eq!(
+                session::session_name_for_dir("__selfcheck_resolver__").as_deref(),
+                Some("__sc_before__"),
+                "the directory must resolve to its recorded name"
+            );
+            std::fs::write(dir.join("meta.json"), r#"{"name":"__sc_after__"}"#)?;
+            assert_eq!(
+                session::session_name_for_dir("__selfcheck_resolver__").as_deref(),
+                Some("__sc_after__"),
+                "a rename must be followed on the NEXT call, not cached from the first"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+            assert!(session::session_name_for_dir("__selfcheck_resolver__").is_none());
+        }
+        println!("[selfcheck] doorman: the directory resolves to the live name, uncached ... PASS");
+
         #[cfg(feature = "web")]
         {
             // The pairing token faces a public tunnel URL, so equality must not leak a matching

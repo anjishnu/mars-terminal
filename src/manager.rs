@@ -2532,6 +2532,12 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
              If you did not: delete ~/.mars/manager/run.sh and it re-materializes clean."
         );
         eprintln!("{msg}");
+        // Surface it where the captain actually looks. A refusal that lives only in a log
+        // presents as "the agent silently stopped", which reads as broken — the exact spend
+        // of trust this gate exists to prevent.
+        if let Some(s) = crate::session::paired_session() {
+            let _ = write_captain_note(&s, "agent-runner-blocked", &msg);
+        }
         return Ok(msg);
     }
     println!("running batch {name} …");

@@ -27,7 +27,7 @@ categories = ["command-line-utilities", "text-editors"]
 #   src/manager_docs/*  — manager.rs embeds all 12 (AGENTS.md, the docs/ spokes, prompt.md AND
 #                         run.sh, which is why this is a bare * and not *.md).
 # Verify with a build from the extracted tarball, never from `cargo package --list` alone.
-include = ["src/**/*.rs", "src/prompts/*.md", "src/manager_docs/*", "src/**/*.json", "src/syntaxes/*.sublime-syntax", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md", "/install.sh"]
+include = ["src/**/*.rs", "src/prompts/*.md", "src/manager_docs/*", "src/**/*.json", "src/syntaxes/*.sublime-syntax", "/Cargo.toml", "/README.md", "/LICENSE", "/CHANGELOG.md", "/SECURITY.md", "/install.sh"]
 
 [[bin]]
 name = "mars"
