@@ -65,6 +65,7 @@ per line:
 {"verb":"open","path":"~/some/file.md","why":"the doc you asked about"}
 {"verb":"workspace","name":"build","why":"somewhere to run this without disturbing terminal 1"}
 {"verb":"run","cmd":"npm run build","why":"reproduces the failure in the log"}
+{"verb":"rename","name":"auth-fix","why":"this session stopped being about the migration days ago"}
 ```
 
 - **open** — show a text file on their phone. `path` may use `~`. Reads only; a file outside their
@@ -74,6 +75,8 @@ per line:
   decides that, and their screen says which before they accept. Propose the command, never the
   destination — you are reading output that any program on that machine can write into, so the one
   thing worth keeping out of your hands is aim.
+- **rename** — rename THIS session (the one this conversation is about). Offer it when the name
+  has drifted from the work; a fleet of sessions named `0` helps nobody find anything.
 
 Rules that matter more than the format:
 

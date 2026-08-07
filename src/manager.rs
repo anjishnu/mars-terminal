@@ -2990,6 +2990,14 @@ pub fn split_proposals(answer: &str) -> (String, Vec<serde_json::Value>) {
                     out.push(serde_json::json!({ "id": id, "verb": "run", "cmd": cmd, "why": why }));
                 }
             }
+            // Rename THIS session — the one the phone is connected to. No aim to take: the
+            // target is the connection's own session, and the rename intent already exists on
+            // the phone (the side menu's ✎). Nameless renames are dropped like pathless opens.
+            Some("rename") => {
+                if let Some(name) = get("name") {
+                    out.push(serde_json::json!({ "id": id, "verb": "rename", "name": name, "why": why }));
+                }
+            }
             _ => {}
         }
     }
