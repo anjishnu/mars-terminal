@@ -1892,14 +1892,23 @@ pub enum AgentStart {
 /// Panes with a real id are unaffected and never consume the ration.
 pub fn restore_plan(panes: &[(String, bool, Option<String>)]) -> Vec<AgentStart> {
     let mut spent: Vec<&str> = Vec::new();
+    let mut claimed: Vec<&str> = Vec::new();
     panes
         .iter()
         .map(|(cwd, agent, chat)| {
             if !*agent {
                 return AgentStart::Bare;
             }
+            // An id can be recorded against two panes — the live manifest on this machine has
+            // exactly that, one conversation claimed by two of four agent panes. Resuming both
+            // reopens one thread twice, which is the same wrong outcome the ration below exists
+            // to prevent, reached through a different door. First claimant keeps it; the rest are
+            // treated as having no id at all.
             if let Some(id) = chat.as_deref().filter(|s| valid_chat_id(s)) {
-                return AgentStart::Resume(id.to_string());
+                if !claimed.iter().any(|c| *c == id) {
+                    claimed.push(id);
+                    return AgentStart::Resume(id.to_string());
+                }
             }
             if spent.iter().any(|d| *d == cwd.as_str()) {
                 AgentStart::Bare

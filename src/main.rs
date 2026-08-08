@@ -7072,6 +7072,20 @@ fn selfcheck() -> Result<()> {
             // A pane with a known id must not spend the directory's one guess.
             let plan2 = session::restore_plan(&[p("/repo", true, Some("aaaa")), p("/repo", true, None)]);
             assert_eq!(plan2[1], Continue, "an exact resume does not consume the ration");
+
+            // Taken from the live manifest on this machine: ONE conversation id recorded against
+            // two of four agent panes. Resuming both reopens one thread twice — the same wrong
+            // outcome as the unrationed `--continue`, through a different door.
+            let dup = session::restore_plan(&[
+                p("/repo", true, Some("9ef23227")),
+                p("/repo", true, None),
+                p("/repo", true, Some("9ef23227")),
+                p("/rover", true, None),
+            ]);
+            assert_eq!(dup[0], Resume("9ef23227".into()), "the first claimant keeps the id");
+            assert_eq!(dup[1], Continue, "/repo's one guess");
+            assert_eq!(dup[2], Bare, "a second pane must not reopen the same conversation");
+            assert_eq!(dup[3], Continue, "a different directory is unaffected");
         }
         println!("[selfcheck] restore: one directory, one guess ... PASS");
 
