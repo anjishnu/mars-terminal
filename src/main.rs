@@ -90,6 +90,9 @@ SESSIONS  (work survives closed windows and disconnects)
   mars ls                        list sessions and their attach state
                                  (aliases: list, --list)
   mars rename <old> <new>        rename a running session
+  mars reboot [name]             bring a session back on the binary on disk NOW —
+                                 restores each workspace's directory and resumes the
+                                 coding agent that was in it
   mars kill <name>               end + delete a session (autosaves first)
   mars killall                   the reset button: end every session (autosaved)
                                  and mars process, stop the Rover bridge, shut down
@@ -110,6 +113,11 @@ ROVER  (your sessions on your phone — needs the `web` feature)
   mars pair --check              what's set up and what isn't, with the fix for each
   mars pair --link               reprint the link for a bridge already running
   mars serve --reset             rotate the pairing token — drops every paired phone
+
+  mars manager                   run one manager turn now — read what the panes did,
+                                 write the briefing and any memos
+  mars snapshot                  the same board and briefing WITHOUT a model
+                                 (deterministic; what the phone falls back to)
 
   The QR is a credential for code execution as you: a phone that can type into
   your terminal can run anything you can. Treat it like a private key, and keep
@@ -7029,6 +7037,43 @@ fn selfcheck() -> Result<()> {
             std::fs::remove_dir_all(&dir).ok();
         }
         println!("[selfcheck] restore: a chat id cannot carry a command ... PASS");
+
+        {
+            // `--continue` resumes the most recent conversation IN A DIRECTORY. For one pane that
+            // is a fair guess; for three in the same repo it silently produced three copies of ONE
+            // thread and lost the other two — and a wrong conversation looks exactly like a right
+            // one, so it is found days later. Ration it: one per directory, never for a pane whose
+            // id is known.
+            use session::AgentStart::{Bare, Continue, Resume};
+            let p = |cwd: &str, agent: bool, chat: Option<&str>| {
+                (cwd.to_string(), agent, chat.map(String::from))
+            };
+            let plan = session::restore_plan(&[
+                p("/repo", true, Some("aaaa-bbbb")),   // known id — exact
+                p("/repo", true, None),                // first guess in /repo
+                p("/repo", true, None),                // would reopen the pane above's thread
+                p("/other", true, None),               // a different directory gets its own guess
+                p("/repo", false, None),               // not an agent at all
+                p("/repo", true, Some("x\rid")),       // a payload id is not an id
+            ]);
+            assert_eq!(plan[0], Resume("aaaa-bbbb".into()), "a known id resumes exactly");
+            assert_eq!(plan[1], Continue, "the first unknown in a directory may guess");
+            assert_eq!(plan[2], Bare, "the second must not reopen the first's conversation");
+            assert_eq!(plan[3], Continue, "the ration is per directory, not per session");
+            assert_eq!(plan[4], Bare, "a shell pane starts no agent");
+            // Not `Continue`: /repo's one guess was already spent above. A refused id makes the
+            // pane a guesser, and a guesser still queues behind the directory's ration.
+            assert_eq!(plan[5], Bare, "a refused id does not get its own exemption");
+            assert_eq!(
+                session::restore_plan(&[p("/fresh", true, Some("x\rid"))])[0],
+                Continue,
+                "but a refused id does fall back rather than resuming garbage"
+            );
+            // A pane with a known id must not spend the directory's one guess.
+            let plan2 = session::restore_plan(&[p("/repo", true, Some("aaaa")), p("/repo", true, None)]);
+            assert_eq!(plan2[1], Continue, "an exact resume does not consume the ration");
+        }
+        println!("[selfcheck] restore: one directory, one guess ... PASS");
 
         {
             // The doorman's identity seam: a session's DIRECTORY is durable, its name is not.

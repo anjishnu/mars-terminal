@@ -5251,12 +5251,12 @@ impl App {
     /// The agent line goes through `send_bytes`, which queues behind the prompt probe and flushes
     /// only once the shell is genuinely reading — the mechanism `nudge_manager` learned to use
     /// after a turn typed into a not-yet-ready terminal vanished without trace.
-    pub fn restore_workspace(&mut self, cwd: &std::path::Path, agent: bool, chat: Option<&str>) {
+    pub fn restore_workspace(&mut self, cwd: &std::path::Path, start: &crate::session::AgentStart) {
         // `open_terminal` takes its cwd from here; setting it is the whole of "restore the
         // directory". Cleared by the caller once the last workspace is up.
         self.startup_cwd = Some(cwd.to_path_buf());
         self.open_terminal();
-        if !agent {
+        if *start == crate::session::AgentStart::Bare {
             return;
         }
         let id = self.focused_pane_id();
@@ -5268,9 +5268,13 @@ impl App {
                 // `Mars-Mission/mars-terminal`, so `--continue` would confidently restore a
                 // different conversation. `--continue` stays as the fallback for a pane whose id
                 // was never captured.
-                let line = match chat {
-                    Some(id) => format!("claude --resume {id}\r"),
-                    None => "claude --continue\r".to_string(),
+                let line = match start {
+                    crate::session::AgentStart::Resume(id) => format!("claude --resume {id}\r"),
+                    crate::session::AgentStart::Continue => "claude --continue\r".to_string(),
+                    // Nothing is typed. See `restore_plan`: a second pane in the same directory
+                    // would resume the FIRST pane's conversation, and two copies of one thread
+                    // read as success while the other thread is quietly gone.
+                    crate::session::AgentStart::Bare => return,
                 };
                 // Marker-gated, not prompt-gated: the glyph heuristic fires on a prompt that is
                 // drawn but not yet reading, and this line vanishing silently is the difference

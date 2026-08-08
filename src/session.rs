@@ -664,16 +664,19 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
         if panes.is_empty() {
             app.open_terminal();
         } else {
-            for (i, (cwd, agent, chat)) in panes.iter().enumerate() {
+            let plan = restore_plan(&panes);
+            for (i, ((cwd, _, _), start)) in panes.iter().zip(plan.iter()).enumerate() {
                 if i > 0 {
                     app.new_tab();
                 }
-                app.restore_workspace(std::path::Path::new(cwd), *agent, chat.as_deref());
+                app.restore_workspace(std::path::Path::new(cwd), start);
             }
             app.clear_startup_cwd();
             // The manifest just consumed becomes read-only until its promise is delivered —
-            // see `restore_hold` for the release conditions.
-            let promised = panes.iter().filter(|(_, agent, _)| *agent).count();
+            // see `restore_hold` for the release conditions. Only panes that will actually START
+            // an agent are promised: counting a pane we deliberately left bare would hold the
+            // manifest hostage until the deadline for an agent nobody asked to appear.
+            let promised = plan.iter().filter(|s| **s != AgentStart::Bare).count();
             if promised > 0 {
                 app.restore_promise =
                     Some((promised, crate::worklog::now_secs() + app.tuning.restore_hold_secs));
@@ -1865,6 +1868,49 @@ pub fn valid_chat_id(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// How one restored pane should bring its agent back.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AgentStart {
+    /// The conversation is known by id — the only outcome that restores the RIGHT one.
+    Resume(String),
+    /// No id, but nothing else in this directory is claiming `--continue`, so the most recent
+    /// conversation here is a fair guess.
+    Continue,
+    /// A shell, and no agent line at all.
+    Bare,
+}
+
+/// Decide, for the whole manifest at once, how each agent pane comes back.
+///
+/// `--continue` resumes the most recent conversation IN A DIRECTORY, which is fine for one pane
+/// and actively wrong for several: three panes in the same repo all resumed the SAME conversation,
+/// so a reboot produced three copies of one thread and lost the other two. That is worse than not
+/// restoring them — a bare shell is obviously empty, whereas a confidently wrong conversation
+/// looks like it worked and is discovered much later.
+///
+/// So `--continue` is rationed: at most one per directory, and only where no id was captured.
+/// Panes with a real id are unaffected and never consume the ration.
+pub fn restore_plan(panes: &[(String, bool, Option<String>)]) -> Vec<AgentStart> {
+    let mut spent: Vec<&str> = Vec::new();
+    panes
+        .iter()
+        .map(|(cwd, agent, chat)| {
+            if !*agent {
+                return AgentStart::Bare;
+            }
+            if let Some(id) = chat.as_deref().filter(|s| valid_chat_id(s)) {
+                return AgentStart::Resume(id.to_string());
+            }
+            if spent.iter().any(|d| *d == cwd.as_str()) {
+                AgentStart::Bare
+            } else {
+                spent.push(cwd.as_str());
+                AgentStart::Continue
+            }
+        })
+        .collect()
+}
+
 pub fn read_restore(name: &str) -> Vec<(String, bool, Option<String>)> {
     let Some(p) = restore_path(name) else { return Vec::new() };
     let Ok(txt) = std::fs::read_to_string(p) else { return Vec::new() };
@@ -1929,12 +1975,31 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
              (A session started before this feature has no manifest; the next reboot will have one.)"
         );
     } else {
-        let agents = panes.iter().filter(|(_, a, _)| *a).count();
-        println!(
-            "rebooting '{name}' — {} workspace(s) to restore{}",
-            panes.len(),
-            if agents > 0 { format!(", {agents} with a coding agent") } else { String::new() }
-        );
+        // Say which agents come back as THEMSELVES and which do not. The failure this reports is
+        // silent by nature: a pane that resumes the wrong conversation looks identical to one
+        // that resumed the right one, and is noticed only when somebody reads it and finds
+        // somebody else's work.
+        let plan = restore_plan(&panes);
+        let exact = plan.iter().filter(|s| matches!(s, AgentStart::Resume(_))).count();
+        let guessed = plan.iter().filter(|s| **s == AgentStart::Continue).count();
+        let dropped = panes.iter().zip(plan.iter())
+            .filter(|((_, a, _), s)| *a && **s == AgentStart::Bare)
+            .count();
+        println!("rebooting '{name}' — {} workspace(s) to restore", panes.len());
+        if exact > 0 {
+            println!("  {exact} agent(s) resume their exact conversation");
+        }
+        if guessed > 0 {
+            println!("  {guessed} agent(s) had no conversation id — resuming the most recent one \
+                      in their directory");
+        }
+        if dropped > 0 {
+            println!(
+                "  {dropped} agent(s) come back as a bare shell: no id, and another pane in the \
+                 same directory is already resuming there.\n  Restoring them too would reopen \
+                 that same conversation, not theirs."
+            );
+        }
     }
 
     // The bridge goes too — but ONLY when this session is the paired one. It is a separate

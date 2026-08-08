@@ -462,7 +462,7 @@ fn session_narrative(s: &SessionSnap) -> String {
     parts.join(" ")
 }
 
-fn session_briefing(s: &SessionSnap, ts: u64) -> String {
+fn session_briefing(s: &SessionSnap, _ts: u64) -> String {
     let mut needs: Vec<&PaneRow> = s
         .panes
         .iter()
@@ -729,7 +729,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
     }
     let briefs: &[(String, String)] = &all;
     let mut cards: Vec<serde_json::Value> = Vec::new();
-    for (name, dir) in &dirs {
+    for (_name, dir) in &dirs {
         // The DIRECTORY id rides on every card: it is the durable session identity (names are
         // renamed, dirs are not), and it is what the bridge scopes a phone's view by.
         let dir_id = dir.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
@@ -1644,11 +1644,6 @@ pub fn agent_enabled(repo: &Path) -> bool {
     }
 }
 
-/// The file the phone writes to flip the switch.
-pub fn agent_switch_path() -> Option<PathBuf> {
-    Some(repo_dir()?.join("agent.enabled"))
-}
-
 /// Record that a turn was actually DELIVERED to the agent — called only once the bytes are in the
 /// pane, never merely because we decided to send them. The first attempt failed exactly here: the
 /// pane had just been created, the prompt went to a shell that had not finished starting, and
@@ -1891,7 +1886,7 @@ pub fn emit(
     origin: &str,
     sessions: &[SessionSnap],
     ts: u64,
-    stale_secs: u64,
+    _stale_secs: u64,
     output: &serde_json::Value,
 ) -> Result<Vec<String>> {
     scaffold_docs(repo)?;

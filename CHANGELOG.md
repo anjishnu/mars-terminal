@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.7.0
+
+Mars grows a second head. A long agent run doesn't need you at the keyboard — it needs
+you to notice when it stops — so this release puts your running sessions on your phone,
+and gives the machine a manager that watches them while you're away and reports in plain
+English when you come back. Everything the phone can do is something you press; nothing
+acts on its own.
+
+### Added
+- **Rover — your sessions on your phone.** `mars pair` prints a QR; scan it and the
+  sessions on that machine are readable from a pocket. There is no account and no cloud
+  service holding your data: the code carries a one-time link to *your* daemon over a
+  tunnel that closes when you stop the bridge. You get the **Mission Briefing** in the
+  mission-control voice, a **board** of every workstream with a plain-English "why" under
+  anything that failed, and **live panes** with real scrollback — answer a `[y/N]` with a
+  button, type a line, or drive a TUI with an on-screen arrow pad. URLs and commands the
+  agent printed become tappable chips that copy cleanly, because selecting text on a
+  phone terminal is miserable. `mars pair --check` reports what is set up and what isn't,
+  with the fix for each, rather than failing quietly.
+- **One pairing covers the host.** Every session on that machine appears in the fleet
+  list and you switch between them without re-scanning — one port, one tunnel, one token,
+  with each phone routed to the session it asked for.
+- **Rover chat.** Ask about the machine in plain language ("why did the build fail?").
+  It is a real Claude Code session that reads the repo and the panes, so the answer is
+  what is actually true rather than a fluent guess — and it can *offer* to act: open a
+  file, start a workspace, run a command, write a note. Each offer is a card you press.
+  The agent behind it is **read-only by construction**; every effect is a proposal.
+- **A manager agent.** Between your visits it reads what the panes did, writes a mission
+  briefing and short **memos** — a stuck deploy, a credential about to expire — and scores
+  its own runs. Memos are assignable: point one at a worker and it starts on the job.
+  `mars manager` runs a turn on demand; `agent.enabled` is the off switch.
+- **`mars reboot`.** Bring a session back on the binary that is on disk *now*, restoring
+  each workspace's directory and resuming the coding agent that was in it — so shipping a
+  new build no longer means losing the desk you were working at.
+- **`SECURITY.md`.** What a pairing token can do, what someone without one cannot, and the
+  rule that governs the rest: text an agent reads is untrusted input, and the human press
+  is the trust boundary.
+
+### Changed
+- **The bridge follows the session, not the process.** It resolves through the session's
+  durable directory, so a rename or a daemon restart no longer strands a paired phone —
+  and it upgrades itself in place, with nothing above it to drift out of date.
+- **The manager view is computed on request** rather than stored, which removes the whole
+  class of stale-index and concurrent-writer bugs that a cached view invited.
+- **Session artifacts live in `~/.mars/sessions/<id>/`**, keyed by id rather than name, so
+  renaming a session no longer orphans its history.
+
+### Security
+- **The agent cannot rewrite its own standing orders.** `run.sh` denies it the tool, Mars
+  compares each instruction doc against the built-in before every tick and refuses to run
+  on unblessed drift, and a doc claiming a version we did not write is replaced rather
+  than trusted.
+- **Agent-authored strings can no longer reach a shell.** A restored conversation id is
+  validated rather than escaped; a memo whose *filename* is not a name is never turned
+  into a card; and the phone refuses to type a path that is not a path.
+- **Assigned workers cannot edit what executes without being run** — build scripts, CI
+  workflows, git hooks, manifests, and `.claude/**`.
+- The pairing token is compared in constant time, stored `0600`, and rotated by
+  `mars serve --reset`; model spend has a ceiling; and the filesystem surface caps writes
+  and refuses anything outside `$HOME`.
+
+### Fixed
+- **A reboot no longer restores the wrong conversation.** An agent pane with a known id
+  resumes exactly that thread; where no id was captured, at most one pane per directory
+  falls back to `--continue`, and the rest come back as bare shells. Three panes in one
+  repo used to resume three copies of a single conversation and silently lose the other
+  two — and a wrong conversation looks exactly like a right one.
+- **Each phone sees only its own session's memos and briefings.** The manager is one agent
+  across many sessions, and its view used to aggregate them.
+- **Every quit leaves a death note**, so a session that vanished can say why.
+
 ## 0.6.0
 
 Mars becomes usable with the mouse without ever punishing the keyboard: the bottom
