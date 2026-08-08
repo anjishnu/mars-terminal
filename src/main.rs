@@ -7108,6 +7108,22 @@ fn selfcheck() -> Result<()> {
                 Some("__sc_after__"),
                 "a rename must be followed on the NEXT call, not cached from the first"
             );
+            // And the DISPLAY seam. MARS_SESSION is set once at daemon start and holds the
+            // directory id, so it keeps saying `0` after the session is renamed to `mars-dev`.
+            // Echoing it names a session that is in no listing and has no socket — which made a
+            // rename to the session's own current name look like it did nothing, and put `s=0`
+            // in the pairing link the phone identifies the session by.
+            std::fs::write(dir.join("meta.json"), r#"{"name":"__sc_renamed__"}"#)?;
+            assert_eq!(
+                session::live_session_name("__selfcheck_resolver__"),
+                "__sc_renamed__",
+                "a birth name must display as the name the session answers to now"
+            );
+            assert_eq!(
+                session::live_session_name("__sc_no_such_session__"),
+                "__sc_no_such_session__",
+                "an unknown name is passed through, never blanked"
+            );
             std::fs::remove_dir_all(&dir).ok();
             assert!(session::session_name_for_dir("__selfcheck_resolver__").is_none());
         }

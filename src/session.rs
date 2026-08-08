@@ -1868,6 +1868,22 @@ pub fn valid_chat_id(s: &str) -> bool {
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// What this session is called NOW, given a name that may be its birth name.
+///
+/// `MARS_SESSION` is set once, when the daemon starts, and holds the session's directory id — so
+/// it keeps saying `0` long after the session was renamed to `mars-dev`. Anything that echoes it
+/// reports a name that appears in no listing and resolves to no socket, which reads as "my session
+/// is called 0" and makes a rename to its own current name look like it did nothing.
+///
+/// The directory is the durable identity and the name is the label: correct for storage, wrong for
+/// display. Translate at the seam where a human will read it.
+pub fn live_session_name(v: &str) -> String {
+    if socket_path(v).map(|p| p.exists()).unwrap_or(false) {
+        return v.to_string();
+    }
+    session_name_for_dir(v).unwrap_or_else(|| v.to_string())
+}
+
 /// How one restored pane should bring its agent back.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum AgentStart {

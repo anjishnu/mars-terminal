@@ -37,7 +37,9 @@ fn resolve_session(arg: Option<String>) -> Result<String> {
     }
     if let Ok(name) = std::env::var("MARS_SESSION") {
         if !name.is_empty() {
-            return Ok(name);
+            // Through the directory: the variable holds the BIRTH name, which stops being the
+            // session's name at the first rename. See `live_session_name`.
+            return Ok(session::live_session_name(&name));
         }
     }
     // The ATTACHED session, not merely the first listed. Taking the first is how a bridge ended
