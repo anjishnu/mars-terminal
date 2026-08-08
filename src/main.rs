@@ -104,6 +104,17 @@ SESSIONS  (work survives closed windows and disconnects)
   Reattach greets you with a \"while away\" line if anything happened;
   C-x g opens the full Away Digest (timeline + durations).
 
+ROVER  (your sessions on your phone — needs the `web` feature)
+  mars pair                      print the QR, start the bridge, print the link
+                                 (alias: serve)
+  mars pair --check              what's set up and what isn't, with the fix for each
+  mars pair --link               reprint the link for a bridge already running
+  mars serve --reset             rotate the pairing token — drops every paired phone
+
+  The QR is a credential for code execution as you: a phone that can type into
+  your terminal can run anything you can. Treat it like a private key, and keep
+  the bridge up only while you are using it. See SECURITY.md.
+
 AGENT  (BETA — an assistant, not an authority; review what it proposes)
   mars setup                     how to get a free API key and turn on the agent
   mars ask \"<question>\"          one-shot answer from the LLM agent

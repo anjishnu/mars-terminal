@@ -283,6 +283,66 @@ With an agent connected, tabs you haven't named get a quiet auto-generated label
 from their content (rename one yourself and it's yours forever; `auto_name_secs = 0`
 turns it off).
 
+## Rover — your sessions on your phone
+
+Long agent runs don't need you at the keyboard; they need you to *notice* when
+something stops. Rover is a phone client for the sessions already running on your
+machine: scan a QR once, and the work you left behind is readable from a pocket —
+with the ability to answer a prompt, run a command, or point a worker at a problem
+without going back to the desk.
+
+```bash
+mars pair               # print the QR, start the bridge, print the link
+mars pair --check       # what's set up and what isn't, with the fix for each
+mars pair --link        # reprint the link for an already-running bridge
+mars serve --reset      # rotate the pairing token (drops every paired phone)
+```
+
+Scan the code and the phone is linked. There is no account, no cloud service holding
+your data, and nothing to sign up for: the QR carries a one-time link to *your*
+machine, and the phone talks to your daemon over a tunnel that closes when you stop
+the bridge.
+
+**What you get on the phone:**
+
+- **Mission Briefing** — the same situation report `mars attach` shows, in the
+  mission-control voice, typed out as it loads. What broke, what finished, what is
+  still running.
+- **The board** — every workstream with a verdict and a plain-English "why" under
+  anything that failed. Tap a card to see the pane behind it.
+- **Live panes** — a real view of any terminal, scrollback included. Answer a `[y/N]`
+  with a button, type a line, or use the on-screen arrow pad for a TUI. URLs and
+  commands the agent printed become tappable chips that copy cleanly, because
+  selecting text on a phone terminal is miserable.
+- **Memos** — things the manager thinks are worth your attention that aren't a
+  workspace: a stuck deploy, a credential about to expire. Assign one to a worker
+  and it starts on it.
+- **Rover chat** — ask about the machine in plain language ("why did the build
+  fail?"). It reads the repo and the panes and answers with what's actually true,
+  and can *offer* to act: open a file, start a workspace, run a command, write a
+  note. Each offer is a card you press. It never acts on its own.
+
+One pairing covers the whole host: every session on that machine shows up in the
+fleet list, and you switch between them without re-scanning.
+
+**What Rover deliberately will not do.** The agent behind Rover chat is read-only —
+it looks, and every effect is a proposal you approve on the device. Anything that
+changes the machine takes a deliberate press, not a tap, and anything destructive
+takes a red one that names what it will end. Commands land in a pane you can watch,
+not somewhere invisible.
+
+**Treat the QR like a private key.** A phone that can type into your terminal can run
+anything you can run, so the pairing token is a credential for code execution as you,
+and it does not expire on its own. Rotate it with `mars serve --reset` after any
+exposure, and keep the bridge up only while you're using it.
+[`SECURITY.md`](./SECURITY.md) sets out the whole boundary — what a token holder can
+do, what someone without one can't, and how text an agent reads is treated as
+untrusted input.
+
+Rover needs the `web` feature (`cargo install mars-terminal --features web --locked`)
+and a tunnel binary on PATH for access from outside your LAN; `mars pair` walks you
+through the setup and tells you which piece is missing rather than failing quietly.
+
 ## Keys you already know
 
 Mars speaks three dialects at once — whichever your fingers know:
