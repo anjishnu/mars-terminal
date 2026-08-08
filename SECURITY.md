@@ -141,15 +141,14 @@ Stated plainly because a gap you know about is cheaper than one a user discovers
 3. **No visibility into who is connected or who has been knocking.**
 4. **A memo carries no provenance.** Nothing distinguishes "the agent concluded this" from "the
    agent was told to write this by text it read," which is exactly the distinction a reader needs.
-5. **The memo render can hide what the worker will read.** The trust model for assigning a worker
-   is deliberate and matches the `run` card: the full memo body is displayed above the button, and
-   a human who reads it and holds anyway is assumed to have seen nothing obviously hostile. That
-   assumption is sound exactly as far as the display is faithful — and today it is not quite.
-   Markdown shows a link's label and not its URL, and raw HTML (including comments) is dropped
-   from view entirely rather than shown, so text can reach the worker that never reached the
-   reader. The worker also reads the *file*, frontmatter included, and is told to "gather what it
-   cites", so it follows references the reader never saw. Making the reviewed bytes the executed
-   bytes is what turns this assumption from approximately true into true.
+5. **A worker follows citations the reader never saw.** The trust model for assigning a worker is
+   deliberate and matches the `run` card: the full memo body is displayed above the button, and a
+   human who reads it and holds anyway is taken to have seen nothing obviously hostile. The render
+   is now faithful enough to carry that — HTML and comments are escaped and shown as literal text
+   (measured), and a link whose label differs from its URL shows the URL. What remains is that the
+   worker reads the *file* rather than the render, so frontmatter is not on screen, and the brief
+   tells it to "gather what it cites" — so a clean-reading memo can point at something that is
+   not. Narrowing the worker to the bytes the reader saw is the remaining distance.
 
 ## Out of scope
 
