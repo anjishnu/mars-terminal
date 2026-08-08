@@ -129,6 +129,24 @@ pub fn split_front(text: &str) -> Option<(&str, &str)> {
     Some((&rest[..end], &rest[end + 5..]))
 }
 
+/// Is this a memo's name, or is it a command wearing one?
+///
+/// A memo's filename is not just a label. It travels to the phone as the card's `path`, and the
+/// captain's "assign" tap types it into a live shell inside the worker brief — so a name holding
+/// `$(…)`, a backtick or a quote is a command, and the captain never sees it, because the card
+/// shows the memo's TITLE. The name is chosen by an agent that reads untrusted terminal output.
+///
+/// `memos.md` already asks for kebab-case, but that is prose an LLM must remember to follow, and
+/// the whole premise here is an agent that has been talked into something. Constrain the alphabet
+/// at the reader instead: a name outside it is not sanitized, it is simply not a memo, so it never
+/// reaches a card. Fails safe — the worst case is an odd file going unlisted.
+pub fn safe_memo_name(n: &str) -> bool {
+    n.ends_with(".md")
+        && !n.starts_with('.')
+        && n.len() <= 128
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
     let Ok(rd) = std::fs::read_dir(feed) else { return Vec::new() };
     let mut out = Vec::new();
@@ -136,8 +154,7 @@ fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
         let p = e.path();
         // Any .md in the directory is a memo. The agent names files after their title, so an
         // allowlist of prefixes would silently drop everything it writes.
-        let is_card = p.file_name().and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(".md") && !n.starts_with('.'));
+        let is_card = p.file_name().and_then(|n| n.to_str()).is_some_and(safe_memo_name);
         if !is_card {
             continue;
         }
