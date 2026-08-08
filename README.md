@@ -343,6 +343,10 @@ Rover needs the `web` feature (`cargo install mars-terminal --features web --loc
 and a tunnel binary on PATH for access from outside your LAN; `mars pair` walks you
 through the setup and tells you which piece is missing rather than failing quietly.
 
+**[`ROVER.md`](./ROVER.md) is the full manual** — setup, how to link Claude Code (and the
+one environment variable that silently breaks it), the gesture grammar, what the agent may
+and may not do, and troubleshooting.
+
 ## Keys you already know
 
 Mars speaks three dialects at once — whichever your fingers know:
@@ -408,4 +412,6 @@ anything that reads wrong (especially on the light theme).
 - [`DESIGN.md`](./DESIGN.md) — architecture rationale, tradeoffs, and how the pieces fit.
 - [`key_design.md`](./key_design.md) — the design doctrine and product vision
   (why the keys are what they are, and where Mars is going).
+- [`ROVER.md`](./ROVER.md) — the Rover manual: pairing, Claude Code, and the phone UI.
+- [`SECURITY.md`](./SECURITY.md) — the security boundary and how to report a vulnerability.
 - [`AGENTS.md`](./AGENTS.md) — instructions for AI coding agents working on Mars.

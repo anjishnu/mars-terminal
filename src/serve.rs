@@ -2026,7 +2026,13 @@ pub fn preflight_bridge(session: Option<&str>) -> Vec<Check> {
 
     out.push(match ngrok_domain() {
         Some(d) => Check::ok("stable URL", d),
-        None => Check::skip("stable URL", "not set — the QR changes on every restart"),
+        // Skip carries no fix, and this is the one skip a reader wants to act on — a changing URL
+        // means re-scanning after every restart, which is the most common "Rover stopped working".
+        None => Check::skip(
+            "stable URL",
+            "not set — the QR changes on every restart. Reserve a free domain at \
+             dashboard.ngrok.com/domains, then: mars pair --domain <name>.ngrok-free.dev",
+        ),
     });
     out
 }

@@ -112,6 +112,7 @@ ROVER  (your sessions on your phone — needs the `web` feature)
                                  (alias: serve)
   mars pair --check              what's set up and what isn't, with the fix for each
   mars pair --link               reprint the link for a bridge already running
+  mars pair --domain <d>         pin the tunnel URL so the QR survives restarts
   mars serve --reset             rotate the pairing token — drops every paired phone
 
   mars manager                   run one manager turn now — read what the panes did,
@@ -449,6 +450,19 @@ fn main() -> Result<()> {
             }
             if has("--link") {
                 return serve::link_main(session);
+            }
+            // Pin the tunnel URL. Without it ngrok mints a fresh random host on every restart, so
+            // every phone must re-scan — the most common way Rover "stops working". It lived only
+            // in an env var, which a new shell and a launchd agent both lose; this writes it to
+            // config where both can see it.
+            if let Some(i) = rest.iter().position(|a| a == "--domain") {
+                let d = rest.get(i + 1).filter(|d| !d.starts_with('-')).ok_or_else(|| {
+                    anyhow::anyhow!("usage: mars pair --domain <name>.ngrok-free.dev")
+                })?;
+                serve::set_ngrok_domain(d)?;
+                println!("stable URL set to {d} — it survives restarts, so the phone keeps its link.");
+                println!("Reserve it first at https://dashboard.ngrok.com/domains if you have not.");
+                return Ok(());
             }
             // Hand the bridge to launchd, so it is a child of launchd rather than of whatever
             // terminal started it. Started by hand from a pane, it dies with the session it
