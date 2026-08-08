@@ -35,9 +35,10 @@ coverage/
 .env.local
 # Forward-looking product strategy stays private unless a reviewed handoff is
 # explicitly allow-listed here.
-design_ideas/*
-!design_ideas/README.md
-!design_ideas/windows-parity-handoff.md
+# Forward-looking product strategy stays private — the whole directory, no exceptions. The two
+# files that were previously un-ignored (README.md, windows-parity-handoff.md) went with it: one
+# carve-out is how a directory that is meant to be private starts leaking again.
+design_ideas/
 # Research artifacts (EMNLP paper + experiment harness/results) — they live on
 # the naacl-research branch and local disk, not in the product mainline
 paper/
