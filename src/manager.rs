@@ -147,7 +147,7 @@ pub fn safe_memo_name(n: &str) -> bool {
         && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
+pub fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
     let Ok(rd) = std::fs::read_dir(feed) else { return Vec::new() };
     let mut out = Vec::new();
     for e in rd.flatten() {
