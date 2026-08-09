@@ -192,8 +192,13 @@ sonnet-5 at low 2.6s, at medium 3.6s, haiku-4.5 3–7s with a weaker answer.
 **Fleet** → the machines and sessions you have paired. **Mission control** → one session's briefing
 and board. **Dive** → a single pane, live.
 
-Swipe left, or hold, to go deeper. The breadcrumb at the bottom shows where you are; hold its right
-end to open the side menu.
+Swipe left, or hold, to go deeper. The breadcrumb at the bottom shows where you are.
+
+**The side menu opens from the glowing bar on the left edge**, at every level including the fleet
+page — tap it, or swipe in from the edge and the drawer follows your finger. What is in it depends
+on where you are: the fleet page's drawer holds the things that belong to the phone (pairing,
+renaming a session, themes, install), and inside a session it also holds that session's own
+controls — a new terminal, files, the manager, the work server.
 
 ### The gesture grammar
 
@@ -267,8 +272,9 @@ The agent cannot execute any of these itself. It proposes; the parser enforces t
 the count at three; you press. A `run` card prints the command verbatim — read it before holding,
 the same way you would read a stranger's shell one-liner before pasting it.
 
-Session lifecycle — creating and renaming — is deliberately **not** in the agent's vocabulary. Those
-live in the fleet page and the side menu, where they are your decision.
+Session lifecycle — creating and renaming — is deliberately **not** in the agent's vocabulary. Both
+live in the side menu, where they are your decision: **New session** inside a session (you are
+already talking to the machine that would host it), and **Rename a session** on the fleet page.
 
 ---
 
