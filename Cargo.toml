@@ -92,3 +92,13 @@ sha2 = "0.10"
 # pinned unicode-width.) Our own crate keeps overflow checks on.
 [profile.dev.package.vt100]
 overflow-checks = false
+
+# Ship a smaller binary without making every user's `cargo install` slower.
+#
+# `strip` removes debug symbols: measured 10.2 MB -> 8.7 MB here, and it costs no compile time.
+# Deliberately NOT setting `lto` or `codegen-units = 1`: they would shrink it further and shave a
+# little runtime, but users compile this crate themselves, so that cost lands on every install
+# rather than on us once. A panic here prints a message, not a symbolicated trace, and the
+# selfcheck runs on the debug build where symbols survive.
+[profile.release]
+strip = true
