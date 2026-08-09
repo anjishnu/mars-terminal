@@ -2428,7 +2428,7 @@ pub fn snapshot_main(repo: Option<String>) -> Result<()> {
 /// for iterating on the agent was the one command that could not feed it. Uses frames the daemon
 /// has spoken since long before today, so it works against whatever is already running: no
 /// restart, and no interrupting a session someone is working in.
-fn pane_output_of(session: &str, panes: &[String]) -> serde_json::Value {
+fn pane_output_of(session: &str, panes: &[String], tail_lines: usize) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     let Ok(path) = crate::session::socket_path(session) else { return serde_json::Value::Object(out) };
     let Ok(stream) = crate::sys::control::connect(&path) else { return serde_json::Value::Object(out) };
@@ -2464,7 +2464,7 @@ fn pane_output_of(session: &str, panes: &[String]) -> serde_json::Value {
                                     .map(|l| plain(l.as_bytes()))
                                     .filter(|l| !l.trim().is_empty())
                                     .collect::<Vec<_>>();
-                                let n = tail.len().saturating_sub(20);
+                                let n = tail.len().saturating_sub(tail_lines);
                                 tail.drain(..n);
                             }
                         }
@@ -2501,7 +2501,7 @@ pub fn force_snapshot(ts: u64) -> Result<usize> {
     for name in live_session_names() {
         let Some(snap) = board_of(&name) else { continue };
         let panes: Vec<String> = snap.panes.iter().map(|p| p.pane_id.clone()).collect();
-        let output = pane_output_of(&name, &panes);
+        let output = pane_output_of(&name, &panes, 20);
         emit(&repo, &host_name(), std::slice::from_ref(&snap), ts, 2700, &output)?;
         n += 1;
     }
@@ -3194,6 +3194,26 @@ fn read_all_session_dirs() -> Vec<PathBuf> {
 /// Deliberately bounded. The tail is capped and the note is already short by contract, so an
 /// answer costs the same whether the pane printed ten lines or ten million — the manager's own
 /// discipline, applied one level over.
+/// How much terminal the chat is given. Thirty was inherited from the board's summary budget,
+/// where brevity is the point; a captain asking about a failure needs the error AND what led to
+/// it, and a stack trace or a compiler diagnostic is routinely longer than thirty lines.
+pub const CHAT_TAIL_LINES: usize = 50;
+
+/// The pane's screen RIGHT NOW, asked of the daemon rather than read off a snapshot.
+///
+/// The chat used to answer from `snapshots/`, which is written by the manager's tick — so "what its
+/// screen shows now" was as old as the last tick, and empty whenever the manager was switched off.
+/// Asking "what does the terminal say?" and being answered from a file written twenty minutes ago
+/// is worse than being told nothing, because the answer is confident and wrong.
+///
+/// Returns empty if the daemon cannot be reached, so the caller can fall back and SAY it fell back.
+pub fn pane_tail_now(session: &str, pane: &str, lines: usize) -> Vec<String> {
+    let v = pane_output_of(session, std::slice::from_ref(&pane.to_string()), lines);
+    v[pane]["tail"].as_array().into_iter().flatten()
+        .filter_map(|l| l.as_str().map(str::to_string))
+        .collect()
+}
+
 pub fn target_context(kind: &str, id: &str) -> String {
     if kind == "memo" {
         // A memo carries its whole substance in its own file; nothing else to gather.
@@ -3242,11 +3262,28 @@ pub fn target_context(kind: &str, id: &str) -> String {
                 w["verdict"].as_str().unwrap_or("?"),
                 w["ageSecs"].as_u64().unwrap_or(0),
             ));
-            let tail: Vec<&str> = w["output"]["tail"].as_array().into_iter().flatten()
-                .filter_map(|l| l.as_str()).collect();
-            if !tail.is_empty() {
-                let from = tail.len().saturating_sub(30);
-                out.push_str(&format!("WHAT ITS SCREEN SHOWS NOW\n{}\n\n", tail[from..].join("\n")));
+            // LIVE first. The snapshot is the manager's last tick, which is minutes old at best
+            // and never written at all when the agent is off — and the captain asking "what does
+            // the terminal say?" means now, not at the last tick.
+            let dir_id = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let live = crate::session::session_name_for_dir(&dir_id)
+                .map(|name| pane_tail_now(&name, id, CHAT_TAIL_LINES))
+                .unwrap_or_default();
+            if !live.is_empty() {
+                out.push_str(&format!("WHAT ITS SCREEN SHOWS NOW\n{}\n\n", live.join("\n")));
+            } else {
+                // Fall back, and SAY it is a fallback. A stale screen presented as the current one
+                // is the failure this is guarding against, not the absence of one.
+                let tail: Vec<&str> = w["output"]["tail"].as_array().into_iter().flatten()
+                    .filter_map(|l| l.as_str()).collect();
+                if !tail.is_empty() {
+                    let from = tail.len().saturating_sub(CHAT_TAIL_LINES);
+                    out.push_str(&format!(
+                        "WHAT ITS SCREEN SHOWED AT THE LAST SNAPSHOT (the live pane could not be \
+                         read just now — say so rather than implying this is current)\n{}\n\n",
+                        tail[from..].join("\n")
+                    ));
+                }
             }
             let sig = &w["output"]["signals"];
             if sig.is_object() && !sig.as_object().map(|o| o.is_empty()).unwrap_or(true) {
