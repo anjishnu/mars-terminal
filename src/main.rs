@@ -7049,13 +7049,32 @@ fn selfcheck() -> Result<()> {
             assert_eq!(prose, "Done.");
             assert!(p.is_empty());
 
-            // rename/session were WITHDRAWN from the vocabulary — the parser must drop them
-            // even when an older doc still advertises them.
+            // SESSION lifecycle stays withdrawn — the parser drops it even when an older doc
+            // still advertises it. `rename` was withdrawn alongside it and has since been
+            // readmitted for WORKSPACES only, which is the whole distinction: naming the tab you
+            // are looking at is reversible and stops nothing; creating or renaming a session is
+            // fleet-page work. If this ever parses a `session` verb again, that ruling has been
+            // lost rather than revisited.
             let (_, p) = manager::split_proposals(
                 "Ok.\n\n```do\n{\"verb\":\"rename\",\"name\":\"auth-fix\"}\n{\"verb\":\"session\",\"name\":\"x\"}\n{\"verb\":\"note\",\"body\":\"kept\"}\n```",
             );
-            assert_eq!(p.len(), 1, "withdrawn verbs must be dropped");
-            assert_eq!(p[0]["verb"], "note");
+            assert_eq!(p.len(), 2, "session must be dropped; workspace rename kept");
+            assert_eq!(p[0]["verb"], "rename");
+            assert_eq!(p[0]["name"], "auth-fix");
+            assert_eq!(p[1]["verb"], "note");
+
+            // A rename with no name is not a rename. The device supplies the pane; the agent must
+            // supply the only field it owns, or the card would offer an empty name.
+            let (_, p) = manager::split_proposals("Ok.\n\n```do\n{\"verb\":\"rename\",\"why\":\"x\"}\n```");
+            assert!(p.is_empty(), "a rename with no name must be dropped");
+
+            // And it never picks its own target: no pane/paneId field survives the parser, so the
+            // device cannot be talked into renaming a workspace the captain is not looking at.
+            let (_, p) = manager::split_proposals(
+                "Ok.\n\n```do\n{\"verb\":\"rename\",\"name\":\"x\",\"pane\":\"3\",\"paneId\":\"7\"}\n```",
+            );
+            assert_eq!(p.len(), 1);
+            assert!(p[0].get("pane").is_none() && p[0].get("paneId").is_none(), "rename must not carry a target");
         }
         println!("[selfcheck] rover: a proposal is parsed strictly and never picks its own target ... PASS");
 

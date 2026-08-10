@@ -3148,6 +3148,21 @@ pub fn split_proposals(answer: &str) -> (String, Vec<serde_json::Value>) {
                     "id": id, "verb": "workspace", "name": get("name").unwrap_or(""), "why": why
                 }));
             }
+            // Rename the WORKSPACE this question is about — the tab, not the session. Session
+            // lifecycle stays withdrawn by the captain's earlier ruling; a workspace called
+            // "terminal 3" that has spent two hours on a migration is the case that ruling was
+            // never about, and the agent is the thing that knows what it has been doing.
+            //
+            // The pane is NOT the agent's to choose: it names a workspace only by proposing for
+            // the one the captain is looking at, and the device supplies the id at tap time — the
+            // same rule that keeps `run` from picking its own target.
+            Some("rename") => {
+                if let Some(name) = get("name") {
+                    out.push(serde_json::json!({
+                        "id": id, "verb": "rename", "name": name, "why": why
+                    }));
+                }
+            }
             Some("run") => {
                 if let Some(cmd) = get("cmd") {
                     out.push(serde_json::json!({ "id": id, "verb": "run", "cmd": cmd, "why": why }));
