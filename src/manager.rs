@@ -1747,7 +1747,25 @@ pub fn agent_tick(
         return None;
     }
     let snap = parse_board(board_json)?;
-    let sessions = [snap];
+    // EVERY live session, not just this daemon's own.
+    //
+    // This was `[snap]`, so the batch a tick composed contained one session — its own. The manager
+    // is one agent across the whole machine, but only the daemon that won the shared lock got its
+    // session summarised, and whichever daemon wins most often starves the rest. Measured on this
+    // machine: one session's cursor was current while another sat three hours behind and a third
+    // two days, with every completed batch naming exactly one session.
+    //
+    // `run_once` (the `mars manager` CLI) always did this correctly, so the two paths disagreed
+    // about what a turn covers — and the one nobody runs by hand was the one that was right.
+    //
+    // This daemon's own snapshot stays authoritative for ITS entry: it is the freshest reading of
+    // the board we are holding, whereas the others are re-read from disk.
+    let mut sessions: Vec<SessionSnap> = live_session_names()
+        .iter()
+        .filter(|n| *n != &snap.name)
+        .filter_map(|n| board_of(n))
+        .collect();
+    sessions.push(snap);
 
     // The flag file is the cadence gate. Absent → due now, which is what makes deleting it the
     // testing lever. A newly-blocked workspace still bypasses the floor entirely.
@@ -1814,6 +1832,10 @@ fn doc_superseded(path: &Path, ours: &str) -> bool {
         // version that is not ours is a version we did not write, whichever direction it points.
         // An ordinary hand-edit keeps its version number and is still left alone.
         Some(theirs) => theirs != mine,
+        // An unversioned file is left alone. It may be a pre-versioning copy that will now never
+        // refresh — but it may equally be the human's own edit, and these docs are theirs by
+        // contract. Clobbering their work to fix our staleness is the worse trade, and there is a
+        // selfcheck asserting exactly that.
         None => false,
     }
 }
@@ -2566,19 +2588,24 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
     // EXECUTION; these are the files whose edit is a new set of INSTRUCTIONS, re-read on every
     // run — a slower path to the same place, and the one an injected agent reaches for once the
     // runner is closed to it.
+    // Drift in the instruction docs is REPORTED, not fatal — a deliberate downgrade from the
+    // refusal this used to be.
+    //
+    // Those files are the human's by contract ("AGENTS.md, docs/**, policy.md | the human. Read
+    // them; never edit them"), so a difference is most likely their own edit, and stopping the
+    // manager over a permitted action is the worse failure. It also fires on Mars's own history:
+    // an unversioned doc shipped before versioning existed can never be refreshed, so two docs on
+    // this machine had drifted for weeks and the refusal would have taken the agent down the
+    // moment a daemon restarted onto it, for something nobody did.
+    //
+    // The security property that matters is unchanged and lives a level down: the runner denies
+    // the agent the TOOL to write these files, so it cannot rewrite its own orders whatever this
+    // check says. run.sh keeps its hard refusal, because an edit there is arbitrary shell.
     if let Err((which, h)) = guarded_docs_ok(&repo) {
-        let msg = format!(
-            "{which} differs from the built-in and is not blessed — refusing to run the agent.\n\
-             The agent reads untrusted terminal output; running it on instructions that may have \
-             come from there is the one failure with no recoverable state.\n\
-             If you edited it deliberately:  echo {h} >> ~/.mars/manager.approved\n\
-             If you did not: delete ~/.mars/manager/{which} and it re-materializes clean."
+        eprintln!(
+            "note: {which} differs from the built-in. If you edited it, that is fine and this \
+             note will repeat; to silence it:  echo {h} >> ~/.mars/manager.approved"
         );
-        eprintln!("{msg}");
-        if let Some(s) = crate::session::paired_session() {
-            let _ = write_captain_note(&s, "agent-orders-blocked", &msg);
-        }
-        return Ok(msg);
     }
     println!("running batch {name} …");
     let started = std::time::Instant::now();
@@ -2941,12 +2968,7 @@ pub fn rover_chat_stream(
     mut on_stage: impl FnMut(&str),
 ) -> (String, bool) {
     let Some(repo) = repo_dir() else { return ("no manager repo".into(), false) };
-    let cwd = existing_session_dir(session)
-        .and_then(|d| std::fs::read_to_string(d.join("restore.json")).ok())
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v["panes"][0]["cwd"].as_str().map(PathBuf::from))
-        .filter(|p| p.is_dir())
-        .or_else(dirs_home);
+    let cwd = session_cwd(session).or_else(dirs_home);
 
     let mut prompt = String::new();
     if !target.trim().is_empty() {
@@ -3212,6 +3234,20 @@ pub fn pane_tail_now(session: &str, pane: &str, lines: usize) -> Vec<String> {
     v[pane]["tail"].as_array().into_iter().flatten()
         .filter_map(|l| l.as_str().map(str::to_string))
         .collect()
+}
+
+/// Where this session's work actually lives — its first pane's directory.
+///
+/// Shared on purpose. The chat agent RUNS here, so a path it proposes is relative to this; the
+/// bridge then has to resolve that path, and if it uses its own directory instead the path points
+/// nowhere and the offer is dropped without a word. Two answers to "where is this session" is the
+/// whole bug, so there is one function.
+pub fn session_cwd(session: &str) -> Option<PathBuf> {
+    existing_session_dir(session)
+        .and_then(|d| std::fs::read_to_string(d.join("restore.json")).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v["panes"][0]["cwd"].as_str().map(PathBuf::from))
+        .filter(|p| p.is_dir())
 }
 
 pub fn target_context(kind: &str, id: &str) -> String {

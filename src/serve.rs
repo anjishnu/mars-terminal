@@ -1278,21 +1278,32 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 // for a file that will not open teaches the captain the button is decorative —
                 // and the model DOES hallucinate paths, so the check has to live here, not in
                 // the prompt.
-                proposals.retain(|p| {
-                    if p.get("verb").and_then(|x| x.as_str()) != Some("open") {
-                        return true;
-                    }
-                    match p.get("path").and_then(|x| x.as_str()).map(resolve_path) {
-                        Some(Ok(rp)) if rp.is_file() => true,
-                        _ => {
-                            crate::session::debug_log(&format!(
-                                "[rover] dropped open offer for a path that will not read: {:?}",
-                                p.get("path")
-                            ));
-                            false
+                // Ground the offer AND canonicalise it. The phone reads the file back through
+                // `fs.read`, which has no idea which session the path came from — so what it is
+                // handed must already be absolute. Judging a path here and then shipping the
+                // relative form would put a working button on a path that cannot be opened.
+                let base = crate::manager::session_cwd(&sess);
+                proposals = proposals
+                    .into_iter()
+                    .filter_map(|mut p| {
+                        if p.get("verb").and_then(|x| x.as_str()) != Some("open") {
+                            return Some(p);
                         }
-                    }
-                });
+                        let raw = p.get("path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        match resolve_path_in(base.as_deref(), &raw) {
+                            Ok(rp) if rp.is_file() => {
+                                p["path"] = serde_json::json!(rp.to_string_lossy());
+                                Some(p)
+                            }
+                            _ => {
+                                crate::session::debug_log(&format!(
+                                    "[rover] dropped open offer for a path that will not read: {raw:?}"
+                                ));
+                                None
+                            }
+                        }
+                    })
+                    .collect();
                 let summary = if usable {
                     format!(
                         "{{\"text\":{},\"computedBy\":{},\"proposals\":{}}}",
@@ -1634,14 +1645,41 @@ pub fn resolve_path_for_test(raw: &str) -> std::io::Result<PathBuf> {
     resolve_path(raw)
 }
 
+/// Selfcheck seams for the session-relative resolution.
+pub fn resolve_path_in_for_test(base: Option<&std::path::Path>, raw: &str) -> std::io::Result<PathBuf> {
+    resolve_path_in(base, raw)
+}
+pub fn fs_home_for_test() -> PathBuf {
+    fs_home()
+}
+
 fn resolve_path(raw: &str) -> std::io::Result<PathBuf> {
+    resolve_path_in(None, raw)
+}
+
+/// Resolve a path the way the SESSION would, not the way the bridge would.
+///
+/// A relative path only means something against a directory, and the two processes have different
+/// ones: the chat agent runs in the session's own directory, while this bridge runs wherever it
+/// was started — measured on this machine, `~/Code` against `~/Mars-Mission/mars-terminal`. So a
+/// perfectly good `docs/design.md` from the agent resolved to nothing here, and the offer to open
+/// it was dropped silently by the grounding check. Every session whose directory differs from the
+/// bridge's was affected, which is nearly all of them.
+///
+/// Containment is unchanged: whatever the base, the result must still canonicalize inside $HOME
+/// and outside the deny-list. A base cannot widen what is reachable, only disambiguate it.
+fn resolve_path_in(base: Option<&std::path::Path>, raw: &str) -> std::io::Result<PathBuf> {
     let raw = raw.trim();
     let p = if raw.is_empty() || raw == "~" {
         fs_home()
     } else if let Some(rest) = raw.strip_prefix("~/") {
         fs_home().join(rest)
     } else {
-        PathBuf::from(raw)
+        let p = PathBuf::from(raw);
+        match base {
+            Some(b) if p.is_relative() => b.join(p),
+            _ => p,
+        }
     };
     let resolved = match p.canonicalize() {
         Ok(c) => c,

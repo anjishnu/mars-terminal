@@ -7235,6 +7235,32 @@ fn selfcheck() -> Result<()> {
 
         #[cfg(feature = "web")]
         {
+            // A relative path only means something against a directory, and the bridge's is not
+            // the session's. Resolving one against the other is how an offer to open a real file
+            // was dropped as unreadable.
+            let home = serve::fs_home_for_test();
+            let base = home.join("__selfcheck_base__");
+            std::fs::create_dir_all(base.join("docs"))?;
+            std::fs::write(base.join("docs/design.md"), "x")?;
+            assert!(
+                serve::resolve_path_in_for_test(Some(&base), "docs/design.md").is_ok(),
+                "a session-relative path must resolve against the SESSION"
+            );
+            assert!(
+                serve::resolve_path_in_for_test(None, "docs/design.md").is_err(),
+                "and against nothing without one — this is the bug that dropped the card"
+            );
+            // A base must disambiguate, never widen: containment still decides.
+            assert!(
+                serve::resolve_path_in_for_test(Some(&base), "../../../etc/hosts").is_err(),
+                "a base cannot be used to climb out of $HOME"
+            );
+            std::fs::remove_dir_all(&base).ok();
+        }
+        println!("[selfcheck] paths: a session-relative offer resolves ... PASS");
+
+        #[cfg(feature = "web")]
+        {
             // The pairing token faces a public tunnel URL, so equality must not leak a matching
             // prefix through early return. Shape checks, mutation-minded: every byte counts, both
             // lengths count, and a prefix is never a match.
