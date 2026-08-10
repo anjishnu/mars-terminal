@@ -262,7 +262,7 @@ impl Default for Tuning {
             watch_min_active_secs: 10,
             goal_tracking: 1,
             mobile_push_interval_ms: 1000,
-            mobile_pane_interval_ms: 40,
+            mobile_pane_interval_ms: 16,
             manager_snapshot_secs: 60,
             manager_snapshot_keep: 20,
             manager_detail_min_secs: 300,
@@ -551,7 +551,11 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
         ("mobile_pane_interval_ms", knob(json!(d.mobile_pane_interval_ms),
             "How often the watched pane's live screen is pushed to the phone, in ms. Separate \
              from the board's cadence because this one is felt as typing latency. Identical \
-             screens are suppressed, so a tight value is free while the pane is idle.")),
+             screens are suppressed, so a tight value is free while the pane is idle. This is a \
+             CEILING, not a rate: frames exist only when the screen actually changed, so lowering \
+             it delivers those changes sooner rather than sending more of them. Measured, a wheel \
+             took 106ms to come back against a 12ms control round trip, and up to 40 of that was \
+             this throttle.")),
         ("mobile_push_interval_ms", knob(json!(d.mobile_push_interval_ms),
             "How often (ms) the session daemon pushes the workspace board + \
              briefing to a subscribed phone (the Rover bridge). The tick loop \
