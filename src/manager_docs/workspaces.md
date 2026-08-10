@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 14 -->
+<!-- mars-doc-version: 15 -->
 # Workspace notes
 
 **Read second**, after the briefing, when a row is tapped. One file per workspace at
@@ -32,11 +32,19 @@ than as a sentence to read and retype. Same shape memos already use:
 ```markdown
 ---
 source: agent
+suggested_name: schema-migration
 actions:
   - {id: rerun, label: "Re-run that test alone", keys: "cargo test session -- --nocapture\r"}
   - {id: schema, label: "Check the migration in workspace 2"}
 ---
 ```
+
+`suggested_name` is a name this workspace has earned, offered when the one it has says nothing
+about the work. kebab-case, a few words, no quotes needed. **Omit it when the current name is
+already honest** — that is the common case, and a suggestion on every workspace is one nobody
+reads. Write it fresh each run from what the workspace is doing now; a suggestion matching the
+current name is dropped before the phone sees it, so there is no way to nag by accident and no
+bookkeeping for you to keep.
 
 `keys` is what gets typed into that pane, ending in `\r`. **Omit `keys` entirely** for anything
 that is a suggestion rather than a command — a thought the captain should have is still worth

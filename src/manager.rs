@@ -197,6 +197,43 @@ pub fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
 /// Pull `actions:` out of the frontmatter. Deliberately a small hand-parser rather than a YAML
 /// dependency: the shape is fixed, and a card whose actions fail to parse should still render as
 /// a readable document with no buttons — never vanish.
+/// Two workspace names that mean the same thing.
+///
+/// Normalised, because the agent writes kebab-case and a human types spaces and capitals. This is
+/// the whole of the "stop proposing once it is adopted" rule: a suggestion to rename a thing to
+/// what it is already called is not a suggestion, and dropping it here needs no stored state to
+/// remember that the captain agreed — the name on the workspace IS the record.
+fn same_name(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.trim().to_lowercase().replace([' ', '_'], "-");
+    norm(a) == norm(b)
+}
+
+/// The rename this workspace should be offered, given what it is called now. One seam, so the
+/// whole rule is one thing to read and one thing to assert.
+pub fn suggested_rename(current: &str, raw: Option<&str>) -> Option<String> {
+    let n = sane_workspace_name(raw?)?;
+    (!same_name(&n, current)).then_some(n)
+}
+
+/// The whole read path, from a workspace summary's text to the name to offer — so the selfcheck
+/// exercises the frontmatter parse rather than only the rule that follows it.
+pub fn suggested_rename_of_doc(current: &str, doc: &str) -> Option<String> {
+    let front = split_front(doc).map(|(f, _)| f)?;
+    suggested_rename(current, front_field(front, "suggested_name").as_deref())
+}
+
+/// A suggested name fit to send to the phone, or nothing.
+///
+/// This crosses a trust boundary that is easy to miss: the manager writes this field after reading
+/// terminal output, which any program on the machine can write into, and the phone can turn it
+/// into a rename with one press. So it is filtered like input rather than trusted like config —
+/// control characters out (a pane title is drawn into a TUI), and a length that stays a label.
+fn sane_workspace_name(s: &str) -> Option<String> {
+    let t: String = s.trim().trim_matches('"').chars().filter(|c| !c.is_control()).collect();
+    let t = t.trim().to_string();
+    (!t.is_empty() && t.chars().count() <= 40).then_some(t)
+}
+
 fn parse_actions(front: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let mut in_actions = false;
@@ -838,11 +875,18 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     // The `Do` block, as buttons rather than as a sentence to retype. Read from
                     // frontmatter with the SAME parser memos use — the format was already proven
                     // there, and a second one would be a second thing to get wrong.
-                    let actions = dir.as_ref()
+                    let front = dir.as_ref()
                         .and_then(|d| std::fs::read_to_string(
                             d.join("workspaces").join(format!("{}.md", p.pane_id))).ok())
-                        .and_then(|t| split_front(&t).map(|(f, _)| parse_actions(f)))
-                        .unwrap_or_default();
+                        .and_then(|t| split_front(&t).map(|(f, _)| f.to_string()));
+                    let actions = front.as_deref().map(parse_actions).unwrap_or_default();
+                    // A name the workspace has earned. Dropped when it matches what the pane is
+                    // already called — which is what happens the run after the captain adopts it,
+                    // and is why adoption silences this without anything having to remember it.
+                    let suggested = suggested_rename(
+                        &p.name,
+                        front.as_deref().and_then(|f| front_field(f, "suggested_name")).as_deref(),
+                    );
                     serde_json::json!({
                         "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
                         "kind": p.kind, "ageSecs": p.age_secs,
@@ -855,6 +899,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                         "summaryAgeSecs": summary_age,
                         "summaryVersion": version_of(&summary),
                         "actions": actions,
+                        "suggestedName": suggested,
                     })
                 }).collect::<Vec<_>>()).unwrap_or_default(),
             })
@@ -3168,10 +3213,11 @@ pub fn split_proposals(answer: &str) -> (String, Vec<serde_json::Value>) {
                     out.push(serde_json::json!({ "id": id, "verb": "run", "cmd": cmd, "why": why }));
                 }
             }
-            // `rename` and `session` were verbs briefly and were WITHDRAWN by the captain's
-            // ruling: session lifecycle belongs to the fleet page's own controls, not to the
-            // conversation. The parser drops them like any unknown verb, which also disarms an
-            // older bridge's doc still advertising them.
+            // `session` was a verb briefly and was WITHDRAWN by the captain's ruling: session
+            // lifecycle belongs to the fleet page's own controls, not to the conversation. The
+            // parser drops it like any unknown verb, which also disarms an older bridge's doc
+            // still advertising it. (`rename` fell with it and has since been readmitted for
+            // workspaces only — see the arm above.)
             // END this session. The one destructive verb, and it carries no aim by
             // construction: only the session this conversation is about can be ended, and the
             // captain's card says its name in red before the gesture that means it.

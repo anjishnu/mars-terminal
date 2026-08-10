@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 16 -->
+<!-- mars-doc-version: 17 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -115,6 +115,16 @@ worth nothing under a row that already reads `build · failed`.
    PROPOSAL: the captain adopts it with one press, and a workspace called `terminal 3` that has
    spent two hours on a migration is exactly the case this exists for. Suggest nothing when the
    name is already honest; a recommendation on every workspace is one nobody reads.
+
+   **Answer the question fresh every run, and do not try to remember what you suggested before.**
+   Two things you cannot see will already have handled the repetition: a suggestion equal to the
+   workspace's current name is dropped before it reaches the phone, so a name that was adopted
+   silences itself; and a suggestion the captain declined stays hidden for as long as you keep
+   naming the same thing. Neither needs your help, and both work by comparing NAMES. So the only
+   question you answer is *what should this workspace be called today* — if the work has moved on
+   far enough that a different name fits, say that different name and it will be offered again.
+   Repeating yourself is free and costs the captain nothing; second-guessing whether you are
+   allowed to speak is what would lose a rename that mattered.
 10. **Update `memory/`** — rules in [`docs/memory.md`](docs/memory.md).
 11. **Reflect.** Revise `memory/beliefs.md` and `memory/projects.md` — format and rules in
    [`docs/memory.md`](docs/memory.md). This is the step that makes the next run better than this

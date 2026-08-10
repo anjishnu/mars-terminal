@@ -6398,6 +6398,50 @@ fn selfcheck() -> Result<()> {
         assert!(log.contains("no-receipt"), "a run with no receipt scored clean: {log}");
 
         println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
+
+        {
+            use manager::suggested_rename as sr;
+            // The offer is made when the name says nothing about the work.
+            assert_eq!(sr("terminal 3", Some("schema-migration")).as_deref(), Some("schema-migration"));
+
+            // ...and STOPS once it is adopted, which is the whole point. Nothing remembers that
+            // the captain agreed: the name on the workspace is the record, so the run after the
+            // rename asks the same question and gets silence. Normalised, because the agent writes
+            // kebab-case and a human types spaces and capitals — a suggestion that survives
+            // adoption because of a hyphen is the churn this exists to prevent.
+            assert!(sr("schema-migration", Some("schema-migration")).is_none());
+            assert!(sr("Schema Migration", Some("schema-migration")).is_none());
+            assert!(sr("schema_migration", Some(" schema-migration ")).is_none());
+
+            // A DIFFERENT name is what divergence looks like from here: the workspace moved on,
+            // the agent says something new, and that gets through even though the last one was
+            // adopted. Suppression that outlived the work would be a name nobody could correct.
+            assert_eq!(sr("schema-migration", Some("rollback-plan")).as_deref(), Some("rollback-plan"));
+
+            // Absent, empty and quoted-empty all mean "no opinion" — the manager is told to stay
+            // quiet when the name is already honest, and quiet must not render as a card.
+            assert!(sr("terminal 3", None).is_none());
+            assert!(sr("terminal 3", Some("   ")).is_none());
+            assert!(sr("terminal 3", Some("\"\"")).is_none());
+
+            // This field crosses a trust boundary — the manager writes it after reading terminal
+            // output, and the phone turns it into a rename with one press. So it is filtered like
+            // input: no control characters into a pane title, and no essay as a label.
+            assert!(sr("terminal 3", Some("ok\u{1b}[2Jwiped")).is_none_or(|n| !n.contains('\u{1b}')));
+            assert!(sr("terminal 3", Some(&"x".repeat(41))).is_none());
+            assert_eq!(sr("terminal 3", Some(&"x".repeat(40))).as_deref(), Some("x".repeat(40).as_str()));
+        }
+        {
+            // The real read path: a workspace summary exactly as the manager is told to write it.
+            let doc = "---\nsource: agent\nsuggested_name: schema-migration\nactions:\n  - {id: a, label: \"b\", keys: \"c\\r\"}\n---\n\nRewriting the users table.\n";
+            assert_eq!(manager::suggested_rename_of_doc("terminal 3", doc).as_deref(), Some("schema-migration"));
+            assert!(manager::suggested_rename_of_doc("schema-migration", doc).is_none());
+            // The common case is silence: the field is optional and most workspaces are named fine.
+            assert!(manager::suggested_rename_of_doc("terminal 3", "---\nsource: agent\n---\n\nhi\n").is_none());
+            // Prose with no frontmatter at all — the older summaries already on disk.
+            assert!(manager::suggested_rename_of_doc("terminal 3", "just prose").is_none());
+        }
+        println!("[selfcheck] manager: a name is suggested once, then the rename itself silences it ... PASS");
         // Timing is derived from artifact mtimes, so a run's phases can be read off without the
         // agent reporting anything. What matters is that a real delivery produces a duration at
         // all — the old bound was opened->scored, which over-reported by 87 minutes on a run that
