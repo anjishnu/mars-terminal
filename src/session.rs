@@ -1775,6 +1775,11 @@ pub fn restore_path(name: &str) -> Option<std::path::PathBuf> {
 /// the most recent conversation IN A DIRECTORY, which is only the right one by luck: this session
 /// is keyed to `Mars-Mission` while its panes restore into `Mars-Mission/mars-terminal`, so a
 /// reboot would have resumed something else entirely and looked like it worked.
+/// The daemon is the only process that can answer this — it holds the pane's pid.
+pub fn claude_session_of_pub(pid: i32) -> Option<String> {
+    claude_session_of(pid)
+}
+
 fn claude_session_of(pid: i32) -> Option<String> {
     let home = crate::sys::paths::home_dir()?;
 

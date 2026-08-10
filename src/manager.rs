@@ -3221,6 +3221,11 @@ fn read_all_session_dirs() -> Vec<PathBuf> {
 /// it, and a stack trace or a compiler diagnostic is routinely longer than thirty lines.
 pub const CHAT_TAIL_LINES: usize = 50;
 
+/// How much of a conversation's delta a reader is given before the gist has to carry it. Bounded
+/// for the same reason the tail is: a pane left running all day must not become an unbounded
+/// prompt, and a fold is what keeps it from having to.
+pub const CONV_DELTA_LINES: usize = 30;
+
 /// The pane's screen RIGHT NOW, asked of the daemon rather than read off a snapshot.
 ///
 /// The chat used to answer from `snapshots/`, which is written by the manager's tick — so "what its
@@ -3298,9 +3303,27 @@ pub fn target_context(kind: &str, id: &str) -> String {
                 w["verdict"].as_str().unwrap_or("?"),
                 w["ageSecs"].as_u64().unwrap_or(0),
             ));
-            // LIVE first. The snapshot is the manager's last tick, which is minutes old at best
-            // and never written at all when the agent is off — and the captain asking "what does
-            // the terminal say?" means now, not at the last tick.
+            // THE CONVERSATION, when this pane is holding one.
+            //
+            // A screen is a rendering: fifty lines, reflowed to the phone's width, with everything
+            // above the fold gone. The conversation itself is on disk in full, so read that
+            // instead — the gist carries what the manager already folded in, the delta carries
+            // what has been said since, and both readers see the same pair.
+            if let Some(chat) = w["chat"].as_str().filter(|c| !c.is_empty()) {
+                if let Some((gist, delta)) =
+                    crate::conv::gist_and_delta(&dir, id, chat, CONV_DELTA_LINES)
+                {
+                    if !gist.trim().is_empty() {
+                        out.push_str(&format!("WHAT THIS CONVERSATION IS ABOUT\n{}\n\n", gist.trim()));
+                    }
+                    if !delta.trim().is_empty() {
+                        out.push_str(&format!("SAID SINCE THEN\n{}\n\n", delta.trim()));
+                    }
+                }
+            }
+            // LIVE screen too. The conversation says what was discussed; the screen says what the
+            // pane looks like right now — a spinner, a prompt waiting on a [y/N] — which the
+            // transcript does not record until it resolves.
             let dir_id = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let live = crate::session::session_name_for_dir(&dir_id)
                 .map(|name| pane_tail_now(&name, id, CHAT_TAIL_LINES))

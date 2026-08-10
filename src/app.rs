@@ -1159,6 +1159,19 @@ impl App {
                     if let Some(cmd) = self.fg_commands.get(t) {
                         row["cmd"] = serde_json::json!(cmd);
                     }
+                    // WHICH CONVERSATION is running here. Only the daemon can answer: it takes the
+                    // pane's foreground pid and asks Claude Code, and neither the bridge nor the
+                    // manager has a pid to ask with. Carrying it on the row is what lets them read
+                    // the transcript itself rather than the pane's rendering of it — a 50-line
+                    // window, reflowed to the phone's width, of a conversation that is on disk in
+                    // full.
+                    if let Some(term) = self.terms.get(t) {
+                        if term.foreground_command().as_deref() == Some("claude") {
+                            if let Some(id) = term.foreground_pid().and_then(crate::session::claude_session_of_pub) {
+                                row["chat"] = serde_json::json!(id);
+                            }
+                        }
+                    }
                 }
                 if blocked {
                     row["blocked"] = serde_json::json!({

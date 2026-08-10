@@ -12,6 +12,7 @@ mod ssh;
 #[path = "broker_stub.rs"]
 mod broker;
 mod buffer;
+mod conv;
 mod config;
 mod fleet;
 mod health;
@@ -7258,6 +7259,42 @@ fn selfcheck() -> Result<()> {
             std::fs::remove_dir_all(&base).ok();
         }
         println!("[selfcheck] paths: a session-relative offer resolves ... PASS");
+
+        {
+            // The conversation, read from the transcript rather than the screen. Uses a REAL
+            // Claude Code transcript on this machine, because the format is not ours to assume.
+            let dir = std::env::temp_dir().join("__selfcheck_conv__");
+            std::fs::create_dir_all(&dir)?;
+            let real = crate::sys::paths::home_dir()
+                .map(|h| h.join(".claude/projects"))
+                .and_then(|r| std::fs::read_dir(r).ok())
+                .and_then(|rd| {
+                    rd.flatten().flat_map(|e| std::fs::read_dir(e.path()).ok()).flatten()
+                        .flatten()
+                        .map(|e| e.path())
+                        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                            && std::fs::metadata(p).map(|m| m.len() > 4096).unwrap_or(false))
+                });
+            if let Some(t) = real {
+                let id = t.file_stem().unwrap().to_string_lossy().to_string();
+                let (gist, delta) = conv::gist_and_delta(&dir, "0", &id, 30).expect("transcript found by id");
+                assert!(gist.is_empty(), "no gist has been folded yet");
+                assert!(!delta.is_empty(), "a real transcript must yield readable exchanges");
+                assert!(
+                    delta.contains("captain:") || delta.contains("agent:"),
+                    "exchanges must be attributed: {}",
+                    &delta[..delta.len().min(120)]
+                );
+                assert!(delta.lines().filter(|l| l.starts_with("captain:") || l.starts_with("agent:")).count() <= 30,
+                    "the delta must respect its budget");
+                // Asked again with nothing folded, the same ground is re-offered rather than lost.
+                let (_, again) = conv::gist_and_delta(&dir, "0", &id, 30).unwrap();
+                assert!(!again.is_empty(), "an unfolded delta is shown again, never dropped");
+                assert!(conv::transcript_for("no-such-conversation-id").is_none());
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        println!("[selfcheck] conv: the transcript reads as attributed exchanges ... PASS");
 
         #[cfg(feature = "web")]
         {

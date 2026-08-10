@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 15 -->
+<!-- mars-doc-version: 16 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -103,15 +103,27 @@ worth nothing under a row that already reads `build · failed`.
 7. **Advance `memory/cursor.json`** — set each session's entry to the newest snapshot filename you
    actually read. Mars computes "unconsumed" from this: leaving it stale makes you re-read
    forever, and advancing it past files you did not read skips work silently.
-8. **Update `memory/`** — rules in [`docs/memory.md`](docs/memory.md).
-9. **Reflect.** Revise `memory/beliefs.md` and `memory/projects.md` — format and rules in
+8. **Fold each conversation's gist** — for every workspace whose entry carried a conversation,
+   rewrite `conv/<pane-id>.md` in that session's directory so it accounts for the delta you were
+   just shown, then leave the delta behind. The gist is a running answer to two questions and
+   nothing else: *what is this conversation for*, and *what is still open*. Keep it to a short
+   paragraph however long the conversation runs — it is re-read on every turn, by you and by the
+   conversational Rover, and a gist that grows with the transcript defeats the point of having
+   one. Settled matters leave; open ones stay until they are settled.
+9. **Recommend a name for each workspace** whose current one does not describe what it is doing —
+   one line in the workspace summary's frontmatter as `suggested_name: <kebab-case>`. It is a
+   PROPOSAL: the captain adopts it with one press, and a workspace called `terminal 3` that has
+   spent two hours on a migration is exactly the case this exists for. Suggest nothing when the
+   name is already honest; a recommendation on every workspace is one nobody reads.
+10. **Update `memory/`** — rules in [`docs/memory.md`](docs/memory.md).
+11. **Reflect.** Revise `memory/beliefs.md` and `memory/projects.md` — format and rules in
    [`docs/memory.md`](docs/memory.md). This is the step that makes the next run better than this
    one: everything else you write describes *now*, and this is where you record what you
    understand. Revise in place; never append. If the picture held, say so.
-10. **Write a run receipt** — your own account of what you wrote and what you deliberately
+12. **Write a run receipt** — your own account of what you wrote and what you deliberately
    skipped, format in [`docs/receipts.md`](docs/receipts.md). Mars checks the account against the
    filesystem, so a skip with a reason is a clean outcome and silence is not.
-11. **Move the batch file to `inbox/done/`.** That is how a run is recorded as finished.
+13. **Move the batch file to `inbox/done/`.** That is how a run is recorded as finished.
 
 ## Sign everything you write
 
@@ -154,7 +166,7 @@ Write to a temporary file and rename it into place, so a reader never catches a 
 
 | Path | Owner |
 |---|---|
-| `memory/**`, `../sessions/*/memos/**` | **you** |
+| `memory/**`, `../sessions/*/memos/**`, `../sessions/*/conv/*.md` | **you** |
 | `../sessions/*/workspaces/*.md`, `../sessions/*/mission_briefing.md` | **you** |
 | `../sessions/*/snapshots/**`, `meta.json` | Mars — regenerated; edits are lost |
 | `index.json`, `index.md`, `timeline.md`, `mission_briefing.computed.md` | Mars — regenerated |
