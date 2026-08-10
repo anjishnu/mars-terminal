@@ -920,6 +920,26 @@ impl App {
     pub fn tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab]
     }
+    /// Rename the workspace that OWNS `pane`, for a Rover subscriber renaming a workspace it is
+    /// not standing in (the desk path renames the ACTIVE tab through `PromptKind::RenameTab`).
+    ///
+    /// Addressed by pane rather than by the board row's `id`, which is a `tab_index` — a position
+    /// in `tabs` that every close shifts. An index that crossed the wire can name a different
+    /// workspace by the time it lands, and renaming the wrong one is silent. A pane id never
+    /// means anything but the pane it was minted for.
+    pub fn rename_workspace_of_pane(&mut self, pane: PaneId, to: &str) -> bool {
+        let to = to.trim();
+        if to.is_empty() {
+            return false;
+        }
+        let Some(idx) = self.tabs.iter().position(|t| t.layout.pane_ids().contains(&pane)) else {
+            return false;
+        };
+        let id = self.tabs[idx].id;
+        self.auto_name_attempts.entry(id).or_default().settle(); // manual name opts out, as at the desk
+        self.tabs[idx].name = to.to_string();
+        true
+    }
     pub fn focused_pane_id(&self) -> PaneId {
         self.tabs[self.active_tab].focused_pane
     }

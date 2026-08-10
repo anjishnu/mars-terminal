@@ -212,3 +212,17 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   restates it as still-true forever — a quiet board never contradicts it. `lastGreeting` is
   worse: cached in localStorage, keyed by session NAME, asserts board state, never expires.
   Clearing `rover.briefing.*` / `rover.greeting.*` is the only way to flush a poisoned cache.
+- **A board row's `id` is a `tab_index`, NOT an identity — never address a workspace by it.**
+  `mobile_board_json` emits `"id": s.tab_index.to_string()`, a position in `App::tabs`, so
+  closing any workspace shifts the id of every one after it. An id that crossed the wire can
+  name a different workspace by the time it lands, and the miss is silent. Every row also
+  carries `paneId` (a real `PaneId`, stable for the pane's life) — address workspaces by that.
+  **Workspace rename** (2026-08) does: phone sends `{t:"rename_workspace",paneId,name}` →
+  `serve.rs` → `ClientFrame::RenameWorkspace{pane,to}` → `SrvEvent` →
+  `App::rename_workspace_of_pane`, which finds the tab whose `layout.pane_ids()` contains the
+  pane. Unlike the SESSION rename it rides the subscribe writer (the daemon does not close the
+  stream) and needs no local registry mirror — the next board push carries the name back.
+- **`ui::workspace_name` ignores a purely numeric tab name** (`tab.name.parse::<usize>()` must
+  ERR for the custom name to win), so renaming a workspace to `42` from either the phone or the
+  desk prompt silently falls back to `terminal N` / the filename. Pre-existing and shared by
+  both rename paths; a validating UI would have to reject digit-only names on its own.

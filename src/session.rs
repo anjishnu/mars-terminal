@@ -100,6 +100,10 @@ pub enum ClientFrame {
     /// additive (never takes over the desktop client). It appears as a new workspace on the
     /// board and is watchable like any other pane.
     NewTerminal,
+    /// Rename the WORKSPACE (tab) that owns `pane` — the phone's drawer renaming the workspace
+    /// it is standing in. Distinct from `Rename`, which renames the whole session and ends the
+    /// connection; this one is additive and the new name returns on the next board push.
+    RenameWorkspace { pane: usize, to: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -523,6 +527,8 @@ enum SrvEvent {
     WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16>, raw: bool },
     /// A subscriber asked to open a new terminal tab (the phone's "New terminal").
     NewTerminal,
+    /// A subscriber renamed the workspace owning this pane (the phone's drawer).
+    RenameWorkspace { pane: usize, to: String },
     /// A subscriber asked for a pane's scrollback (paging up in the xterm.js renderer).
     PaneHistory { pane: usize, lines: usize },
     /// A subscriber asked for a window of a pane's transcript, by line id.
@@ -941,6 +947,13 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 app.open_terminal();
                 app.needs_redraw = true;
             }
+            Ok(SrvEvent::RenameWorkspace { pane, to }) => {
+                // Additive, like NewTerminal: the phone names a workspace without taking the
+                // session. A pane that has since closed simply renames nothing.
+                if app.rename_workspace_of_pane(pane, &to) {
+                    app.needs_redraw = true;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1293,6 +1306,11 @@ fn client_connection(
                     }
                     Ok(ClientFrame::NewTerminal) => {
                         if tx.send(SrvEvent::NewTerminal).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientFrame::RenameWorkspace { pane, to }) => {
+                        if tx.send(SrvEvent::RenameWorkspace { pane, to }).is_err() {
                             break;
                         }
                     }
