@@ -714,10 +714,26 @@ fn start_tunnel(local_port: u16) -> Result<(Option<std::process::Child>, String)
     // A pinned custom domain need not contain "ngrok" (paid custom domains don't), so accept any
     // URL that matches the configured host as well.
     let expect_host = domain.as_ref().map(|d| d.split("://").last().unwrap_or(d).trim_end_matches('/').to_string());
+    // KEEP ngrok's own account of itself. This thread already reads every line and threw all but
+    // the URL away — so the one component that knows why a tunnel died wrote its explanation into
+    // a pipe nobody read. A tunnel went down today, its local API kept reporting a healthy
+    // tunnel, and the outage was misdiagnosed twice as a phone problem because there was no record
+    // anywhere. Appended, capped, and never fatal: a log that breaks the tunnel is worse than none.
+    let log = crate::sys::paths::home_dir().map(|h| h.join(".mars").join("tunnel.log"));
+    if let Some(p) = &log {
+        // Start each run clean rather than growing without bound — the interesting window is
+        // always "since this tunnel came up".
+        if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+        let _ = std::fs::write(p, format!("--- tunnel started {} ---\n", crate::worklog::now_secs()));
+    }
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
         let mut sent = false;
+        let mut sink = log.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
         for line in reader.lines().map_while(|l| l.ok()) {
+            if let Some(f) = sink.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
             if !sent {
                 if let Some(idx) = line.find("url=https://") {
                     let url: String = line[idx + 4..].chars().take_while(|c| !c.is_whitespace()).collect();
@@ -1430,6 +1446,19 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             }
         }
         // Open a new terminal tab in the session (additive; surfaces on the next board push).
+        // Adopt the name the manager proposed for a workspace. A rename, not a suggestion: the
+        // proposing already happened, and this is the press that accepts it.
+        Some("workspace.rename") => {
+            let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            if let (Some(pane), false) = (pane, name.is_empty()) {
+                let _ = session::write_frame(writer, &ClientFrame::RenameWorkspace { pane, name: name.clone() });
+                let _ = tx.send(format!(
+                    "{{\"t\":\"toast\",\"text\":{}}}",
+                    json_str(&format!("workspace renamed to {name}"))
+                ));
+            }
+        }
         Some("new_terminal") => {
             let _ = session::write_frame(writer, &ClientFrame::NewTerminal);
         }

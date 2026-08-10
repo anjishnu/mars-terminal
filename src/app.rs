@@ -5302,6 +5302,22 @@ impl App {
         self.startup_cwd = None;
     }
 
+    /// Which tab holds this pane — the board calls a tab a "workspace", and the phone only ever
+    /// knows pane ids.
+    pub fn tab_index_of_pane(&self, pane: usize) -> Option<usize> {
+        self.tabs.iter().position(|t| t.layout.pane_ids().contains(&pane))
+    }
+
+    /// Set a tab's name and stop the auto-namer from overwriting it. An adopted name is a
+    /// decision; a generated one must not quietly replace it on the next sample — which is
+    /// exactly what the manual rename path already does.
+    pub fn set_tab_name(&mut self, idx: usize, name: &str) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        let id = tab.id;
+        tab.name = name.to_string();
+        self.auto_name_attempts.entry(id).or_default().settle();
+    }
+
     pub fn open_terminal(&mut self) {
         // If this pane is already a terminal, just re-attach.
         if let PaneContent::Terminal(_) = self.focused_pane().content {
