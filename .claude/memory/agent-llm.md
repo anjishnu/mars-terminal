@@ -136,3 +136,17 @@ Prompt assembly, provider routing, directives, and the shipped W1-W7 workflows.
   pushed into agent_history + open_bar(Ask) — deterministic, no key. Action::AwayDigest, C-x g.
 - Broker-ready: only LLM part is verdict TEXT via existing watch_summary→chat seam.
 - fmt_dur(ticks): secs = ticks*poll_interval_ms/1000 → "45s"/"4m12s"/"3h02m".
+
+## Manager docs (`src/manager_docs/*.md`) — the version marker is the whole refresh mechanism
+- `seed()` rewrites `~/.mars/manager/<doc>` only when the on-disk `<!-- mars-doc-version: N -->`
+  DIFFERS from the embedded one. Editing a doc without bumping N means the agent never sees the
+  edit — the change ships, builds, selfchecks, and silently does nothing.
+- **Bumping is not enough: bump PAST whatever is on disk.** Disk versions drift ahead of source
+  (a build that was installed and later reverted, another session's install). Landing on the same
+  number the disk already has reads as "current" and refreshes nothing. Always compare
+  `grep mars-doc-version src/manager_docs/X.md` against `~/.mars/manager/[docs/]X.md` before
+  trusting the bump; equal versions there is the healthy steady state for docs you did NOT touch.
+- Verify seeding without spending a manager turn: `MARS_MANAGER_DIR=<tmp> mars manager run` against
+  a copy of the on-disk docs, then re-read the markers. It scaffolds first, so the docs are already
+  rewritten by the time the run itself blocks on the agent (it will hang — that is expected).
+- An UNVERSIONED on-disk doc is left alone forever, by design ("ours until you make it yours").

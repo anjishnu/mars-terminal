@@ -8,6 +8,6 @@ Format: - `<topic>.md` — <one-sentence description> [keyword1, keyword2, keywo
 - `ssh-broker.md` — `mars keyd` + `mars ssh`: the key never leaves home, the fleet registry, route and credential invariants [ssh, broker, keyd, remote, fleet, auth, capability, credential, tunnel]
 - `windows-port.md` — Windows adapter facts: ConPTY, control-channel auth, key events, job objects, OpenSSH limits [windows, conpty, msvc, hmac, nonce, job, openssh]
 - `ui-input.md` — keybinding rulings, mouse/hit registry, selection, undo, navigator, motion, theming [ui, mouse, click, selection, drag, undo, tree, navigator, sidebar, motion, keybinding, theme, palette, splash, render]
-- `agent-llm.md` — provider precedence and routing, directives, and the shipped W1-W7 agent workflows [agent, llm, provider, anthropic, groq, gemini, model, tier, prompt, directive, watch, notice, digest]
+- `agent-llm.md` — provider precedence and routing, directives, the W1-W7 agent workflows, and how manager docs are versioned/re-seeded [agent, llm, provider, anthropic, groq, gemini, model, tier, prompt, directive, watch, notice, digest, manager, docs, seed, doc-version, scaffold]
 - `design-docs.md` — what each root doc is for, the durable invariants, and which `design_ideas/` docs are unbuilt proposals [design, doc, invariant, roadmap, strategy, proposal, vision]
 - `rover.md` — the Rover phone/web client (mars-rover repo, `/c` route) and the `mars serve`/`mars qr` bridge (`web` feature) [rover, mobile, pwa, phone, web, serve, qr, bridge, websocket, tungstenite, npm, tanstack, /c, protocol, mock]
