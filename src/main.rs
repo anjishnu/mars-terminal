@@ -7072,12 +7072,13 @@ fn selfcheck() -> Result<()> {
                 p("/repo", true, Some("x\rid")),       // a payload id is not an id
             ]);
             assert_eq!(plan[0], Resume("aaaa-bbbb".into()), "a known id resumes exactly");
-            assert_eq!(plan[1], Continue, "the first unknown in a directory may guess");
-            assert_eq!(plan[2], Bare, "the second must not reopen the first's conversation");
-            assert_eq!(plan[3], Continue, "the ration is per directory, not per session");
+            // /repo has an exact resume, so nothing there may guess: `--continue` picks by
+            // recency and would land on the conversation pane 0 just reopened.
+            assert_eq!(plan[1], Bare, "no guessing beside an exact resume");
+            assert_eq!(plan[2], Bare, "and certainly not twice");
+            assert_eq!(plan[3], Continue, "a directory with no resume may still guess, once");
             assert_eq!(plan[4], Bare, "a shell pane starts no agent");
-            // Not `Continue`: /repo's one guess was already spent above. A refused id makes the
-            // pane a guesser, and a guesser still queues behind the directory's ration.
+            // A refused id makes the pane a guesser, and /repo is closed to guesses.
             assert_eq!(plan[5], Bare, "a refused id does not get its own exemption");
             assert_eq!(
                 session::restore_plan(&[p("/fresh", true, Some("x\rid"))])[0],
@@ -7085,8 +7086,17 @@ fn selfcheck() -> Result<()> {
                 "but a refused id does fall back rather than resuming garbage"
             );
             // A pane with a known id must not spend the directory's one guess.
+            // Observed on a real reboot: pane 0 resumed a known conversation, pane 2 guessed with
+            // `--continue`, and the guess landed on the very conversation pane 0 had just reopened
+            // — because resuming it made it the most recent in that directory. A guess is only
+            // safe where nothing is being resumed by name.
             let plan2 = session::restore_plan(&[p("/repo", true, Some("aaaa")), p("/repo", true, None)]);
-            assert_eq!(plan2[1], Continue, "an exact resume does not consume the ration");
+            assert_eq!(plan2[1], Bare, "no guessing in a directory where a conversation is resumed");
+            assert_eq!(
+                session::restore_plan(&[p("/repo", true, Some("aaaa")), p("/other", true, None)])[1],
+                Continue,
+                "a different directory is still free to guess"
+            );
 
             // Taken from the live manifest on this machine: ONE conversation id recorded against
             // two of four agent panes. Resuming both reopens one thread twice — the same wrong
@@ -7098,7 +7108,7 @@ fn selfcheck() -> Result<()> {
                 p("/rover", true, None),
             ]);
             assert_eq!(dup[0], Resume("9ef23227".into()), "the first claimant keeps the id");
-            assert_eq!(dup[1], Continue, "/repo's one guess");
+            assert_eq!(dup[1], Bare, "no guessing beside it");
             assert_eq!(dup[2], Bare, "a second pane must not reopen the same conversation");
             assert_eq!(dup[3], Continue, "a different directory is unaffected");
         }

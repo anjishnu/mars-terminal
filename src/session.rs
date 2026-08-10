@@ -1914,6 +1914,18 @@ pub enum AgentStart {
 pub fn restore_plan(panes: &[(String, bool, Option<String>)]) -> Vec<AgentStart> {
     let mut spent: Vec<&str> = Vec::new();
     let mut claimed: Vec<&str> = Vec::new();
+    // Directories where some pane resumes a KNOWN conversation. No guess may be spent there.
+    //
+    // `--continue` picks the most recent conversation in a directory — and the one another pane is
+    // about to resume by id becomes exactly that, the moment it is resumed. So the guess lands on
+    // the conversation already open in the pane beside it. Observed on a real reboot: two panes
+    // came back holding one conversation, which is the duplicate the ration was meant to stop,
+    // arriving through the other door.
+    let resumed_dirs: Vec<&str> = panes
+        .iter()
+        .filter(|(_, agent, chat)| *agent && chat.as_deref().is_some_and(valid_chat_id))
+        .map(|(cwd, _, _)| cwd.as_str())
+        .collect();
     panes
         .iter()
         .map(|(cwd, agent, chat)| {
@@ -1931,7 +1943,9 @@ pub fn restore_plan(panes: &[(String, bool, Option<String>)]) -> Vec<AgentStart>
                     return AgentStart::Resume(id.to_string());
                 }
             }
-            if spent.iter().any(|d| *d == cwd.as_str()) {
+            if spent.iter().any(|d| *d == cwd.as_str())
+                || resumed_dirs.iter().any(|d| *d == cwd.as_str())
+            {
                 AgentStart::Bare
             } else {
                 spent.push(cwd.as_str());
