@@ -100,8 +100,10 @@ pub enum ClientFrame {
     /// additive (never takes over the desktop client). It appears as a new workspace on the
     /// board and is watchable like any other pane.
     NewTerminal,
-    /// Adopt the name the manager proposed for the workspace holding this pane.
-    RenameWorkspace { pane: usize, name: String },
+    /// Rename the WORKSPACE (tab) that owns `pane` — the phone's drawer renaming the workspace
+    /// it is standing in. Distinct from `Rename`, which renames the whole session and ends the
+    /// connection; this one is additive and the new name returns on the next board push.
+    RenameWorkspace { pane: usize, to: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -525,9 +527,8 @@ enum SrvEvent {
     WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16>, raw: bool },
     /// A subscriber asked to open a new terminal tab (the phone's "New terminal").
     NewTerminal,
-    /// Adopt a name for the workspace holding this pane — the manager proposes, the captain
-    /// presses once. Carries a pane id because the phone knows panes, not tabs.
-    RenameWorkspace { pane: usize, name: String },
+    /// A subscriber renamed the workspace owning this pane (the phone's drawer).
+    RenameWorkspace { pane: usize, to: String },
     /// A subscriber asked for a pane's scrollback (paging up in the xterm.js renderer).
     PaneHistory { pane: usize, lines: usize },
     /// A subscriber asked for a window of a pane's transcript, by line id.
@@ -939,24 +940,19 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     });
                 }
             }
-            Ok(SrvEvent::RenameWorkspace { pane, name }) => {
-                // Name the TAB the pane lives in — that is what the board calls a workspace and
-                // what the engineer sees on both surfaces. Settling the auto-namer matters as much
-                // as the name: an adopted name is a decision, and a generated one must not
-                // quietly replace it on the next sample.
-                let name = name.trim().to_string();
-                if !name.is_empty() {
-                    if let Some(idx) = app.tab_index_of_pane(pane) {
-                        app.set_tab_name(idx, &name);
-                    }
-                }
-            }
             Ok(SrvEvent::NewTerminal) => {
                 // Phone tapped "New terminal": open a terminal in a new tab (additive — the
                 // desktop client's ownership is untouched). It surfaces on the next board push.
                 app.new_tab();
                 app.open_terminal();
                 app.needs_redraw = true;
+            }
+            Ok(SrvEvent::RenameWorkspace { pane, to }) => {
+                // Additive, like NewTerminal: the phone names a workspace without taking the
+                // session. A pane that has since closed simply renames nothing.
+                if app.rename_workspace_of_pane(pane, &to) {
+                    app.needs_redraw = true;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1313,8 +1309,8 @@ fn client_connection(
                             break;
                         }
                     }
-                    Ok(ClientFrame::RenameWorkspace { pane, name }) => {
-                        if tx.send(SrvEvent::RenameWorkspace { pane, name }).is_err() {
+                    Ok(ClientFrame::RenameWorkspace { pane, to }) => {
+                        if tx.send(SrvEvent::RenameWorkspace { pane, to }).is_err() {
                             break;
                         }
                     }

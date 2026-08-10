@@ -2925,6 +2925,63 @@ fn selfcheck() -> Result<()> {
                 );
             }
 
+            // Task 3b: renaming ONE workspace over the wire — ClientFrame::RenameWorkspace →
+            // SrvEvent → App::rename_workspace_of_pane → the next board push carries the name.
+            //
+            // Addressed by the row's `paneId` and NOT by its `id`: `id` is a tab_index, which
+            // every close shifts, so an index that crossed the wire can land on a different
+            // workspace. This asserts the pane-addressed contract the phone's drawer relies on.
+            {
+                let board = next_board(&mut sub_r, 5).expect("no board frame before workspace rename");
+                let rows = board["rows"].as_array().expect("board rows not an array").clone();
+                let row = rows.first().expect("board carried no rows to rename");
+                let pane: usize = row["paneId"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("board row carried no parseable paneId");
+                let before = row["name"].as_str().unwrap_or_default().to_string();
+                assert_ne!(before, "phonenamed", "fixture already used the test name");
+
+                session::write_frame(
+                    &mut sub_w,
+                    &session::ClientFrame::RenameWorkspace { pane, to: "phonenamed".into() },
+                )?;
+
+                let mut named = false;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline && !named {
+                    if let Some(b) = next_board(&mut sub_r, 2) {
+                        named = b["rows"].as_array().map(|rs| {
+                            rs.iter().any(|r| {
+                                r["name"] == "phonenamed"
+                                    && r["paneId"].as_str().and_then(|s| s.parse::<usize>().ok()) == Some(pane)
+                            })
+                        }).unwrap_or(false);
+                    }
+                }
+                assert!(named, "the workspace owning pane {pane} never came back renamed");
+
+                // A pane nobody owns renames nothing — the phone can hold a paneId whose
+                // workspace closed, and the daemon must drop it rather than rename a neighbour.
+                let ghost = usize::MAX;
+                session::write_frame(
+                    &mut sub_w,
+                    &session::ClientFrame::RenameWorkspace { pane: ghost, to: "ghostnamed".into() },
+                )?;
+                let mut boards = 0;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+                while std::time::Instant::now() < deadline {
+                    if let Some(b) = next_board(&mut sub_r, 2) {
+                        boards += 1;
+                        assert!(
+                            !b["rows"].as_array().map(|rs| rs.iter().any(|r| r["name"] == "ghostnamed")).unwrap_or(false),
+                            "a rename aimed at a dead pane renamed a live workspace: {b}"
+                        );
+                    }
+                }
+                assert!(boards > 0, "no board pushes arrived after the ghost rename");
+            }
+
             // Task 4: a session's IDENTITY survives a rename, and can be found by it.
             //
             // The bug this closes: `mars serve` captured a socket PATH at startup, the socket is

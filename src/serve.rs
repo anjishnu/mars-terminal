@@ -1446,21 +1446,21 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             }
         }
         // Open a new terminal tab in the session (additive; surfaces on the next board push).
-        // Adopt the name the manager proposed for a workspace. A rename, not a suggestion: the
-        // proposing already happened, and this is the press that accepts it.
-        Some("workspace.rename") => {
-            let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
-            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            if let (Some(pane), false) = (pane, name.is_empty()) {
-                let _ = session::write_frame(writer, &ClientFrame::RenameWorkspace { pane, name: name.clone() });
-                let _ = tx.send(format!(
-                    "{{\"t\":\"toast\",\"text\":{}}}",
-                    json_str(&format!("workspace renamed to {name}"))
-                ));
-            }
-        }
         Some("new_terminal") => {
             let _ = session::write_frame(writer, &ClientFrame::NewTerminal);
+        }
+        // Rename ONE workspace, addressed by the pane the phone is standing in. Unlike
+        // `rename` (the session) this rides the subscribe writer: the daemon closes the stream
+        // that sends `Rename`, but a workspace rename leaves the connection open, so the live
+        // board keeps flowing and the new name arrives on the next push.
+        Some("rename_workspace") => {
+            let pane = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok());
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            if let Some(pane) = pane {
+                if !name.is_empty() {
+                    let _ = session::write_frame(writer, &ClientFrame::RenameWorkspace { pane, to: name });
+                }
+            }
         }
         // Every live session on this host: the phone's fleet page renders the truth instead of
         // its own bookkeeping. Enumerate the socket dir and identify each — dead sockets are
