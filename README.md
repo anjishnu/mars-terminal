@@ -146,8 +146,8 @@ different-sized terminal just reflows.
 > have been through enough releases to be treated as part of the product rather than an
 > experiment. What has not changed is the posture: the agent is an assistant, not an
 > authority, so review what it proposes before running it. Destructive actions are gated,
-> and you should still read them. **Rover** (phone) and the **Windows** port remain in
-> beta.
+> and you should still read them. **Rover** (phone) and the **Windows** port are the only
+> beta surfaces left.
 
 Works out of the box with a free-tier key from any of:
 
@@ -203,11 +203,11 @@ mars ask "how do I move a pane to the other side?"
 
 ### The agent works on every box — your key never leaves home
 
-> **Beta.** The SSH features (`mars ssh`, `mars keyd`, the fleet view, and the
-> remote installer) are still being hardened. The AI features they carry left beta in
-> 0.7.0 (see [The agent](#the-agent)); this note is about the remote path itself. The
-> core editor, multiplexer, and sessions are stable; the remote/tunnel path may have
-> rough edges — please report anything you hit.
+> **Out of beta as of 0.7.0**, along with the AI features it carries (see
+> [The agent](#the-agent)). `mars ssh`, `mars keyd`, the fleet view and the remote
+> installer have been through enough releases to stand on their own. Two things to know
+> rather than warnings: it uses stock OpenSSH without `ControlMaster`, and the remote/
+> tunnel path still has more moving parts than the local one — please report anything you hit.
 > Native Windows can be the home host when the remote is Unix. It uses stock OpenSSH
 > without `ControlMaster`: a short bootstrap connection checks/installs Mars, then
 > one foreground connection owns the session and tunnel. Password/2FA users may
@@ -405,7 +405,7 @@ interval, scrollback depth, colors, timings, watch quiet threshold) live in
 Broke your config experimenting? **`mars reset`** restores default keys + tuning (your
 old files are kept as `*.bak`).
 
-**Color themes (beta).** `mars theme list` shows the bundled themes — **Mission
+**Color themes.** `mars theme list` shows the bundled themes — **Mission
 Control** (the default), **Eclipse** (high-contrast), **Paper** (warm light), and
 **Hacker** (green-on-black); `mars theme <name>` switches (recorded in
 `~/.mars/config.json`). Or the **Theme ▸** picker in the command bar switches live. Drop your own token→color JSON in `~/.mars/themes/`. A running session keeps

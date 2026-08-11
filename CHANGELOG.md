@@ -59,13 +59,15 @@ acts on its own.
   is the trust boundary.
 
 ### Changed
-- **The AI features leave beta.** The `?` ask flow, agent-proposed `RUN:`/`TYPE:`
-  directives, refactors, triage, watch summaries and the away digest have been through
-  enough releases to be part of the product rather than an experiment. The posture is
-  unchanged: the agent is an assistant, not an authority, destructive actions stay
-  gated, and you should still read what it proposes. **Rover and the Windows port
-  remain in beta** — both are the least-travelled paths here, and Rover's worst failure
-  (a laptop that closed while you were out) is the hardest to test.
+- **The AI, SSH and theming features leave beta.** The `?` ask flow, agent-proposed
+  `RUN:`/`TYPE:` directives, refactors, triage, watch summaries and the away digest; the
+  SSH broker (`mars ssh`, `mars keyd`, the fleet view, the remote installer); and the
+  color themes have all been through enough releases to be part of the product rather
+  than an experiment. The posture is unchanged: the agent is an assistant, not an
+  authority, destructive actions stay gated, and you should still read what it proposes.
+  **Rover and the Windows port are the only beta surfaces left** — both are the
+  least-travelled paths here, and Rover's worst failure (a laptop that closed while you
+  were out) is the hardest to test.
 - **The bridge follows the session, not the process.** It resolves through the session's
   durable directory, so a rename or a daemon restart no longer strands a paired phone —
   and it upgrades itself in place, with nothing above it to drift out of date.

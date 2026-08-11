@@ -143,13 +143,13 @@ LLM DEBUG  (calibrate prompts / right-size models per call)
   mars llm-stats [--raw|--json|--daily|--since 7d]
                                  profile the log: per task×model ranked by token
                                  use; --daily trend, --json scriptable, --since window
-  mars theme [list|<name>]       list color themes, or switch (writes config) [beta]
+  mars theme [list|<name>]       list color themes, or switch (writes config)
   mars config                    show the global config (~/.mars/config.json)
   mars translate \"<english>\"     headless: English → one shell command (logs it)
   --memory none|history|docs|full  retrieval variant: history = your own commands
                                  for translate; docs = Mars's own docs for ask
 
-REMOTE  (BETA — the agent works on every box; the key never leaves home)
+REMOTE  (the agent works on every box; the key never leaves home)
   mars ssh <host> [ssh args]     land in a mars session on the remote (attach
                                  the most recent, else create \"main\") with the
                                  auth socket forwarded — the remote agent asks
@@ -5271,7 +5271,7 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] themes (resolve/parse/render) . PASS");
     }
 
-    // 40e. Live theme picker (beta): SetTheme applies the resolved palette and
+    // 40e. Live theme picker: SetTheme applies the resolved palette and
     //      persists the choice. HOME is isolated so it never touches a real config.
     {
         let saved = std::env::var(sys::paths::HOME_ENV).ok();
@@ -5291,7 +5291,7 @@ fn selfcheck() -> Result<()> {
             None => std::env::remove_var(sys::paths::HOME_ENV),
         }
         let _ = std::fs::remove_dir_all(&tmp);
-        println!("[selfcheck] set theme live (beta) ..... PASS");
+        println!("[selfcheck] set theme live .............. PASS");
     }
 
     // 40f. Color-honesty guard: after the theming factor, no bare ANSI `Color::Named`

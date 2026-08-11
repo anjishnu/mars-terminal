@@ -89,7 +89,7 @@ pub enum Action {
     OpenDenylist,
     /// Open tuning.json — every behavioral knob, self-describing — in the editor.
     OpenTuning,
-    /// Apply the named color theme live (beta) — selected from the Theme ▸ submenu.
+    /// Apply the named color theme live — selected from the Theme ▸ submenu.
     SetTheme(String),
     /// Open the assistant's voice file (~/.mars/persona.md) in the editor.
     OpenPersona,
@@ -285,7 +285,7 @@ fn root_menu() -> Vec<MenuItem> {
         MenuItem::run_desc("Forget all commands", Action::ClearCommandMemory, "Erase the agent's remembered commands (asks first)"),
         MenuItem::run_desc("Open redaction denylist", Action::OpenDenylist, "Edit the strings always redacted from LLM prompts"),
         MenuItem::run_desc("Open tuning knobs", Action::OpenTuning, "Edit every behavioral knob (tuning.json) — each explains itself"),
-        MenuItem::sub("Theme ▸ (beta)", "themes"),
+        MenuItem::sub("Theme ▸", "themes"),
         MenuItem::run_desc("Open persona", Action::OpenPersona, "Edit the voice the assistant replies in — style only, never behavior"),
         MenuItem::run_desc("Detach session", Action::Detach,      "Disconnect; the session keeps running (reattach: mars attach)"),
         MenuItem::run_desc("Rename session", Action::RenameSession, "Rename this session (also: mars rename <old> <new>)"),
