@@ -108,7 +108,7 @@ SESSIONS  (work survives closed windows and disconnects)
   Reattach greets you with a \"while away\" line if anything happened;
   C-x g opens the full Away Digest (timeline + durations).
 
-ROVER  (your sessions on your phone — needs the `web` feature)
+ROVER  (BETA — your sessions on your phone; needs the `web` feature)
   mars pair                      print the QR, start the bridge, print the link
                                  (alias: serve)
   mars pair --check              what's set up and what isn't, with the fix for each
@@ -125,7 +125,7 @@ ROVER  (your sessions on your phone — needs the `web` feature)
   your terminal can run anything you can. Treat it like a private key, and keep
   the bridge up only while you are using it. See SECURITY.md.
 
-AGENT  (BETA — an assistant, not an authority; review what it proposes)
+AGENT  (an assistant, not an authority — review what it proposes)
   mars setup                     how to get a free API key and turn on the agent
   mars ask \"<question>\"          one-shot answer from the LLM agent
   Keys (paid-first): ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY,
@@ -3382,7 +3382,7 @@ fn selfcheck() -> Result<()> {
         use manager::{PaneRow, SessionSnap};
         let repo = cfg_dir.join("mgr");
         let pane = |pane_id: &str, name: &str, verdict: &str, why: &str, age: u64| PaneRow {
-            id: pane_id.into(), pane_id: pane_id.into(), name: name.into(),
+            id: pane_id.into(), pane_id: pane_id.into(), wid: pane_id.into(), name: name.into(),
             verdict: verdict.into(), kind: "terminal".into(), why: why.into(),
             age_secs: age, blocked_prompt: (verdict == "blocked").then(|| why.to_string()), focused: false,
         };
@@ -3598,7 +3598,7 @@ fn selfcheck() -> Result<()> {
             let mk = |age: u64| vec![SessionSnap {
                 name: "stable".into(), health: String::new(),
                 panes: vec![PaneRow {
-                    id: "1".into(), pane_id: "1".into(), name: "terminal 1".into(),
+                    id: "1".into(), pane_id: "1".into(), wid: "1".into(), name: "terminal 1".into(),
                     verdict: "idle".into(), kind: "terminal".into(), why: String::new(),
                     age_secs: age, blocked_prompt: None, focused: false,
                 }],
@@ -6440,6 +6440,44 @@ fn selfcheck() -> Result<()> {
             // Prose with no frontmatter at all — the older summaries already on disk.
             assert!(manager::suggested_rename_of_doc("terminal 3", "just prose").is_none());
         }
+        {
+            // A workspace's identity must survive the process that minted it. `PaneId` cannot:
+            // it is a counter from zero in each daemon, so after a reboot that drops a middle
+            // workspace, everything filed under it belongs to somebody else.
+            let w = crate::terminal::new_wid(Some(std::path::Path::new("/Users/x/Mars-Mission/mars-terminal")));
+            let (ts, tail) = w.split_once('-').expect("<secs>-<dir>");
+            assert!(ts.parse::<u64>().is_ok(), "the timestamp leads, so ids sort by age: {w}");
+            assert_eq!(tail, "mars-terminal", "the tail names the directory, for a human reading a filename");
+            // Punctuation a filename should not carry never reaches one.
+            let odd = crate::terminal::new_wid(Some(std::path::Path::new("/tmp/a b/../we:ird!")));
+            assert!(odd.split_once('-').unwrap().1.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'), "{odd}");
+            // No directory at all is still an id, not an empty tail.
+            assert!(crate::terminal::new_wid(None).ends_with("-workspace"));
+
+            // The manifest carries it, and reading it back returns the SAME id — this round trip
+            // is the whole fix: the id is what makes a reboot re-attach the right summary.
+            let dir = manager::sessions_root().expect("sessions root").join("__selfcheck_wid__");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("meta.json"), r#"{"name":"__sc_wid__"}"#)?;
+            let panes = vec![
+                session::RestoredPane { wid: "111-alpha".into(), cwd: "/a".into(), agent: false, chat: None },
+                session::RestoredPane { wid: "222-beta".into(), cwd: "/b".into(), agent: false, chat: None },
+            ];
+            session::write_restore("__sc_wid__", &panes);
+            let back = session::read_restore("__sc_wid__");
+            assert_eq!(back.iter().map(|p| p.wid.clone()).collect::<Vec<_>>(), ["111-alpha", "222-beta"]);
+            // Closing the FIRST workspace must not shift the second's identity onto it — the exact
+            // shape of the bug, where pane 1 vanishes and pane 2 inherits its files.
+            session::write_restore("__sc_wid__", &panes[1..]);
+            let back = session::read_restore("__sc_wid__");
+            assert_eq!(back.len(), 1);
+            assert_eq!(back[0].wid, "222-beta", "the survivor keeps its own id, not the gap's");
+            // A manifest from before ids exist restores with none, which mints a fresh one rather
+            // than inheriting whatever now sits in that position.
+            assert!(session::read_restore("__sc_missing__").is_empty());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        println!("[selfcheck] manager: a workspace id outlives the daemon that minted it ... PASS");
         println!("[selfcheck] manager: a name is suggested once, then the rename itself silences it ... PASS");
         // Timing is derived from artifact mtimes, so a run's phases can be read off without the
         // agent reporting anything. What matters is that a real delivery produces a duration at
@@ -6534,7 +6572,7 @@ fn selfcheck() -> Result<()> {
             let board = vec![manager::SessionSnap {
                 name: "0".into(), health: String::new(),
                 panes: vec![manager::PaneRow {
-                    id: "0".into(), pane_id: "0".into(), name: "terminal 1".into(),
+                    id: "0".into(), pane_id: "0".into(), wid: "0".into(), name: "terminal 1".into(),
                     verdict: "running".into(), kind: "terminal".into(), why: String::new(),
                     age_secs: 5, blocked_prompt: None, focused: false,
                 }],
@@ -6619,7 +6657,7 @@ fn selfcheck() -> Result<()> {
                 && Verdict::Stalled.rank() < Verdict::Failed.rank(),
                 "stalled must outrank healthy work and yield to a settled failure");
             let stalled = manager::PaneRow {
-                id: "7".into(), pane_id: "7".into(), name: "build".into(),
+                id: "7".into(), pane_id: "7".into(), wid: "7".into(), name: "build".into(),
                 verdict: "stalled".into(), kind: "terminal".into(),
                 why: "cargo build · silent 12m".into(),
                 age_secs: 900, blocked_prompt: None, focused: false,
@@ -7166,8 +7204,8 @@ fn selfcheck() -> Result<()> {
             )?;
             let panes = session::read_restore("__sc_restore__");
             assert_eq!(panes.len(), 2, "both panes still restore");
-            assert!(panes[0].2.is_none(), "a payload id is refused, not resumed: {:?}", panes[0].2);
-            assert!(panes[1].2.is_some(), "a real id still restores its conversation");
+            assert!(panes[0].chat.is_none(), "a payload id is refused, not resumed: {:?}", panes[0].chat);
+            assert!(panes[1].chat.is_some(), "a real id still restores its conversation");
             std::fs::remove_dir_all(&dir).ok();
         }
         println!("[selfcheck] restore: a chat id cannot carry a command ... PASS");
@@ -7179,8 +7217,11 @@ fn selfcheck() -> Result<()> {
             // one, so it is found days later. Ration it: one per directory, never for a pane whose
             // id is known.
             use session::AgentStart::{Bare, Continue, Resume};
-            let p = |cwd: &str, agent: bool, chat: Option<&str>| {
-                (cwd.to_string(), agent, chat.map(String::from))
+            let p = |cwd: &str, agent: bool, chat: Option<&str>| session::RestoredPane {
+                wid: format!("1-{}", cwd.trim_matches('/')),
+                cwd: cwd.to_string(),
+                agent,
+                chat: chat.map(String::from),
             };
             let plan = session::restore_plan(&[
                 p("/repo", true, Some("aaaa-bbbb")),   // known id — exact

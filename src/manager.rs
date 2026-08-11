@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 pub struct PaneRow {
     pub id: String,
     pub pane_id: String,
+    /// Durable workspace id — what per-workspace files are named after, so a reboot does not
+    /// re-point them. See `Term::wid`; `pane_id` is the runtime handle for addressing a pane.
+    pub wid: String,
     pub name: String,
     pub verdict: String,
     pub kind: String,
@@ -860,7 +863,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     // Per FIELD, not per document: a garbled workspace summary costs that one
                     // workspace its prose and nothing else.
                     let w = dir.as_ref()
-                        .and_then(|d| read_agent_prose_aged(&d.join("workspaces").join(format!("{}.md", p.pane_id)), ts, false));
+                        .and_then(|d| read_agent_prose_aged(&d.join("workspaces").join(format!("{}.md", p.wid)), ts, false));
                     // Two FIELDS, not one. The ticker ("running · 5m") and the agent's note are
                     // different kinds of thing on different clocks — one is arithmetic that must
                     // always be current, the other is judgement that may be minutes old or absent.
@@ -880,7 +883,7 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     // there, and a second one would be a second thing to get wrong.
                     let front = dir.as_ref()
                         .and_then(|d| std::fs::read_to_string(
-                            d.join("workspaces").join(format!("{}.md", p.pane_id))).ok())
+                            d.join("workspaces").join(format!("{}.md", p.wid))).ok())
                         .and_then(|t| split_front(&t).map(|(f, _)| f.to_string()));
                     let actions = front.as_deref().map(parse_actions).unwrap_or_default();
                     // A name the workspace has earned. Dropped when it matches what the pane is
@@ -892,6 +895,9 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
                     );
                     serde_json::json!({
                         "pane": p.pane_id, "name": p.name, "verdict": p.verdict,
+                        // Durable, so a decision the captain records about this workspace is
+                        // still about it after a reboot. `pane` addresses; `wid` identifies.
+                        "wid": p.wid,
                         "kind": p.kind, "ageSecs": p.age_secs,
                         "status": workspace_summary(p),
                         "summary": summary,
@@ -952,6 +958,11 @@ fn parse_board(json: &str) -> Option<SessionSnap> {
         .map(|r| PaneRow {
             id: r["id"].as_str().unwrap_or_default().to_string(),
             pane_id: r["paneId"].as_str().unwrap_or_default().to_string(),
+            // Durable identity. Falls back to the runtime handle for a board from a daemon that
+            // predates ids — which reads exactly as before rather than filing everything under "".
+            wid: r["wid"].as_str().filter(|w| !w.is_empty()).unwrap_or_else(
+                || r["paneId"].as_str().unwrap_or_default()
+            ).to_string(),
             name: r["name"].as_str().unwrap_or_default().to_string(),
             verdict: r["verdict"].as_str().unwrap_or("idle").to_string(),
             kind: r["kind"].as_str().unwrap_or("terminal").to_string(),
@@ -2358,6 +2369,7 @@ fn read_all_sessions() -> Vec<SessionSnap> {
                 let panes = v["workspaces"].as_array().map(|a| a.iter().map(|w| PaneRow {
                     id: w["id"].as_str().unwrap_or_default().to_string(),
                     pane_id: w["paneId"].as_str().unwrap_or_default().to_string(),
+                    wid: w["paneId"].as_str().unwrap_or_default().to_string(),
                     name: w["name"].as_str().unwrap_or_default().to_string(),
                     verdict: w["verdict"].as_str().unwrap_or("idle").to_string(),
                     kind: w["kind"].as_str().unwrap_or("terminal").to_string(),
@@ -3374,8 +3386,12 @@ pub fn target_context(kind: &str, id: &str) -> String {
             // instead — the gist carries what the manager already folded in, the delta carries
             // what has been said since, and both readers see the same pair.
             if let Some(chat) = w["chat"].as_str().filter(|c| !c.is_empty()) {
+                // Filed under the DURABLE id, so a gist folded before a reboot is still this
+                // conversation's afterwards. Older snapshots carry no `wid`; those fall back to
+                // the selector and behave exactly as they did.
+                let key = w["wid"].as_str().filter(|s| !s.is_empty()).unwrap_or(id);
                 if let Some((gist, delta)) =
-                    crate::conv::gist_and_delta(&dir, id, chat, CONV_DELTA_LINES)
+                    crate::conv::gist_and_delta(&dir, key, chat, CONV_DELTA_LINES)
                 {
                     if !gist.trim().is_empty() {
                         out.push_str(&format!("WHAT THIS CONVERSATION IS ABOUT\n{}\n\n", gist.trim()));

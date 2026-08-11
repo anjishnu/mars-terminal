@@ -126,7 +126,39 @@ fn capture(p: &mut vt100::Parser, bytes: &[u8], log: &Mutex<LineLog>) {
     p.set_scrollback(if saved > 0 { saved + total_scrolled } else { 0 });
 }
 
+/// Mint a durable workspace id: seconds since the epoch, then the directory it was opened in.
+///
+/// Not a random UUID: this is read by people in filenames and logs, so the semantic tail is what
+/// makes `1754812800-mars-terminal` recognisable where a bare hex string is not. Uniqueness comes
+/// from the timestamp; the tail is for the reader.
+pub fn new_wid(cwd: Option<&std::path::Path>) -> String {
+    let tail = cwd
+        .and_then(|c| c.file_name())
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .map(|n| {
+            n.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+                .trim_matches('-')
+                .to_string()
+        })
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "workspace".into());
+    let tail: String = tail.chars().take(24).collect();
+    format!("{}-{}", crate::worklog::now_secs(), tail.trim_matches('-'))
+}
+
 pub struct Term {
+    /// This workspace's DURABLE identity: `<unix-secs>-<directory>`, minted once when the shell is
+    /// spawned and carried across a reboot in `restore.json`.
+    ///
+    /// Distinct from `PaneId`, which is a process-scoped counter and therefore a runtime HANDLE:
+    /// unique while this daemon lives, reassigned from zero by the next one. Anything that must
+    /// still mean the same workspace after a restart — the manager's per-workspace summary, a
+    /// conversation gist, a decision the captain recorded about this workspace — keys on this, and
+    /// anything that addresses a pane in the running daemon keys on the handle. Conflating the two
+    /// is what let a reboot attach one workspace's summary to another.
+    pub wid: String,
     /// The shell has exited; the pane shows a notice until the user closes it.
     pub exited: bool,
     /// Where the shell was spawned (the work journal's cwd). The shell may
@@ -330,6 +362,10 @@ pub fn spawn(
         NEXT_STARTUP_PROBE.fetch_add(1, Ordering::Relaxed)
     );
     Ok(Term {
+        // Timestamp first so ids sort by age and collide only within the same second in the same
+        // directory; the directory is there so a human reading `~/.mars` can tell which workspace
+        // a file belongs to without cross-referencing anything.
+        wid: new_wid(spawn_cwd.as_deref()),
         exited: false,
         spawn_cwd,
         parser,

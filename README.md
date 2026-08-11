@@ -141,11 +141,13 @@ different-sized terminal just reflows.
 
 ## The agent
 
-> **Beta.** The AI features — the `?` ask flow, agent-proposed `RUN:`/`TYPE:`
-> directives, refactors, triage, watch summaries, and the away digest — are new and
-> still being tuned. Treat the agent as an assistant, not an authority: review what it
-> proposes before running it (destructive actions are gated, but read them). The core
-> editor, multiplexer, and sessions are stable.
+> **Out of beta as of 0.7.0.** The AI features — the `?` ask flow, agent-proposed
+> `RUN:`/`TYPE:` directives, refactors, triage, watch summaries, and the away digest —
+> have been through enough releases to be treated as part of the product rather than an
+> experiment. What has not changed is the posture: the agent is an assistant, not an
+> authority, so review what it proposes before running it. Destructive actions are gated,
+> and you should still read them. **Rover** (phone) and the **Windows** port remain in
+> beta.
 
 Works out of the box with a free-tier key from any of:
 
@@ -202,9 +204,10 @@ mars ask "how do I move a pane to the other side?"
 ### The agent works on every box — your key never leaves home
 
 > **Beta.** The SSH features (`mars ssh`, `mars keyd`, the fleet view, and the
-> remote installer) are new and still being hardened — as are the AI features they
-> carry (see [The agent](#the-agent)). The core editor, multiplexer, and sessions are
-> stable; the remote/tunnel path may have rough edges — please report anything you hit.
+> remote installer) are still being hardened. The AI features they carry left beta in
+> 0.7.0 (see [The agent](#the-agent)); this note is about the remote path itself. The
+> core editor, multiplexer, and sessions are stable; the remote/tunnel path may have
+> rough edges — please report anything you hit.
 > Native Windows can be the home host when the remote is Unix. It uses stock OpenSSH
 > without `ControlMaster`: a short bootstrap connection checks/installs Mars, then
 > one foreground connection owns the session and tunnel. Password/2FA users may
@@ -285,6 +288,10 @@ turns it off).
 
 ## Rover — your sessions on your phone
 
+> **Beta.** Rover is new in 0.7.0. The bridge, the tunnel and the phone client are the
+> least-travelled paths in Mars, and the failure mode that matters — a laptop that closed
+> while you were out — is the hardest to test. Expect rough edges there and report them.
+
 Long agent runs don't need you at the keyboard; they need you to *notice* when
 something stops. Rover is a phone client for the sessions already running on your
 machine: scan a QR once, and the work you left behind is readable from a pocket —
@@ -324,6 +331,24 @@ the bridge.
 
 One pairing covers the whole host: every session on that machine shows up in the
 fleet list, and you switch between them without re-scanning.
+
+**Naming what you are looking at.** A workspace called `terminal 3` that has spent the
+morning on a migration tells you nothing from a phone, so three things can rename one:
+the sidebar (a rename row for the workspace you are in, beside the one for the session),
+Rover chat (it can *offer* a name — you press), and the manager, which after each run
+suggests a name for any workspace whose current one says nothing about the work. A
+suggestion appears on the workspace's own pane as one press. Take it or wave it away and
+it stops; the manager only speaks again when it has a *different* name to propose, which
+is what "the work has moved on" looks like from the outside. Nothing renames anything on
+its own.
+
+**When the link is down, it says why.** The three ways a phone loses its machine used to
+look identical — an empty screen. They are now told apart and named: a host that never
+answered (asleep, or its tunnel is gone), a token that was refused (re-scan the QR), and
+a link that keeps dropping (your network). On the host side, `mars pair --check` and
+`mars pair --link` probe the public URL from outside before handing you a QR, because
+ngrok's local API will cheerfully report a healthy tunnel whose edge session is dead —
+which is exactly the state that looks fine from the desk and unreachable from the road.
 
 **What Rover deliberately will not do.** The agent behind Rover chat is read-only —
 it looks, and every effect is a proposal you approve on the device. Anything that

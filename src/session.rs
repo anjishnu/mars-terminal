@@ -671,11 +671,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             app.open_terminal();
         } else {
             let plan = restore_plan(&panes);
-            for (i, ((cwd, _, _), start)) in panes.iter().zip(plan.iter()).enumerate() {
+            for (i, (p, start)) in panes.iter().zip(plan.iter()).enumerate() {
                 if i > 0 {
                     app.new_tab();
                 }
-                app.restore_workspace(std::path::Path::new(cwd), start);
+                // The id comes back WITH the workspace. Without this the manager's summary for
+                // this workspace, and its conversation gist, would be looked up under an id that
+                // now belongs to whichever pane happened to land in the same position.
+                app.restore_workspace(std::path::Path::new(&p.cwd), start, &p.wid);
             }
             app.clear_startup_cwd();
             // The manifest just consumed becomes read-only until its promise is delivered —
@@ -1043,7 +1046,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // The session's shape, refreshed on the same tick as the snapshot. A reboot reads
                 // this to come back as itself; writing it here rather than on shutdown means a
                 // daemon that is killed outright still leaves one behind.
-                let shape: Vec<(String, bool, Option<String>)> = app
+                let shape: Vec<RestoredPane> = app
                     .tabs
                     .iter()
                     .filter(|t| !t.hidden)
@@ -1060,10 +1063,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         // The conversation id, while the process is still alive to be asked. After
                         // the reboot there is nothing left to ask.
                         let chat = agent.then(|| term.foreground_pid().and_then(claude_session_of)).flatten();
-                        Some((cwd, agent, chat))
+                        Some(RestoredPane { wid: term.wid.clone(), cwd, agent, chat })
                     })
                     .collect();
-                let agents_now = shape.iter().filter(|(_, agent, _)| *agent).count();
+                let agents_now = shape.iter().filter(|p| p.agent).count();
                 if !restore_hold(&mut app.restore_promise, agents_now, now) {
                     if let Some(n) = app.session_name.as_deref() {
                         crate::session::write_restore(n, &shape);
@@ -1860,12 +1863,26 @@ pub fn restore_hold(promise: &mut Option<(usize, u64)>, agents_now: usize, now: 
 }
 
 /// Snapshot the session's shape. `panes` is `(cwd, running_a_coding_agent)` per workspace.
-pub fn write_restore(name: &str, panes: &[(String, bool, Option<String>)]) {
+/// One workspace as the manifest remembers it.
+///
+/// A struct rather than a tuple because it grew a fourth field whose whole point is that it is NOT
+/// interchangeable with the others: `wid` is the durable identity, and an anonymous `String` in
+/// position 0 next to another `String` is how the wrong one gets passed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RestoredPane {
+    /// Durable workspace id. Empty for a manifest written before ids existed.
+    pub wid: String,
+    pub cwd: String,
+    pub agent: bool,
+    pub chat: Option<String>,
+}
+
+pub fn write_restore(name: &str, panes: &[RestoredPane]) {
     let Some(p) = restore_path(name) else { return };
     let body = serde_json::json!({
         "at_ts": crate::worklog::now_secs(),
-        "panes": panes.iter().map(|(cwd, agent, chat)| serde_json::json!({
-            "cwd": cwd, "agent": agent, "chat": chat,
+        "panes": panes.iter().map(|p| serde_json::json!({
+            "wid": p.wid, "cwd": p.cwd, "agent": p.agent, "chat": p.chat,
         })).collect::<Vec<_>>(),
     });
     if let Ok(t) = serde_json::to_string_pretty(&body) {
@@ -1929,7 +1946,7 @@ pub enum AgentStart {
 ///
 /// So `--continue` is rationed: at most one per directory, and only where no id was captured.
 /// Panes with a real id are unaffected and never consume the ration.
-pub fn restore_plan(panes: &[(String, bool, Option<String>)]) -> Vec<AgentStart> {
+pub fn restore_plan(panes: &[RestoredPane]) -> Vec<AgentStart> {
     let mut spent: Vec<&str> = Vec::new();
     let mut claimed: Vec<&str> = Vec::new();
     // Directories where some pane resumes a KNOWN conversation. No guess may be spent there.
@@ -1941,13 +1958,14 @@ pub fn restore_plan(panes: &[(String, bool, Option<String>)]) -> Vec<AgentStart>
     // arriving through the other door.
     let resumed_dirs: Vec<&str> = panes
         .iter()
-        .filter(|(_, agent, chat)| *agent && chat.as_deref().is_some_and(valid_chat_id))
-        .map(|(cwd, _, _)| cwd.as_str())
+        .filter(|p| p.agent && p.chat.as_deref().is_some_and(valid_chat_id))
+        .map(|p| p.cwd.as_str())
         .collect();
     panes
         .iter()
-        .map(|(cwd, agent, chat)| {
-            if !*agent {
+        .map(|p| {
+            let (cwd, chat) = (&p.cwd, &p.chat);
+            if !p.agent {
                 return AgentStart::Bare;
             }
             // An id can be recorded against two panes — the live manifest on this machine has
@@ -1973,27 +1991,31 @@ pub fn restore_plan(panes: &[(String, bool, Option<String>)]) -> Vec<AgentStart>
         .collect()
 }
 
-pub fn read_restore(name: &str) -> Vec<(String, bool, Option<String>)> {
+pub fn read_restore(name: &str) -> Vec<RestoredPane> {
     let Some(p) = restore_path(name) else { return Vec::new() };
     let Ok(txt) = std::fs::read_to_string(p) else { return Vec::new() };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return Vec::new() };
     v["panes"].as_array().map(|a| {
         a.iter().filter_map(|p| {
             let cwd = p["cwd"].as_str()?.to_string();
-            (!cwd.is_empty()).then(|| (
+            (!cwd.is_empty()).then(|| RestoredPane {
+                // A manifest written before ids existed has none. Empty means "mint a fresh one",
+                // which loses that workspace's history exactly once and never again — the same
+                // trade `restore.json` itself already makes for pre-feature sessions.
+                wid: p["wid"].as_str().unwrap_or_default().to_string(),
                 cwd,
-                p["agent"].as_bool().unwrap_or(false),
+                agent: p["agent"].as_bool().unwrap_or(false),
                 // A rejected id degrades to `--continue`, which restores by directory: the
                 // documented fallback for a pane whose id was never captured, and the right
                 // landing place for one whose id cannot be trusted.
-                p["chat"].as_str().filter(|s| {
+                chat: p["chat"].as_str().filter(|s| {
                     let ok = valid_chat_id(s);
                     if !ok {
                         debug_log(&format!("[restore] refused a chat id that is not one: {s:?}"));
                     }
                     ok
                 }).map(String::from),
-            ))
+            })
         }).collect()
     }).unwrap_or_default()
 }
@@ -2045,7 +2067,7 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
         let exact = plan.iter().filter(|s| matches!(s, AgentStart::Resume(_))).count();
         let guessed = plan.iter().filter(|s| **s == AgentStart::Continue).count();
         let dropped = panes.iter().zip(plan.iter())
-            .filter(|((_, a, _), s)| *a && **s == AgentStart::Bare)
+            .filter(|(p, s)| p.agent && **s == AgentStart::Bare)
             .count();
         println!("rebooting '{name}' — {} workspace(s) to restore", panes.len());
         if exact > 0 {

@@ -192,6 +192,14 @@ sonnet-5 at low 2.6s, at medium 3.6s, haiku-4.5 3–7s with a weaker answer.
 **Fleet** → the machines and sessions you have paired. **Mission control** → one session's briefing
 and board. **Dive** → a single pane, live.
 
+Inside a pane, **Terminal renderer** in the side menu switches between the DOM renderer (the
+default: a parsed ANSI snapshot, roughly 60 times a second) and xterm.js (a byte stream, the same
+engine a desktop terminal uses). They are two ways of drawing the same pane and you can switch
+freely; xterm is generally smoother on a full-screen TUI, and the DOM path is what documents use.
+Dragging your thumb in a pane running something that repaints — Claude Code, `vim`, `less` — sends
+wheel events rather than scrolling a buffer, because such an app keeps its own history and there is
+no scrollback for the phone to move.
+
 Swipe left, or hold, to go deeper. The breadcrumb at the bottom shows where you are.
 
 **The side menu opens from the glowing bar on the left edge**, at every level including the fleet
@@ -264,7 +272,8 @@ It can also **offer** to act. An offer arrives as a card you press:
 |---|---|---|
 | **open** | opens a file — checked to exist before the card is shown | tap |
 | **note** | saves a memo | tap |
-| **workspace** | opens a new workspace | tap |
+| **workspace** | opens a new workspace, named if it proposed a name | tap |
+| **rename** | renames the workspace you are looking at | tap |
 | **run** | runs a command in a pane you can watch | **hold** |
 | **close** | ends this session | **red hold** |
 
@@ -272,9 +281,42 @@ The agent cannot execute any of these itself. It proposes; the parser enforces t
 the count at three; you press. A `run` card prints the command verbatim — read it before holding,
 the same way you would read a stranger's shell one-liner before pasting it.
 
-Session lifecycle — creating and renaming — is deliberately **not** in the agent's vocabulary. Both
-live in the side menu, where they are your decision: **New session** inside a session (you are
-already talking to the machine that would host it), and **Rename a session** on the fleet page.
+Two of these never choose their own target. `run` and `rename` carry no pane: the workspace you
+have open decides, and your screen names it before you press. The agent is reading terminal output,
+which any program on the machine can write into, so aim is the one thing kept out of its hands.
+
+Session lifecycle — creating and renaming a *session* — is deliberately **not** in the agent's
+vocabulary. Both live in the side menu, where they are your decision: **New session** inside a
+session (you are already talking to the machine that would host it), and **Rename a session** on
+the fleet page. Renaming a *workspace* is different and the agent may offer it: it is reversible,
+it stops nothing that is running, and the agent is the thing that knows what the workspace has
+been doing all morning.
+
+---
+
+## Naming workspaces
+
+`terminal 3` tells you nothing from a phone. Three things can fix that, and none of them act alone.
+
+- **The side menu** has a rename row for the workspace you are standing in, below the one for the
+  session. It appears only inside a workspace — from the fleet screen there is no single workspace
+  it could honestly mean.
+- **Rover chat** can offer a name, as the `rename` card above.
+- **The manager**, after each run, suggests a name for any workspace whose current one says nothing
+  about the work. It appears on that workspace's own pane, next to the manager's other proposals,
+  as one press.
+
+**A suggestion you have dealt with does not come back.** Taking it and waving it away are the same
+act — both record the decision against the workspace, which is why renaming by hand afterwards does
+not resurrect the offer. The manager only speaks again when it has a *different* name to propose,
+and that is the whole definition of "the work has diverged": nothing measures divergence, a
+different name simply is it. A suggestion that matches what the workspace is already called never
+becomes a card at all.
+
+The manager is told to write the suggestion fresh every run and not to track what it said before,
+because the suppression works by comparing names and needs no cooperation from it. Repeating itself
+is free; a manager second-guessing whether it is allowed to speak is what would lose a rename that
+mattered.
 
 ---
 
@@ -361,6 +403,29 @@ under your prompt. `mars reboot` prints this breakdown before it acts.
 
 **Memos stopped appearing.** Memo filenames must be plain (`[A-Za-z0-9._-]`). A file named anything
 else is not loaded — deliberately, because a memo's name reaches a shell when you assign it.
+
+**The phone cannot connect and the laptop looks fine from the desk.** This is the failure Rover
+exists for and the one most likely to lie to you. ngrok's local API reports the *agent's* belief,
+so a tunnel whose edge session has died still lists a healthy `https://` URL, and every check you
+can run at the keyboard says everything is well while the phone gets an SSL error.
+
+`mars pair --check` and `mars pair --link` now ask the question from outside: they fetch the public
+URL and require this bridge's own header in the answer, because ngrok's "tunnel not found" page is
+a perfectly good HTTP response and would otherwise read as success. A failure prints what to do —
+stop the bridge and its ngrok agent, then `mars pair` again.
+
+Read the result asymmetrically. A reply has been to ngrok's edge and back, so it proves the path; a
+silence could equally be *this* laptop's network, which is why nothing refuses to work on the
+strength of one failed probe. If you have just upgraded, a bridge older than this check answers
+without the header and is reported as such — restart it and the warning goes.
+
+**A phone shows another workspace's summary after a reboot.** Fixed in 0.7.0, and worth knowing why
+if you see it on an older build. Per-workspace files used to be named after the pane's runtime
+handle — a counter that restarts at zero in each daemon — so a reboot that dropped a middle
+workspace shifted every file onto its neighbour. Workspaces now carry a durable id
+(`<unix-secs>-<directory>`) minted when the shell is spawned and carried across the reboot in
+`restore.json`. A session rebooted from a manifest written before ids existed starts its history
+fresh, once.
 
 ---
 

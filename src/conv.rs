@@ -24,8 +24,6 @@ use std::path::{Path, PathBuf};
 /// What the last fold left behind for one pane.
 #[derive(Default)]
 pub struct Conv {
-    /// The manager's standing summary — what this conversation is about, and what is open.
-    pub gist: String,
     /// Bytes already accounted for by the gist.
     pub offset: u64,
     /// Bytes last SHOWN to a reader. Becomes `offset` once the gist is seen to have been rewritten.
@@ -83,7 +81,6 @@ fn load_cursor(session_dir: &Path, pane: &str) -> Conv {
         return Conv::default();
     };
     Conv {
-        gist: String::new(),
         offset: v["offset"].as_u64().unwrap_or(0),
         shown: v["shown"].as_u64().unwrap_or(0),
         gist_mtime: v["gist_mtime"].as_u64().unwrap_or(0),

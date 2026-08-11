@@ -1179,6 +1179,12 @@ impl App {
                     if let Some(cmd) = self.fg_commands.get(t) {
                         row["cmd"] = serde_json::json!(cmd);
                     }
+                    // The DURABLE id, beside the runtime handle. `paneId` addresses this pane in
+                    // this daemon; `wid` still names this workspace after a reboot, and is what
+                    // anything filed against a workspace is filed under.
+                    if let Some(term) = self.terms.get(t) {
+                        row["wid"] = serde_json::json!(term.wid);
+                    }
                     // WHICH CONVERSATION is running here. Only the daemon can answer: it takes the
                     // pane's foreground pid and asks Claude Code, and neither the bridge nor the
                     // manager has a pid to ask with. Carrying it on the row is what lets them read
@@ -5284,11 +5290,27 @@ impl App {
     /// The agent line goes through `send_bytes`, which queues behind the prompt probe and flushes
     /// only once the shell is genuinely reading — the mechanism `nudge_manager` learned to use
     /// after a turn typed into a not-yet-ready terminal vanished without trace.
-    pub fn restore_workspace(&mut self, cwd: &std::path::Path, start: &crate::session::AgentStart) {
+    pub fn restore_workspace(
+        &mut self,
+        cwd: &std::path::Path,
+        start: &crate::session::AgentStart,
+        wid: &str,
+    ) {
         // `open_terminal` takes its cwd from here; setting it is the whole of "restore the
         // directory". Cleared by the caller once the last workspace is up.
         self.startup_cwd = Some(cwd.to_path_buf());
         self.open_terminal();
+        // Put the workspace's durable id back on the terminal that was just born. An empty one
+        // means the manifest predates ids; the freshly minted one then stands, and this workspace
+        // starts its history here rather than inheriting somebody else's.
+        if !wid.is_empty() {
+            let pane = self.focused_pane_id();
+            if let Some(PaneContent::Terminal(tid)) = self.panes.get(&pane).map(|p| p.content.clone()) {
+                if let Some(t) = self.terms.get_mut(&tid) {
+                    t.wid = wid.to_string();
+                }
+            }
+        }
         if *start == crate::session::AgentStart::Bare {
             return;
         }

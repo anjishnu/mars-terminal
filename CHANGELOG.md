@@ -9,6 +9,26 @@ English when you come back. Everything the phone can do is something you press; 
 acts on its own.
 
 ### Added
+- **Name the workspace you are working in.** A workspace called `terminal 3` that has
+  spent the morning on a migration tells you nothing from a phone. Three things can now
+  rename one, and none acts alone: a rename row in Rover's side menu for the workspace
+  you are standing in, a `rename` card Rover chat can offer, and — after each manager
+  run — a suggested name on the workspace's own pane, adopted with one press. Taking a
+  suggestion and dismissing it are the same act: both are recorded against the
+  workspace, so it does not come back until the manager has a *different* name to
+  propose. Nothing measures "divergence"; a different name is what divergence means.
+- **Workspaces have a durable id.** `<unix-secs>-<directory>`, minted when the shell is
+  spawned and carried across `mars reboot` in the restore manifest. Per-workspace files
+  — the manager's summary, a conversation gist — are named after it instead of the
+  pane's runtime handle, which is a counter that restarts at zero in every daemon. A
+  reboot that dropped a middle workspace used to shift each of those files onto its
+  neighbour, silently.
+- **A tunnel is verified before you are handed a QR.** `mars pair --check` and
+  `mars pair --link` fetch the public URL from outside and require this bridge's own
+  header in the answer. ngrok's local API reports the agent's belief, so a tunnel whose
+  edge session has died still lists a healthy URL — the state that looks fine at the
+  desk and unreachable from the road. A failed probe is reported, never acted on: a
+  reply proves the path, a silence could be this laptop's own network.
 - **Rover — your sessions on your phone.** `mars pair` prints a QR; scan it and the
   sessions on that machine are readable from a pocket. There is no account and no cloud
   service holding your data: the code carries a one-time link to *your* daemon over a
@@ -39,6 +59,13 @@ acts on its own.
   is the trust boundary.
 
 ### Changed
+- **The AI features leave beta.** The `?` ask flow, agent-proposed `RUN:`/`TYPE:`
+  directives, refactors, triage, watch summaries and the away digest have been through
+  enough releases to be part of the product rather than an experiment. The posture is
+  unchanged: the agent is an assistant, not an authority, destructive actions stay
+  gated, and you should still read what it proposes. **Rover and the Windows port
+  remain in beta** — both are the least-travelled paths here, and Rover's worst failure
+  (a laptop that closed while you were out) is the hardest to test.
 - **The bridge follows the session, not the process.** It resolves through the session's
   durable directory, so a rename or a daemon restart no longer strands a paired phone —
   and it upgrades itself in place, with nothing above it to drift out of date.

@@ -611,6 +611,56 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
 
 /// Read the live public tunnel URL from ngrok's local inspection API (127.0.0.1:4040), so we can
 /// reprint the pairing QR for an already-running bridge without standing up a second server.
+/// The header `serve_static` stamps on its reply, and the only proof a tunnel reaches THIS bridge.
+const BRIDGE_HEADER: &str = "X-Mars-Bridge";
+
+/// Does the public URL actually reach this bridge?
+///
+/// ngrok's local API is not evidence. It reports the agent's own belief, and the failure that cost
+/// an evening was an agent that believed it had a tunnel while the edge session was gone: the phone
+/// got `ERR_SSL_PROTOCOL_ERROR` while `/api/tunnels` went on listing a healthy https URL, so every
+/// local check said "fine" and the one thing that mattered was broken. This asks from OUTSIDE, over
+/// the public name, and requires our own header in the answer.
+///
+/// A failure here is weaker evidence than a success. A reply has been to ngrok's edge and back, so
+/// it proves the path; a silence could equally be this laptop's own network. So every caller REPORTS
+/// this and none of them refuse to work because of it.
+///
+/// Never call it from the serving thread: the request comes back to this process, and a bridge
+/// waiting on its own answer cannot give one.
+fn tunnel_answers(base: &str) -> Result<(), String> {
+    let ours = |r: &ureq::Response| r.header(BRIDGE_HEADER).is_some();
+    match ureq::get(base).timeout(Duration::from_secs(6)).call() {
+        Ok(r) if ours(&r) => Ok(()),
+        // A status code is still an answer, and our own bridge may legitimately return one.
+        Err(ureq::Error::Status(_, r)) if ours(&r) => Ok(()),
+        // Something is there but did not identify itself. Two very different causes, and naming
+        // both is what keeps this from being ignored: a bridge older than this header looks
+        // exactly like ngrok's edge answering for a bridge that has gone.
+        Ok(_) | Err(ureq::Error::Status(_, _)) => Err(concat!(
+            "that URL answers, but not as this bridge — if you have just upgraded, the running ",
+            "bridge predates this check and only needs restarting; otherwise ngrok's edge is up ",
+            "and the agent is no longer attached to it",
+        )
+        .into()),
+        Err(e) => Err(format!("the tunnel did not answer ({e})")),
+    }
+}
+
+/// What to print when a probe fails. One wording, because it is the same problem wherever it is
+/// noticed, and the remedy is a command the engineer runs rather than one we run for them.
+fn tunnel_warning(why: &str) -> String {
+    [
+        String::new(),
+        format!("⚠  {why}."),
+        "   A phone will not reach this machine until the tunnel is replaced:".into(),
+        "   stop the bridge and its ngrok agent, then run `mars pair` again.".into(),
+        "   (Away from the machine, this is what the phone reports as \"the host did not answer\".)".into(),
+        String::new(),
+    ]
+    .join("\n")
+}
+
 fn running_tunnel_url() -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", 4040)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
@@ -634,6 +684,10 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
         "a bridge is already running on :{DEFAULT_PORT}, but its tunnel URL couldn't be read from \
          ngrok (http://127.0.0.1:4040). See the bridge's log (`~/.mars/serve-agent.log`)."
     ))?;
+    // Before the QR, not after: a code printed under a warning still gets scanned.
+    if let Err(why) = tunnel_answers(&base) {
+        println!("{}", tunnel_warning(&why));
+    }
     let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
     let token = ensure_token()?;
     let fp = daemon_fingerprint(session);
@@ -788,8 +842,12 @@ fn serve_static(mut stream: TcpStream) -> Result<()> {
              <code>MARS_WEB_DIR</code> to serve the built app.</p></body>"
                 .to_string()
         });
+    // A header only this bridge sends. It is what makes a tunnel probe conclusive: ngrok's own
+    // "tunnel not found" page is a perfectly good HTTP response, and without something of ours in
+    // the answer, an edge that has lost its agent reads exactly like a working link.
     let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{BRIDGE_HEADER}: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        env!("CARGO_PKG_VERSION"),
         body.len(),
         body
     );
@@ -2237,6 +2295,19 @@ pub fn check_main(session_arg: Option<String>) -> Result<()> {
     if bridge.iter().any(|c| c.failed()) {
         anyhow::bail!("bridge preflight failed — fix the ✗ lines above, then `mars pair`");
     }
+    // A bridge may already BE up, and this is where somebody asks "is this working". Answering
+    // "ready to start one" is wrong when one is running on a tunnel that no longer carries
+    // anything — precisely the case where every local signal reads fine.
+    if let Some(base) = running_tunnel_url() {
+        match tunnel_answers(&base) {
+            Ok(()) => println!("  a bridge is already live at {base}, and it answers from outside"),
+            Err(why) => {
+                println!("  a bridge is already live at {base}");
+                println!("{}", tunnel_warning(&why));
+            }
+        }
+        return Ok(());
+    }
     println!("  ready — run `mars pair` to bring the bridge up");
     Ok(())
 }
@@ -2246,6 +2317,9 @@ pub fn link_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
     let base = running_tunnel_url()
         .ok_or_else(|| anyhow!("no bridge is running — start one with `mars pair`"))?;
+    if let Err(why) = tunnel_answers(&base) {
+        eprintln!("{}", tunnel_warning(&why));
+    }
     let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
     let token = ensure_token()?;
     let fp = daemon_fingerprint(&session);
