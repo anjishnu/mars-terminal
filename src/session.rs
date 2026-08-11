@@ -732,6 +732,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
         // Only spend LLM tokens on Rover's map/reduce while a phone is glancing in.
         // (Dead streams are pruned on the next push; a one-tick lag is harmless.)
         app.rover_active = !subscribers.is_empty();
+        // The free enrichment answers to a wider question: will anyone READ this board. The
+        // manager's snapshot tick below reads every session on this host for as long as the
+        // daemon lives, and a phone serves only one session at a time — so keying the board's
+        // contents to the phone left every other session unable to say what it was running.
+        app.board_has_reader = app.rover_active || app.tuning.manager_snapshot_secs > 0;
         // Record the edge, not the state: the manager needs to know when somebody started
         // looking and how long they had been away, which is a fact about a transition.
         if presence_watched != Some(app.rover_active) {

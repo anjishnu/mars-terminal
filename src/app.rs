@@ -609,7 +609,20 @@ pub struct App {
     /// The previous briefing text, for the reduce's `{prev}` continuity block.
     rover_prev_brief: String,
     /// A phone is subscribed → spend tokens on the map/reduce; idle otherwise.
+    ///
+    /// This is ATTENTION: a human looking at THIS session right now. It is the right gate for
+    /// model spend and the wrong one for everything else — see `board_has_reader`.
     pub rover_active: bool,
+    /// Someone will READ this board: a phone glancing, or the manager's snapshot tick, which
+    /// runs for every session on this host for as long as the daemon lives. Gates the
+    /// enrichment that costs no tokens.
+    ///
+    /// Distinct from `rover_active` on purpose. A phone connection serves exactly ONE session,
+    /// so deriving "is this board worth filling in" from "is a phone here" left every session
+    /// the phone was not on with a board that could not say what it was running — and the
+    /// manager writes its briefings from exactly those boards. Readership is host-wide;
+    /// attention is not.
+    pub board_has_reader: bool,
     /// The line the phone greeted the captain with this session — fed to the briefing so the
     /// narrative continues from it instead of repeating or contradicting it.
     pub rover_greeting: String,
@@ -796,6 +809,7 @@ impl App {
             rover_brief_sig: 0,
             rover_prev_brief: String::new(),
             rover_active: false,
+            board_has_reader: false,
             rover_greeting: String::new(),
             auto_name_attempts: std::collections::HashMap::new(),
             tab_name_suggestion: std::collections::HashMap::new(),
@@ -6845,19 +6859,37 @@ impl App {
             .collect()
     }
 
-    /// Sample what each board pane is running, on a slow timer, for the phone's board.
+    /// Cadence for free enrichment, matched to who is reading it: `watched_secs` while a phone
+    /// is glancing, the manager's snapshot interval otherwise. Sampling faster than the reader
+    /// reads is waste, and the manager only looks once a minute.
     ///
-    /// Only while a phone is subscribed: this exists to label rows on Rover, and every pass costs
-    /// one `ps` per board pane. A desktop that nobody is glancing at should not be paying for it.
+    /// Takes the watched cadence rather than picking one, because the callers disagree about it
+    /// — the `ps` sample and the tier-0 map are tuned separately — and slowing the phone's path
+    /// is not what this is for.
+    fn enrich_secs(&self, watched_secs: u64) -> u64 {
+        if self.rover_active {
+            watched_secs
+        } else {
+            self.tuning.manager_snapshot_secs
+        }
+    }
+
+    /// Sample what each board pane is running, on a slow timer, for whoever reads the board.
+    ///
+    /// Gated on READERSHIP, not attention. Every pass costs one `ps` per board pane and no
+    /// tokens, and the manager snapshots every session on this host whether or not a phone is
+    /// on it — so keying this to the phone left the manager describing a workspace it could
+    /// not name, which is how a Claude session waiting at a prompt and a wedged build became
+    /// the same row.
     ///
     /// Panes that have gone quiet are DROPPED rather than left holding their last command — a row
     /// still labelled `claude` after the agent exited is a worse answer than an unlabelled one.
     pub fn maybe_sample_foreground(&mut self) {
-        if !self.rover_active {
+        if !self.board_has_reader {
             self.fg_commands.clear();
             return;
         }
-        let ticks = (self.tuning.foreground_sample_secs * 1000
+        let ticks = (self.enrich_secs(self.tuning.foreground_sample_secs) * 1000
             / self.tuning.poll_interval_ms.max(1))
         .max(1);
         if self.frame_tick % ticks != 0 {
@@ -6878,28 +6910,32 @@ impl App {
     /// One LLM call per fire, throttled, gated on `bg_busy` — so it never hammers
     /// the model and idle workspaces are never re-summarized. Keyless hosts fill
     /// the cache deterministically (tier-0 triage), no tokens spent.
+    ///
+    /// The two passes answer to different gates. PASS 1 costs nothing and runs for any READER,
+    /// so the manager's snapshot of an unwatched session still says what its panes are doing.
+    /// PASS 2 spends a token budget and so waits for ATTENTION — a phone actually glancing.
     fn maybe_rover_map(&mut self) {
-        if !self.rover_active || self.bg_busy || self.agent_pending {
+        if !self.board_has_reader {
             return;
         }
         // Cold start (nothing mapped yet) fires promptly for a snappy first board;
         // once the cache is warm, throttle to one changed pane per interval.
         if !self.rover_summaries.is_empty() {
-            let ticks = (self.tuning.rover_map_min_secs * 1000 / self.tuning.poll_interval_ms.max(1)).max(1);
+            let ticks = (self.enrich_secs(self.tuning.rover_map_min_secs) * 1000
+                / self.tuning.poll_interval_ms.max(1))
+            .max(1);
             if self.frame_tick % ticks != 0 {
                 return;
             }
         }
-        let cfg = agent::AgentConfig::from_env();
-        // Remote box with the tunnel down: don't spend the trigger — try again once
-        // the broker is reachable (mirrors maybe_fire_watches).
-        if cfg.provider == "broker" && !cfg.is_configured() {
-            return;
-        }
-        let keyed = cfg.is_configured();
         // PASS 1 (free, always): every stale pane gets the deterministic tier-0 line NOW, so the
         // phone's board is fully populated the moment it renders instead of filling in one
         // model call at a time. Costs no tokens; the model's wording replaces it in pass 2.
+        //
+        // Ahead of every model gate below, deliberately. "Always" used to be untrue three ways —
+        // no phone, a busy background call, or a broker whose tunnel was down each skipped the
+        // free pass along with the paid one, and a host that can't reach a model is exactly the
+        // host that most needs the deterministic line.
         for id in self.rover_terminal_surfaces() {
             let tail = self.terminal_tail(id, self.tuning.agent_scrollback_context);
             if tail.trim().is_empty() {
@@ -6918,7 +6954,18 @@ impl App {
                 provider: "tier-0".into(),
             });
         }
-        if !keyed {
+        // Everything below spends tokens, so it answers to ATTENTION rather than readership: an
+        // unwatched session gets the tier-0 board and stops there.
+        if !self.rover_active || self.bg_busy || self.agent_pending {
+            return;
+        }
+        let cfg = agent::AgentConfig::from_env();
+        // Remote box with the tunnel down: don't spend the trigger — try again once
+        // the broker is reachable (mirrors maybe_fire_watches).
+        if cfg.provider == "broker" && !cfg.is_configured() {
+            return;
+        }
+        if !cfg.is_configured() {
             return; // keyless host: tier-0 IS the answer
         }
         // PASS 2 (keyed): upgrade ONE tier-0 line to the model's, then stop — `bg_busy`
@@ -6960,13 +7007,27 @@ impl App {
     /// over the cached per-workspace summaries — re-run ONLY when a summary,
     /// verdict, or the mission changed (the `rover_brief_sig` guard), never every
     /// tick. Keyless hosts get the deterministic placeholder instead.
+    ///
+    /// Runs for any READER. An unwatched session takes the deterministic path rather than no
+    /// path at all: the manager snapshots it either way, and a briefing built from tier-0
+    /// verdicts is the difference between "terminal 1 stalled 4h40m" and a briefing that can
+    /// name what is stalled.
     fn maybe_rover_brief(&mut self) {
-        if !self.rover_active || self.bg_busy || self.agent_pending {
+        if !self.board_has_reader {
+            return;
+        }
+        // A WATCHED session waits for a free background slot instead of settling for the
+        // placeholder — the model briefing is the one it is going to get, and claiming the
+        // signature below on a transient busy tick would freeze the placeholder in place until
+        // the board's content changed again.
+        if self.rover_active && (self.bg_busy || self.agent_pending) {
             return;
         }
         // Cold start (no briefing yet) fires promptly; once one exists, throttle.
         if self.rover_brief.is_some() {
-            let ticks = (self.tuning.rover_brief_min_secs * 1000 / self.tuning.poll_interval_ms.max(1)).max(1);
+            let ticks = (self.enrich_secs(self.tuning.rover_brief_min_secs) * 1000
+                / self.tuning.poll_interval_ms.max(1))
+            .max(1);
             if self.frame_tick % ticks != 0 {
                 return;
             }
@@ -6978,13 +7039,15 @@ impl App {
             return; // nothing changed since the last briefing
         }
         let cfg = agent::AgentConfig::from_env();
-        if cfg.provider == "broker" && !cfg.is_configured() {
+        // Only a watched session holds out for the broker: unwatched, we were never going to
+        // call the model anyway, so waiting for the tunnel would just withhold the free briefing.
+        if self.rover_active && cfg.provider == "broker" && !cfg.is_configured() {
             return;
         }
         self.rover_brief_sig = sig; // claim the signature before firing so we don't double-fire
-        if !cfg.is_configured() {
-            // Keyless: the deterministic placeholder briefing, pushed as-is but
-            // FLAGGED as a fallback candidate — the phone escalates it to Lovable
+        if !self.rover_active || !cfg.is_configured() {
+            // Keyless, or nobody glancing: the deterministic placeholder briefing, pushed as-is
+            // but FLAGGED as a fallback candidate — the phone escalates it to Lovable
             // (rather than treating it as the real briefing) while showing it now.
             let det = self.rover_deterministic_brief();
             self.rover_prev_brief = det.clone();
