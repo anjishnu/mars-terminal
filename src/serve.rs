@@ -1610,6 +1610,42 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // completely different rates — the board with every command you run, memos and health
         // only after an agent run — and the phone should not refetch a briefing to learn a
         // run tally.
+        // The agent conversation as rows, for the phone's timeline lens.
+        //
+        // The CHAT ID COMES FROM THE CLIENT, and that is safe for exactly one reason: it flows
+        // through `valid_chat_id`, which admits only `[A-Za-z0-9_-]{1,64}`. No separator, no dot,
+        // so nothing here can be steered out of `~/.claude/projects` — the same seam that disarmed
+        // the restore-manifest injection. Without that check this would be an arbitrary-file read
+        // wearing a conversation id.
+        //
+        // The bridge relays board frames rather than holding them, so it cannot map a pane to its
+        // conversation on its own; the phone already has that mapping from the board it is
+        // rendering, and sending it back is cheaper than teaching the bridge to cache.
+        Some("agent.timeline") => {
+            let pane = v.get("paneId").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            let chat = v.get("chat").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(60).min(300) as usize;
+            let reply = if !crate::session::valid_chat_id(&chat) {
+                // Not an error to report loudly: a shell pane simply has no conversation, and the
+                // client says so rather than rendering an empty list that looks like a hung fetch.
+                serde_json::json!({
+                    "t": "agent.timeline", "paneId": pane, "rows": [],
+                    "reason": "this workspace is not running a coding agent",
+                })
+            } else {
+                match crate::timeline::rows_for(&chat, limit) {
+                    Some(rows) => serde_json::json!({
+                        "t": "agent.timeline", "paneId": pane, "chat": chat,
+                        "rows": crate::timeline::rows_json(&rows),
+                    }),
+                    None => serde_json::json!({
+                        "t": "agent.timeline", "paneId": pane, "chat": chat, "rows": [],
+                        "reason": "no transcript found for this conversation yet",
+                    }),
+                }
+            };
+            let _ = tx.send(reply.to_string());
+        }
         Some("manager.board") | Some("manager.memos") | Some("manager.health") => {
             let want = v.get("t").and_then(|t| t.as_str()).unwrap_or_default().to_string();
             let session_name = socket.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();

@@ -13,6 +13,7 @@ mod ssh;
 mod broker;
 mod buffer;
 mod conv;
+mod timeline;
 mod config;
 mod fleet;
 mod health;
@@ -6502,6 +6503,69 @@ fn selfcheck() -> Result<()> {
             assert!(session::read_restore("__sc_missing__").is_empty());
             std::fs::remove_dir_all(&dir).ok();
         }
+        {
+            use timeline::{Row, ToolStatus};
+            // Shapes taken from a live transcript, including the bookkeeping records that make up
+            // most of the file. `mode` / `agent-name` / `last-prompt` carry no message and must
+            // leave no trace: rendering them cost the timeline roughly half its rows.
+            let fixture = concat!(
+                r#"{"type":"mode","mode":"acceptEdits"}"#, "\n",
+                r#"{"type":"agent-name","name":"claude"}"#, "\n",
+                r#"{"type":"user","message":{"content":"fix the build"}}"#, "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"they mean cargo"},{"type":"text","text":"On it."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}}]}}"#, "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"Finished in 3s"}]}}"#, "\n",
+                r#"{"type":"last-prompt","text":"noise"}"#, "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/repo/src/main.rs"}}]}}"#, "\n",
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"no such file"}]}}"#, "\n",
+                r#"{"type":"telepathy","message":{"content":[]}}"#, "\n",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t"#,
+            );
+            let rows = timeline::rows_from_str(fixture, 0);
+
+            // The sequence a reader should see — and nothing from the bookkeeping.
+            assert_eq!(rows[0], Row::User { text: "fix the build".into() });
+            assert_eq!(rows[1], Row::Reasoning { text: "they mean cargo".into() });
+            assert_eq!(rows[2], Row::Assistant { text: "On it.".into() });
+            assert!(matches!(&rows[3], Row::Tool { name, summary, status: ToolStatus::Ok, detail: Some(d), .. }
+                if name == "Bash" && summary == "cargo build" && d == "Finished in 3s"));
+            // A result resolves the call it belongs to, IN PLACE — a failed tool must not read as
+            // still running, which is the one status a supervisor acts on.
+            assert!(matches!(&rows[4], Row::Tool { name, summary, status: ToolStatus::Failed, .. }
+                if name == "Edit" && summary == "/repo/src/main.rs"));
+            // A message-bearing record we cannot map is still shown, named by its own type.
+            assert_eq!(rows[5], Row::Unknown { label: "telepathy".into() });
+            // ...and the truncated final line — normal when reading a file being appended to —
+            // yields no partial row rather than a half-parsed one.
+            assert_eq!(rows.len(), 6, "bookkeeping must leave no trace: {rows:?}");
+
+            // Redacted thinking is the COMMON case: measured on a live transcript, every
+            // `thinking` block carried a signature and an empty string. An empty reasoning row is
+            // a blank line, and a timeline of blank lines is worse than one without reasoning.
+            let redacted = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"abc"}]}}"#;
+            assert!(timeline::rows_from_str(redacted, 0).is_empty());
+
+            // A tool result whose call sits above the tail window resolves nothing, panics nowhere.
+            let orphan = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"gone","content":"x"}]}}"#;
+            assert!(timeline::rows_from_str(orphan, 0).is_empty());
+
+            // Bounds. The transcript is written by a program that reads whatever is on the machine,
+            // and every one of these bytes crosses to a phone.
+            let big = format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"b","name":"Bash","input":{{"command":"{}"}}}}]}}}}"#,
+                "x".repeat(200_000)
+            );
+            let r = timeline::rows_from_str(&big, 0);
+            assert!(matches!(&r[0], Row::Tool { summary, .. } if summary.chars().count() <= 120));
+            let esc = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a\u001b[2Jb"}]}}"#;
+            assert_eq!(timeline::rows_from_str(esc, 0)[0], Row::Assistant { text: "a[2Jb".into() },
+                "no escape sequence reaches a phone");
+
+            // `limit` keeps the TAIL — a supervisor opening a pane wants the latest, not the oldest.
+            let rows = timeline::rows_from_str(fixture, 2);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1], Row::Unknown { label: "telepathy".into() });
+        }
+        println!("[selfcheck] timeline: a transcript becomes rows, and bookkeeping leaves no trace ... PASS");
         println!("[selfcheck] manager: a workspace id outlives the daemon that minted it ... PASS");
         println!("[selfcheck] manager: a name is suggested once, then the rename itself silences it ... PASS");
         // Timing is derived from artifact mtimes, so a run's phases can be read off without the
