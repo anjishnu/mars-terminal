@@ -6445,12 +6445,26 @@ fn selfcheck() -> Result<()> {
             // it is a counter from zero in each daemon, so after a reboot that drops a middle
             // workspace, everything filed under it belongs to somebody else.
             let w = crate::terminal::new_wid(Some(std::path::Path::new("/Users/x/Mars-Mission/mars-terminal")));
-            let (ts, tail) = w.split_once('-').expect("<secs>-<dir>");
+            let mut parts = w.splitn(3, '-');
+            let ts = parts.next().unwrap_or_default();
+            let _token = parts.next().unwrap_or_default();
             assert!(ts.parse::<u64>().is_ok(), "the timestamp leads, so ids sort by age: {w}");
-            assert_eq!(tail, "mars-terminal", "the tail names the directory, for a human reading a filename");
+            assert!(w.ends_with("-mars-terminal"), "the tail names the directory, for a human reading a filename: {w}");
             // Punctuation a filename should not carry never reaches one.
+            // BORN IN A BATCH. A reboot restores every workspace at once, so ids minted in the
+            // same second in the same directory must still differ — the first version keyed on
+            // the clock alone and a real reboot handed two workspaces one id, which is the
+            // collision this whole mechanism exists to prevent.
+            let dir = Some(std::path::Path::new("/Users/x/Code"));
+            let batch: Vec<String> = (0..8).map(|_| crate::terminal::new_wid(dir)).collect();
+            let mut uniq = batch.clone();
+            uniq.sort();
+            uniq.dedup();
+            assert_eq!(uniq.len(), batch.len(), "a batch of workspaces must not share an id: {batch:?}");
+            assert!(batch.iter().all(|w| w.ends_with("-code")), "and each still says where it lives");
+
             let odd = crate::terminal::new_wid(Some(std::path::Path::new("/tmp/a b/../we:ird!")));
-            assert!(odd.split_once('-').unwrap().1.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'), "{odd}");
+            assert!(odd.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'), "no punctuation reaches a filename: {odd}");
             // No directory at all is still an id, not an empty tail.
             assert!(crate::terminal::new_wid(None).ends_with("-workspace"));
 
@@ -6472,6 +6486,17 @@ fn selfcheck() -> Result<()> {
             let back = session::read_restore("__sc_wid__");
             assert_eq!(back.len(), 1);
             assert_eq!(back[0].wid, "222-beta", "the survivor keeps its own id, not the gap's");
+            // A manifest written by the colliding build is REPAIRED on read: one workspace keeps
+            // the id, the rest come back blank and mint fresh. Two workspaces answering to one
+            // set of files is worse than one workspace losing its history once.
+            let dup = vec![
+                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None },
+                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None },
+            ];
+            session::write_restore("__sc_wid__", &dup);
+            let back = session::read_restore("__sc_wid__");
+            assert_eq!(back[0].wid, "1-code", "the first claimant keeps it");
+            assert!(back[1].wid.is_empty(), "the duplicate is dropped, not shared");
             // A manifest from before ids exist restores with none, which mints a fresh one rather
             // than inheriting whatever now sits in that position.
             assert!(session::read_restore("__sc_missing__").is_empty());

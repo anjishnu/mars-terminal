@@ -126,11 +126,19 @@ fn capture(p: &mut vt100::Parser, bytes: &[u8], log: &Mutex<LineLog>) {
     p.set_scrollback(if saved > 0 { saved + total_scrolled } else { 0 });
 }
 
-/// Mint a durable workspace id: seconds since the epoch, then the directory it was opened in.
+/// Mint a durable workspace id: `<unix-secs>-<token>-<directory>`.
 ///
-/// Not a random UUID: this is read by people in filenames and logs, so the semantic tail is what
-/// makes `1754812800-mars-terminal` recognisable where a bare hex string is not. Uniqueness comes
-/// from the timestamp; the tail is for the reader.
+/// Not a random UUID: this is read by people in filenames and logs, so the leading timestamp
+/// sorts by age and the trailing directory says what it belongs to, where a bare hex string
+/// says nothing.
+///
+/// THE TOKEN IS NOT DECORATION. The first version was `<secs>-<directory>` on the theory that a
+/// timestamp is unique enough — and a reboot restored two workspaces into the same directory
+/// within the same second and gave them the SAME id, which is the collision this whole mechanism
+/// exists to prevent, reintroduced by the mechanism itself. Workspaces are born in batches, so a
+/// clock is not an identity. The token is this process plus a per-process sequence, which makes
+/// ids unique within a daemon by construction and across daemons by a margin that would need the
+/// same second, the same low pid bits and the same sequence number to fail.
 pub fn new_wid(cwd: Option<&std::path::Path>) -> String {
     let tail = cwd
         .and_then(|c| c.file_name())
@@ -145,7 +153,15 @@ pub fn new_wid(cwd: Option<&std::path::Path>) -> String {
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "workspace".into());
     let tail: String = tail.chars().take(24).collect();
-    format!("{}-{}", crate::worklog::now_secs(), tail.trim_matches('-'))
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{:x}{:x}-{}",
+        crate::worklog::now_secs(),
+        std::process::id() & 0xffff,
+        seq & 0xff,
+        tail.trim_matches('-'),
+    )
 }
 
 pub struct Term {

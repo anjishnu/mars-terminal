@@ -1862,7 +1862,6 @@ pub fn restore_hold(promise: &mut Option<(usize, u64)>, agents_now: usize, now: 
     promise.is_some()
 }
 
-/// Snapshot the session's shape. `panes` is `(cwd, running_a_coding_agent)` per workspace.
 /// One workspace as the manifest remembers it.
 ///
 /// A struct rather than a tuple because it grew a fourth field whose whole point is that it is NOT
@@ -1877,6 +1876,7 @@ pub struct RestoredPane {
     pub chat: Option<String>,
 }
 
+/// Snapshot the session's shape: one entry per workspace, in tab order.
 pub fn write_restore(name: &str, panes: &[RestoredPane]) {
     let Some(p) = restore_path(name) else { return };
     let body = serde_json::json!({
@@ -1995,6 +1995,7 @@ pub fn read_restore(name: &str) -> Vec<RestoredPane> {
     let Some(p) = restore_path(name) else { return Vec::new() };
     let Ok(txt) = std::fs::read_to_string(p) else { return Vec::new() };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return Vec::new() };
+    let mut seen: Vec<String> = Vec::new();
     v["panes"].as_array().map(|a| {
         a.iter().filter_map(|p| {
             let cwd = p["cwd"].as_str()?.to_string();
@@ -2002,7 +2003,24 @@ pub fn read_restore(name: &str) -> Vec<RestoredPane> {
                 // A manifest written before ids existed has none. Empty means "mint a fresh one",
                 // which loses that workspace's history exactly once and never again — the same
                 // trade `restore.json` itself already makes for pre-feature sessions.
-                wid: p["wid"].as_str().unwrap_or_default().to_string(),
+                wid: {
+                    // Repair a manifest that carries the same id twice. An earlier build minted
+                    // `<secs>-<dir>`, which collided whenever a reboot restored two workspaces
+                    // into one directory in one second — and a duplicate id is worse than none,
+                    // because both workspaces then answer to the same files. The first claimant
+                    // keeps it; the rest come back blank and mint fresh, losing their history
+                    // once rather than sharing somebody else's for good.
+                    let w = p["wid"].as_str().unwrap_or_default().to_string();
+                    if w.is_empty() || seen.contains(&w) {
+                        if !w.is_empty() {
+                            debug_log(&format!("[restore] duplicate workspace id {w:?} — minting a fresh one"));
+                        }
+                        String::new()
+                    } else {
+                        seen.push(w.clone());
+                        w
+                    }
+                },
                 cwd,
                 agent: p["agent"].as_bool().unwrap_or(false),
                 // A rejected id degrades to `--continue`, which restores by directory: the

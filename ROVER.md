@@ -423,8 +423,9 @@ without the header and is reported as such — restart it and the warning goes.
 if you see it on an older build. Per-workspace files used to be named after the pane's runtime
 handle — a counter that restarts at zero in each daemon — so a reboot that dropped a middle
 workspace shifted every file onto its neighbour. Workspaces now carry a durable id
-(`<unix-secs>-<directory>`) minted when the shell is spawned and carried across the reboot in
-`restore.json`. A session rebooted from a manifest written before ids existed starts its history
+(`<unix-secs>-<token>-<directory>`) minted when the shell is spawned and carried across the reboot
+in `restore.json`. The token matters: workspaces are born in batches, so a reboot can restore two
+into the same directory in the same second, and a clock alone is not an identity. A session rebooted from a manifest written before ids existed starts its history
 fresh, once.
 
 ---

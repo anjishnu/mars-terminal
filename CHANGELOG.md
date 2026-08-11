@@ -17,7 +17,7 @@ acts on its own.
   suggestion and dismissing it are the same act: both are recorded against the
   workspace, so it does not come back until the manager has a *different* name to
   propose. Nothing measures "divergence"; a different name is what divergence means.
-- **Workspaces have a durable id.** `<unix-secs>-<directory>`, minted when the shell is
+- **Workspaces have a durable id.** `<unix-secs>-<token>-<directory>`, minted when the shell is
   spawned and carried across `mars reboot` in the restore manifest. Per-workspace files
   — the manager's summary, a conversation gist — are named after it instead of the
   pane's runtime handle, which is a counter that restarts at zero in every daemon. A
