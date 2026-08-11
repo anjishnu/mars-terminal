@@ -6404,18 +6404,17 @@ fn selfcheck() -> Result<()> {
             // The offer is made when the name says nothing about the work.
             assert_eq!(sr("terminal 3", Some("schema-migration")).as_deref(), Some("schema-migration"));
 
-            // ...and STOPS once it is adopted, which is the whole point. Nothing remembers that
-            // the captain agreed: the name on the workspace is the record, so the run after the
-            // rename asks the same question and gets silence. Normalised, because the agent writes
-            // kebab-case and a human types spaces and capitals — a suggestion that survives
-            // adoption because of a hyphen is the churn this exists to prevent.
+            // A suggestion equal to the current name is a no-op and never becomes a card.
+            // Normalised, because the agent writes kebab-case and a human types spaces and
+            // capitals. This is only a guard against a silly card: whether the captain has already
+            // DEALT with a suggestion is recorded against the pane id, which survives the rename
+            // that this comparison would otherwise be reading as the decision.
             assert!(sr("schema-migration", Some("schema-migration")).is_none());
             assert!(sr("Schema Migration", Some("schema-migration")).is_none());
             assert!(sr("schema_migration", Some(" schema-migration ")).is_none());
 
-            // A DIFFERENT name is what divergence looks like from here: the workspace moved on,
-            // the agent says something new, and that gets through even though the last one was
-            // adopted. Suppression that outlived the work would be a name nobody could correct.
+            // A DIFFERENT name gets through: the workspace moved on and the agent says something
+            // new. Suppression that outlived the work would be a name nobody could correct.
             assert_eq!(sr("schema-migration", Some("rollback-plan")).as_deref(), Some("rollback-plan"));
 
             // Absent, empty and quoted-empty all mean "no opinion" — the manager is told to stay

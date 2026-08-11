@@ -199,17 +199,20 @@ pub fn read_open_cards(feed: &Path) -> Vec<OpenCard> {
 /// a readable document with no buttons — never vanish.
 /// Two workspace names that mean the same thing.
 ///
-/// Normalised, because the agent writes kebab-case and a human types spaces and capitals. This is
-/// the whole of the "stop proposing once it is adopted" rule: a suggestion to rename a thing to
-/// what it is already called is not a suggestion, and dropping it here needs no stored state to
-/// remember that the captain agreed — the name on the workspace IS the record.
+/// Normalised, because the agent writes kebab-case and a human types spaces and capitals.
+///
+/// This is a NO-OP GUARD, not the suppression rule. It exists so a suggestion to rename a thing to
+/// what it is already called never reaches the phone as a card. It was briefly load-bearing —
+/// "adoption silences it because the name becomes the record" — which was wrong: a record the next
+/// hand-rename erases is not a record. Whether a suggestion has been dealt with is answered by the
+/// captain's decision, keyed on the pane id, which is what identifies a workspace across a rename.
 fn same_name(a: &str, b: &str) -> bool {
     let norm = |s: &str| s.trim().to_lowercase().replace([' ', '_'], "-");
     norm(a) == norm(b)
 }
 
-/// The rename this workspace should be offered, given what it is called now. One seam, so the
-/// whole rule is one thing to read and one thing to assert.
+/// The rename this workspace should be offered, given what it is called now — sanitised, and
+/// silent when it would be a no-op. One seam, so it is one thing to read and one thing to assert.
 pub fn suggested_rename(current: &str, raw: Option<&str>) -> Option<String> {
     let n = sane_workspace_name(raw?)?;
     (!same_name(&n, current)).then_some(n)
