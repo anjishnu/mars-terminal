@@ -6544,6 +6544,13 @@ fn selfcheck() -> Result<()> {
             let redacted = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"abc"}]}}"#;
             assert!(timeline::rows_from_str(redacted, 0).is_empty());
 
+            // A multi-line command is summarised as ONE line. Truncating at the first newline
+            // showed the `cd` and hid the heredoc that was the actual work.
+            let multi = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"m","name":"Bash","input":{"command":"cd /repo\npython3 - <<EOF\nprint(1)\nEOF"}}]}}"#;
+            let r = timeline::rows_from_str(multi, 0);
+            assert!(matches!(&r[0], Row::Tool { summary, .. }
+                if summary == "cd /repo python3 - <<EOF print(1) EOF"), "{r:?}");
+
             // A tool result whose call sits above the tail window resolves nothing, panics nowhere.
             let orphan = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"gone","content":"x"}]}}"#;
             assert!(timeline::rows_from_str(orphan, 0).is_empty());

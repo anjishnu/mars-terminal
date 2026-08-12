@@ -98,12 +98,23 @@ fn tool_summary(name: &str, input: &Value) -> String {
         _ => None,
     };
     match salient {
-        Some(s) => clean(s, SUMMARY_CHARS),
+        Some(s) => one_line(s, SUMMARY_CHARS),
         None => match input {
             Value::Null => String::new(),
-            other => clean(&other.to_string(), SUMMARY_CHARS),
+            other => one_line(&other.to_string(), SUMMARY_CHARS),
         },
     }
+}
+
+/// A summary is one line, whatever the input was.
+///
+/// Commands are routinely multi-line — a heredoc, a shell loop — and truncating at the first
+/// newline showed `cd ~/Code/replyguy-web` for a call whose actual work was the forty lines below
+/// it. Collapsing runs of whitespace keeps the whole command in view up to the cap, so the summary
+/// says what the call DID rather than where it started.
+fn one_line(s: &str, max: usize) -> String {
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    clean(&collapsed, max)
 }
 
 /// Text out of a `tool_result`'s content, which is a string on some records and a block list on
