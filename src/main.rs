@@ -6551,6 +6551,21 @@ fn selfcheck() -> Result<()> {
             assert!(matches!(&r[0], Row::Tool { summary, .. }
                 if summary == "cd /repo python3 - <<EOF print(1) EOF"), "{r:?}");
 
+            // An edit carries WHAT IT REPLACED, because "it edited three files" is worth nothing
+            // to a supervisor without "and here is what it put there". Write has no before — a new
+            // file — and says so with None rather than an empty string, which would read as "the
+            // file was empty".
+            let edit = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e","name":"Edit","input":{"file_path":"/a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}]}}"#;
+            assert!(matches!(&timeline::rows_from_str(edit, 0)[0],
+                Row::Tool { change: Some(c), .. } if c.before.as_deref() == Some("let x = 1;") && c.after == "let x = 2;"));
+            let write = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"w","name":"Write","input":{"file_path":"/b.rs","content":"fn main() {}"}}]}}"#;
+            assert!(matches!(&timeline::rows_from_str(write, 0)[0],
+                Row::Tool { change: Some(c), .. } if c.before.is_none() && c.after == "fn main() {}"));
+            // A tool that changes nothing carries no change — the field is about repository edits,
+            // not about every input we happen to have.
+            let read = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/c.rs"}}]}}"#;
+            assert!(matches!(&timeline::rows_from_str(read, 0)[0], Row::Tool { change: None, .. }));
+
             // A tool result whose call sits above the tail window resolves nothing, panics nowhere.
             let orphan = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"gone","content":"x"}]}}"#;
             assert!(timeline::rows_from_str(orphan, 0).is_empty());

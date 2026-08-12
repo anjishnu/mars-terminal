@@ -36,11 +36,29 @@ impl ToolStatus {
     }
 }
 
+/// A repository change, as small as it can be while still being checkable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    pub before: Option<String>,
+    pub after: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     User { text: String },
     Assistant { text: String },
-    Tool { id: String, name: String, summary: String, status: ToolStatus, detail: Option<String> },
+    Tool {
+        id: String,
+        name: String,
+        summary: String,
+        status: ToolStatus,
+        detail: Option<String>,
+        /// What an edit replaced, and with what. Carried only for the tools that CHANGE the repo,
+        /// because those are the rows a supervisor actually audits — "it edited three files" is
+        /// worth nothing without "and here is what it put there". Everything else keeps `detail`,
+        /// which is the tool's own output.
+        change: Option<Change>,
+    },
     /// The model thinking aloud. Common enough that treating it as unknown would bury the
     /// timeline; muted rather than hidden, because on a phone it is usually skipped and
     /// occasionally the most informative thing there.
@@ -115,6 +133,26 @@ fn tool_summary(name: &str, input: &Value) -> String {
 fn one_line(s: &str, max: usize) -> String {
     let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
     clean(&collapsed, max)
+}
+
+/// Bounded, because a written file can be a megabyte and this crosses to a phone.
+const CHANGE_CHARS: usize = 1200;
+
+/// What this call changed, for the tools that change things.
+///
+/// `Edit` carries both halves and is a real diff. `Write` has no before — a new file, or a whole
+/// replacement — and saying so with `None` is more honest than inventing an empty string, which a
+/// reader would take to mean "the file was empty".
+fn change_of(name: &str, input: &Value) -> Option<Change> {
+    let get = |k: &str| input.get(k).and_then(|v| v.as_str());
+    match name {
+        "Edit" => Some(Change {
+            before: get("old_string").map(|s| clean(s, CHANGE_CHARS)),
+            after: clean(get("new_string")?, CHANGE_CHARS),
+        }),
+        "Write" => Some(Change { before: None, after: clean(get("content")?, CHANGE_CHARS) }),
+        _ => None,
+    }
 }
 
 /// Text out of a `tool_result`'s content, which is a string on some records and a block list on
@@ -213,6 +251,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                             let id = block["id"].as_str().unwrap_or_default().to_string();
                             let name = clean(block["name"].as_str().unwrap_or("tool"), 60);
                             let summary = tool_summary(&name, &block["input"]);
+                            let change = change_of(&name, &block["input"]);
                             pending.push((id.clone(), rows.len()));
                             rows.push(Row::Tool {
                                 id,
@@ -220,6 +259,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                                 summary,
                                 status: ToolStatus::Running,
                                 detail: None,
+                                change,
                             });
                         }
                         "thinking" => {
@@ -284,9 +324,10 @@ pub fn rows_json(rows: &[Row]) -> Vec<Value> {
         .map(|r| match r {
             Row::User { text } => serde_json::json!({ "kind": "user", "text": text }),
             Row::Assistant { text } => serde_json::json!({ "kind": "assistant", "text": text }),
-            Row::Tool { id, name, summary, status, detail } => serde_json::json!({
+            Row::Tool { id, name, summary, status, detail, change } => serde_json::json!({
                 "kind": "tool", "id": id, "name": name, "summary": summary,
                 "status": status.as_str(), "detail": detail,
+                "change": change.as_ref().map(|c| serde_json::json!({ "before": c.before, "after": c.after })),
             }),
             Row::Reasoning { text } => serde_json::json!({ "kind": "reasoning", "text": text }),
             Row::Error { message } => serde_json::json!({ "kind": "error", "text": message }),
