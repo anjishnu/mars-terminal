@@ -175,6 +175,10 @@ pub struct Term {
     /// anything that addresses a pane in the running daemon keys on the handle. Conflating the two
     /// is what let a reboot attach one workspace's summary to another.
     pub wid: String,
+    /// The conversation this pane holds, when Mars KNOWS rather than guesses — because it typed
+    /// `--resume <id>` itself, or because the captain bound one by hand from the phone. Preferred
+    /// over discovery by pid, which searches two files that are often both silent.
+    pub assigned_chat: Option<String>,
     /// The shell has exited; the pane shows a notice until the user closes it.
     pub exited: bool,
     /// Where the shell was spawned (the work journal's cwd). The shell may
@@ -382,6 +386,7 @@ pub fn spawn(
         // directory; the directory is there so a human reading `~/.mars` can tell which workspace
         // a file belongs to without cross-referencing anything.
         wid: new_wid(spawn_cwd.as_deref()),
+        assigned_chat: None,
         exited: false,
         spawn_cwd,
         parser,

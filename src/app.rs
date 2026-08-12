@@ -1184,6 +1184,12 @@ impl App {
                     // anything filed against a workspace is filed under.
                     if let Some(term) = self.terms.get(t) {
                         row["wid"] = serde_json::json!(term.wid);
+                        // Where the shell was born. The phone needs it to offer the RIGHT
+                        // conversations when Mars could not work out which one a pane holds:
+                        // Claude Code files transcripts under a slug of this path.
+                        if let Some(cwd) = term.spawn_cwd.as_ref() {
+                            row["cwd"] = serde_json::json!(cwd.display().to_string());
+                        }
                     }
                     // WHICH CONVERSATION is running here. Only the daemon can answer: it takes the
                     // pane's foreground pid and asks Claude Code, and neither the bridge nor the
@@ -1193,7 +1199,14 @@ impl App {
                     // full.
                     if let Some(term) = self.terms.get(t) {
                         if term.foreground_command().as_deref() == Some("claude") {
-                            if let Some(id) = term.foreground_pid().and_then(crate::session::claude_session_of_pub) {
+                            // ASSIGNED beats DISCOVERED. When Mars typed `--resume <id>` it knows
+                            // exactly which conversation this pane holds; discovery by pid is a
+                            // search that fails often — measured here, a live `claude` pane with
+                            // no `sessions/<pid>.json` and no roster entry at all.
+                            let id = term.assigned_chat.clone().or_else(|| {
+                                term.foreground_pid().and_then(crate::session::claude_session_of_pub)
+                            });
+                            if let Some(id) = id {
                                 row["chat"] = serde_json::json!(id);
                             }
                         }
@@ -5303,6 +5316,16 @@ impl App {
         // Put the workspace's durable id back on the terminal that was just born. An empty one
         // means the manifest predates ids; the freshly minted one then stands, and this workspace
         // starts its history here rather than inheriting somebody else's.
+        // Resuming names the conversation outright, so record it now rather than hunting for it
+        // later — this is the whole of task #38 for a restored pane.
+        if let crate::session::AgentStart::Resume(id) = start {
+            let pane = self.focused_pane_id();
+            if let Some(PaneContent::Terminal(tid)) = self.panes.get(&pane).map(|p| p.content.clone()) {
+                if let Some(t) = self.terms.get_mut(&tid) {
+                    t.assigned_chat = Some(id.clone());
+                }
+            }
+        }
         if !wid.is_empty() {
             let pane = self.focused_pane_id();
             if let Some(PaneContent::Terminal(tid)) = self.panes.get(&pane).map(|p| p.content.clone()) {

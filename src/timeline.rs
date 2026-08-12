@@ -283,3 +283,89 @@ pub fn rows_json(rows: &[Row]) -> Vec<Value> {
         })
         .collect()
 }
+
+/// Claude Code files a conversation under a slug of the directory it was started in:
+/// `/Users/x/Mars-Mission` becomes `-Users-x-Mars-Mission`. Derived rather than stored, which is
+/// normally a smell — but this one belongs to another program and is the only key it exposes, so
+/// the alternative is not a better key, it is no key at all.
+fn project_slug(cwd: &str) -> String {
+    cwd.replace('/', "-")
+}
+
+/// A conversation the captain could bind to a pane: what it is called, and when it was last
+/// touched. The title is Claude Code's own (`aiTitle`, else `customTitle`) — a generated summary is
+/// a far better thing to choose from than a uuid, and reading the file's HEAD for it costs nothing
+/// even on a 200 MB transcript.
+pub fn candidates(cwd: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
+    let Some(home) = crate::sys::paths::home_dir() else { return Vec::new() };
+    let root = home.join(".claude").join("projects");
+    let want = cwd.map(project_slug);
+
+    let mut found: Vec<(u64, std::path::PathBuf, String)> = Vec::new();
+    for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        let dname = dir.file_name().to_string_lossy().to_string();
+        // Same directory first. When nothing matches — a conversation started elsewhere and
+        // `cd`-ed, a slug we cannot reproduce — fall back to everything rather than to an empty
+        // list, because a wrong-looking list is still a choosable list and an empty one is a dead
+        // end wearing an explanation.
+        if let Some(w) = &want {
+            if &dname != w {
+                continue;
+            }
+        }
+        for f in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+            let path = f.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            found.push((mtime, path, dname.clone()));
+        }
+    }
+    if found.is_empty() && want.is_some() {
+        return candidates(None, limit);
+    }
+
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.truncate(limit);
+    found
+        .into_iter()
+        .filter_map(|(mtime, path, dname)| {
+            let id = path.file_stem()?.to_string_lossy().to_string();
+            if !crate::session::valid_chat_id(&id) {
+                return None;
+            }
+            serde_json::json!({
+                "chat": id, "title": title_of(&path), "dir": dname, "mtime": mtime,
+            })
+            .into()
+        })
+        .collect()
+}
+
+/// The conversation's own title, from the first 64 KB. Claude Code writes `ai-title` /
+/// `custom-title` records as it goes; the LAST one in that window is the freshest opinion.
+fn title_of(path: &std::path::Path) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut buf))
+        .unwrap_or(0);
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let mut title = String::new();
+    for line in head.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        for k in ["customTitle", "aiTitle"] {
+            if let Some(t) = v.get(k).and_then(|x| x.as_str()).filter(|t| !t.is_empty()) {
+                title = clean(t, 80);
+            }
+        }
+    }
+    title
+}
+

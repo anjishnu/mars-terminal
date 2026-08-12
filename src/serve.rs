@@ -1610,6 +1610,24 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // completely different rates — the board with every command you run, memos and health
         // only after an agent run — and the phone should not refetch a briefing to learn a
         // run tally.
+        // Conversations the captain could bind to a pane, when Mars could not work it out.
+        //
+        // Discovery by pid fails often — a live `claude` pane with no `sessions/<pid>.json` and no
+        // roster entry is the normal case, not the edge — and the honest answer to "we cannot tell
+        // which conversation this is" is to ask, not to hide the feature. Titles come from Claude
+        // Code's own `aiTitle`, so this is a list of names rather than a list of uuids.
+        Some("agent.candidates") => {
+            let cwd = v.get("cwd").and_then(|x| x.as_str()).filter(|c| !c.is_empty());
+            let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(12).min(40) as usize;
+            let _ = tx.send(
+                serde_json::json!({
+                    "t": "agent.candidates",
+                    "paneId": v.get("paneId").and_then(|x| x.as_str()).unwrap_or_default(),
+                    "candidates": crate::timeline::candidates(cwd, limit),
+                })
+                .to_string(),
+            );
+        }
         // The agent conversation as rows, for the phone's timeline lens.
         //
         // The CHAT ID COMES FROM THE CLIENT, and that is safe for exactly one reason: it flows
