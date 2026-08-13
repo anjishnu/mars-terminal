@@ -58,11 +58,19 @@ pub enum Row {
         /// worth nothing without "and here is what it put there". Everything else keeps `detail`,
         /// which is the tool's own output.
         change: Option<Change>,
+        /// Seconds between the call and its result. A supervisor's second question about any
+        /// command is how long it took, and the transcript timestamps both ends, so answering it
+        /// costs a subtraction.
+        secs: Option<u64>,
     },
     /// The model thinking aloud. Common enough that treating it as unknown would bury the
     /// timeline; muted rather than hidden, because on a phone it is usually skipped and
     /// occasionally the most informative thing there.
     Reasoning { text: String },
+    /// The agent's plan, as a list rather than as a paragraph about a list. This is the single
+    /// most useful thing on the screen when the question is "does it understand the job", and it
+    /// arrives as a tool call that would otherwise render as `TodoWrite · {…}`.
+    Todo { items: Vec<(String, String)> },
     Error { message: String },
     /// A record we do not model, named by its own `type`. Rendered as a muted line rather than
     /// hidden — a gap the reader can see is honest; a silently dropped row is not.
@@ -135,8 +143,51 @@ fn one_line(s: &str, max: usize) -> String {
     clean(&collapsed, max)
 }
 
+/// Seconds out of an ISO-8601 stamp, without a date library.
+///
+/// Only ever subtracted from another stamp minutes away, so days and leap seconds do not arise —
+/// and a stamp we cannot read yields `None`, which renders as no duration rather than as a wrong
+/// one.
+fn epoch_secs(iso: &str) -> Option<u64> {
+    // 2026-08-12T20:50:21.106Z
+    let (date, rest) = iso.split_once('T')?;
+    let mut d = date.split('-');
+    let (y, mo, da): (u64, u64, u64) = (
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+    );
+    let mut t = rest.trim_end_matches('Z').split(':');
+    let (h, mi): (u64, u64) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?);
+    let se: u64 = t.next()?.split('.').next()?.parse().ok()?;
+    // Days since an arbitrary epoch — only differences are ever used.
+    let days = y * 365 + y / 4 + mo * 31 + da;
+    Some(((days * 24 + h) * 60 + mi) * 60 + se)
+}
+
 /// Bounded, because a written file can be a megabyte and this crosses to a phone.
 const CHANGE_CHARS: usize = 1200;
+
+/// The plan out of a `TodoWrite`, if that is what this is.
+///
+/// Shapes vary by version — `todos` or `items`, `content` or `text` — so each is tried rather than
+/// assumed, and anything unrecognised falls through to being an ordinary tool row. A plan we
+/// cannot read is not worth a broken one.
+fn todo_items(name: &str, input: &Value) -> Option<Vec<(String, String)>> {
+    if name != "TodoWrite" {
+        return None;
+    }
+    let arr = input.get("todos").or_else(|| input.get("items"))?.as_array()?;
+    let items: Vec<(String, String)> = arr
+        .iter()
+        .filter_map(|t| {
+            let text = t.get("content").or_else(|| t.get("text")).or_else(|| t.get("activeForm"))?.as_str()?;
+            let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("pending");
+            Some((clean(text, 160), clean(status, 20)))
+        })
+        .collect();
+    (!items.is_empty()).then_some(items)
+}
 
 /// What this call changed, for the tools that change things.
 ///
@@ -187,7 +238,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
     // Where each tool call landed, so its result can resolve it in place. A result whose call we
     // never saw is ignored rather than invented — with a tail read, the call may simply be above
     // the window.
-    let mut pending: Vec<(String, usize)> = Vec::new();
+    let mut pending: Vec<(String, usize, Option<u64>)> = Vec::new();
 
     for line in body.lines() {
         let line = line.trim();
@@ -200,6 +251,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
         };
         let kind = v["type"].as_str().unwrap_or("");
         let content = &v["message"]["content"];
+        let at = v["timestamp"].as_str().and_then(epoch_secs);
 
         match kind {
             "user" => {
@@ -218,9 +270,11 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                             let id = block["tool_use_id"].as_str().unwrap_or_default();
                             let failed = block["is_error"].as_bool().unwrap_or(false);
                             let text = result_text(&block["content"]);
-                            if let Some((_, idx)) = pending.iter().find(|(pid, _)| pid == id) {
-                                if let Some(Row::Tool { status, detail, .. }) = rows.get_mut(*idx) {
+                            if let Some((_, idx, started)) = pending.iter().find(|(pid, _, _)| pid == id) {
+                                let took = started.zip(at).map(|(a, b)| b.saturating_sub(a));
+                                if let Some(Row::Tool { status, detail, secs, .. }) = rows.get_mut(*idx) {
                                     *status = if failed { ToolStatus::Failed } else { ToolStatus::Ok };
+                                    *secs = took;
                                     let d = clean(&text, DETAIL_CHARS);
                                     if !d.is_empty() {
                                         *detail = Some(d);
@@ -252,7 +306,11 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                             let name = clean(block["name"].as_str().unwrap_or("tool"), 60);
                             let summary = tool_summary(&name, &block["input"]);
                             let change = change_of(&name, &block["input"]);
-                            pending.push((id.clone(), rows.len()));
+                            if let Some(items) = todo_items(&name, &block["input"]) {
+                                rows.push(Row::Todo { items });
+                                continue;
+                            }
+                            pending.push((id.clone(), rows.len(), at));
                             rows.push(Row::Tool {
                                 id,
                                 name,
@@ -260,6 +318,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                                 status: ToolStatus::Running,
                                 detail: None,
                                 change,
+                                secs: None,
                             });
                         }
                         "thinking" => {
@@ -324,9 +383,13 @@ pub fn rows_json(rows: &[Row]) -> Vec<Value> {
         .map(|r| match r {
             Row::User { text } => serde_json::json!({ "kind": "user", "text": text }),
             Row::Assistant { text } => serde_json::json!({ "kind": "assistant", "text": text }),
-            Row::Tool { id, name, summary, status, detail, change } => serde_json::json!({
+            Row::Todo { items } => serde_json::json!({
+                "kind": "todo",
+                "todos": items.iter().map(|(t, st)| serde_json::json!({ "text": t, "status": st })).collect::<Vec<_>>(),
+            }),
+            Row::Tool { id, name, summary, status, detail, change, secs } => serde_json::json!({
                 "kind": "tool", "id": id, "name": name, "summary": summary,
-                "status": status.as_str(), "detail": detail,
+                "status": status.as_str(), "detail": detail, "secs": secs,
                 "change": change.as_ref().map(|c| serde_json::json!({ "before": c.before, "after": c.after })),
             }),
             Row::Reasoning { text } => serde_json::json!({ "kind": "reasoning", "text": text }),

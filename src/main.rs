@@ -6566,6 +6566,24 @@ fn selfcheck() -> Result<()> {
             let read = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/c.rs"}}]}}"#;
             assert!(matches!(&timeline::rows_from_str(read, 0)[0], Row::Tool { change: None, .. }));
 
+            // A plan renders as a plan, not as `TodoWrite · {…}`. It is the clearest signal on the
+            // screen that the agent understood the job, and it arrives as an ordinary tool call.
+            let todo = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"TodoWrite","input":{"todos":[{"content":"fix the parser","status":"completed"},{"content":"ship it","status":"in_progress"}]}}]}}"#;
+            let r = timeline::rows_from_str(todo, 0);
+            assert!(matches!(&r[0], Row::Todo { items } if items.len() == 2
+                && items[0] == ("fix the parser".to_string(), "completed".to_string())));
+            // A shape we do not recognise stays an ordinary tool row rather than a broken plan.
+            let odd_todo = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"TodoWrite","input":{"unknown":1}}]}}"#;
+            assert!(matches!(&timeline::rows_from_str(odd_todo, 0)[0], Row::Tool { .. }));
+
+            // How long a command took, from the two timestamps the transcript already carries.
+            let timed = concat!(
+                r#"{"type":"assistant","timestamp":"2026-08-12T20:50:21.106Z","message":{"content":[{"type":"tool_use","id":"z","name":"Bash","input":{"command":"cargo test"}}]}}"#, "
+",
+                r#"{"type":"user","timestamp":"2026-08-12T20:50:33.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"z","content":"ok"}]}}"#,
+            );
+            assert!(matches!(&timeline::rows_from_str(timed, 0)[0], Row::Tool { secs: Some(12), .. }));
+
             // A tool result whose call sits above the tail window resolves nothing, panics nowhere.
             let orphan = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"gone","content":"x"}]}}"#;
             assert!(timeline::rows_from_str(orphan, 0).is_empty());
