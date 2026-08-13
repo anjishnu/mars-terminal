@@ -1914,6 +1914,31 @@ fn seed(path: &Path, body: &str) -> Result<()> {
 /// pristine one built from the built-ins.
 /// The same hash `docs_drift` blesses by, for the build-time lock. One hash function for one
 /// question, so the lock can never disagree with the gate.
+/// Will the next run be allowed to start, as far as the standing orders are concerned?
+///
+/// Pure and non-mutating, which is what makes it safe to ask from `status`. It answers the
+/// question a human actually has before upgrading a host — *is this going to stop my manager* —
+/// by reasoning about what `scaffold_docs` will do rather than by doing it:
+///
+///   * version differs from the built-in  → it will be re-seeded → fine
+///   * version matches and text matches    → already current      → fine
+///   * version matches and text differs    → a real edit          → needs a blessing
+///
+/// The third case is both the human's own hand-edit (intended, blessed) and the developer's
+/// forgotten version bump (a mistake, and the one that stops every host at once). They are
+/// indistinguishable here by construction — which is why the build-time lock exists — but naming
+/// the file is enough for a person to tell which they are looking at.
+pub fn orders_after_upgrade(repo: &Path) -> Option<String> {
+    for (rel, built_in) in GUARDED_DOCS {
+        let Ok(text) = std::fs::read_to_string(repo.join(rel)) else { continue };
+        if text == *built_in || doc_superseded(&repo.join(rel), built_in) {
+            continue;
+        }
+        return Some((*rel).to_string());
+    }
+    None
+}
+
 pub fn version_of_pub(text: &str) -> String {
     version_of(text)
 }
@@ -1926,6 +1951,22 @@ pub fn scaffold_docs_pub(repo: &Path) -> Result<()> {
 /// `docs/`, so the cached prefix stays small and detail is loaded only when it is needed.
 fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("AGENTS.md"), include_str!("manager_docs/AGENTS.md"))?;
+    // Claude Code auto-loads CLAUDE.md, not AGENTS.md — so without this the agent spends its
+    // first calls hunting for its own standing orders. Measured across 863 runs: 259
+    // `find -iname AGENTS.md` plus 63 `cat`, every run, before it knows what it is for. The main
+    // repo solved this the same way years ago and the trick was never carried across.
+    //
+    // A symlink rather than a copy, because two files that must agree is precisely the drift this
+    // whole directory is versioned to avoid. `exists()` follows links, so a dangling one is
+    // repaired and a real file the human wrote is left alone — and it is deliberately NOT in
+    // GUARDED_DOCS, having no content of its own to be blessed.
+    #[cfg(unix)]
+    {
+        let link = repo.join("CLAUDE.md");
+        if !link.exists() {
+            let _ = std::os::unix::fs::symlink("AGENTS.md", &link);
+        }
+    }
     seed(&repo.join("docs/layout.md"), include_str!("manager_docs/layout.md"))?;
     seed(&repo.join("docs/cards.md"), include_str!("manager_docs/cards.md"))?;
     seed(&repo.join("docs/memos.md"), include_str!("manager_docs/memos.md"))?;
@@ -2831,6 +2872,13 @@ pub fn status_report(ts: u64) -> Result<String> {
     let mut s = String::new();
     s.push_str(&format!("repo          {}\n", repo.display()));
     s.push_str(&format!("agent         {}\n", if agent_enabled(&repo) { "ON" } else { "OFF — touch agent.enabled" }));
+    s.push_str(&format!(
+        "orders        {}\n",
+        match orders_after_upgrade(&repo) {
+            None => "in sync".to_string(),
+            Some(rel) => format!("DRIFT — {rel} differs at the current version; the next run will refuse until it is blessed"),
+        }
+    ));
     s.push_str(&format!("live sessions {}\n", if live.is_empty() { "(none)".into() } else { live.join(", ") }));
     s.push_str(&format!("snapshots     {pending} on disk\n"));
     s.push_str(&format!("open batch    {}\n", open_batch(&repo).map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_else(|| "(none)".into())));
