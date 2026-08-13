@@ -1,0 +1,14 @@
+# Generated: the version marker and content hash of every guarded doc.
+# Regenerate with tools/doc-lock.py after bumping a doc's mars-doc-version.
+# A doc whose text changed while its version did not is the one mistake that stops the
+# manager on every host at once; the selfcheck compares against this file to catch it.
+AGENTS.md 18 f4f1cc08b4048b3e
+prompt.md 6 21044b003d0fbe8e
+docs/layout.md 2 6c8d68bd6b5a3959
+docs/cards.md - 300d6b690e13a297
+docs/memos.md 14 4f988542218bca02
+docs/briefing.md 17 1163e77b026f49b6
+docs/workspaces.md 15 ba8a5152397372fd
+docs/receipts.md 2 eb65edea2b49648f
+docs/memory.md 6 f6b1742042ad7637
+docs/tools.md - 0e10afdb402131b1

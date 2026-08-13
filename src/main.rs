@@ -7498,6 +7498,111 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] orders: the agent cannot run on unblessed instructions ... PASS");
 
         {
+            // THE MISTAKE THAT STOPS EVERY HOST AT ONCE, made a build failure.
+            //
+            // `doc_superseded` replaces a deployed doc whose version marker DIFFERS from the
+            // built-in. `guarded_docs_ok` refuses the tick when a deployed doc differs from the
+            // built-in without a blessing. Both are right, and between them sits one trap: edit a
+            // doc's text and leave its marker alone, and every host that already installed keeps
+            // its old copy — same version, different text, therefore drifting, unblessed, and
+            // refusing to run. From a change that looked like a no-op.
+            //
+            // It cannot be caught at runtime. On the host, "the developer forgot to bump" and "the
+            // human edited their copy" are byte-identical situations, and the binary carries no
+            // copy of the previous release to tell them apart. So it is caught HERE, against a
+            // recorded pair of (version, hash) per doc: text changed while the version did not is
+            // exactly the condition, and it is decidable at build time.
+            //
+            // The earlier version of this test — seed a repo at version N-1, re-scaffold, assert
+            // no drift — passes whether or not anyone forgot, because it derives the "previous
+            // release" from the current text. It proves the upgrade mechanism works, which is
+            // worth knowing and is not this.
+            let lock = include_str!("manager_docs/versions.lock");
+            let recorded: Vec<(&str, &str, &str)> = lock
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+                .filter_map(|l| {
+                    let mut f = l.split_whitespace();
+                    Some((f.next()?, f.next()?, f.next()?))
+                })
+                .collect();
+            assert_eq!(
+                recorded.len(),
+                manager::GUARDED_DOCS.len(),
+                "versions.lock lists {} docs, GUARDED_DOCS has {} — run tools/doc-lock.py",
+                recorded.len(),
+                manager::GUARDED_DOCS.len()
+            );
+            for (rel, built_in) in manager::GUARDED_DOCS {
+                let (_, want_ver, want_hash) = recorded
+                    .iter()
+                    .find(|(r, _, _)| r == rel)
+                    .unwrap_or_else(|| panic!("{rel} is guarded but absent from versions.lock — run tools/doc-lock.py"));
+                let ver = built_in
+                    .find("mars-doc-version:")
+                    .map(|at| {
+                        built_in[at + 17..]
+                            .trim_start()
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                    })
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "-".into());
+                let hash = manager::version_of_pub(built_in);
+                if &hash != want_hash && &ver == want_ver {
+                    panic!(
+                        "{rel} was edited without bumping its mars-doc-version (still {ver}).\n\
+                         Every host that already installed keeps its old copy at that same version, \
+                         which then reads as unblessed drift and stops the manager everywhere.\n\
+                         Bump the marker in src/manager_docs/, then run tools/doc-lock.py."
+                    );
+                }
+                assert!(
+                    &hash == want_hash,
+                    "{rel} changed (version {ver}) — run tools/doc-lock.py to record it"
+                );
+            }
+        }
+        println!("[selfcheck] orders: a doc cannot change without its version ... PASS");
+
+        {
+            // And the upgrade itself re-seeds rather than deadlocking: a repo deployed at the
+            // previous version must come back clean, not refuse on its own drift.
+            let repo = std::env::temp_dir().join("__selfcheck_upgrade__");
+            std::fs::remove_dir_all(&repo).ok();
+            std::fs::create_dir_all(repo.join("docs"))?;
+            let older = |text: &str| -> String {
+                let Some(at) = text.find("mars-doc-version:") else { return text.to_string() };
+                let digits: String = text[at + 17..].trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                match digits.parse::<u32>() {
+                    Ok(v) if v > 0 => text.replacen(
+                        &format!("mars-doc-version: {v}"),
+                        &format!("mars-doc-version: {}", v - 1),
+                        1,
+                    ),
+                    _ => text.to_string(),
+                }
+            };
+            for (rel, built_in) in manager::GUARDED_DOCS {
+                std::fs::write(repo.join(rel), older(built_in))?;
+            }
+            manager::scaffold_docs_pub(&repo)?;
+            assert!(manager::docs_drift(&repo, &[]).is_none(), "an upgrade must re-seed cleanly");
+
+            // The guard still guards: current version, different body, is a human edit.
+            let (rel, built_in) = manager::GUARDED_DOCS[0];
+            std::fs::write(repo.join(rel), format!("{built_in}\n<!-- mine -->\n"))?;
+            manager::scaffold_docs_pub(&repo)?;
+            assert!(
+                manager::docs_drift(&repo, &[]).is_some(),
+                "a hand-edited doc at the current version must still stop the tick"
+            );
+            std::fs::remove_dir_all(&repo).ok();
+        }
+        println!("[selfcheck] orders: an upgrade re-seeds instead of deadlocking ... PASS");
+
+        {
             // A memo's filename is typed into a shell by the captain's "assign" tap, inside the
             // worker brief — and the captain approved a TITLE, never this string.
             assert!(manager::safe_memo_name("deploy-is-failing.md"), "an ordinary memo");

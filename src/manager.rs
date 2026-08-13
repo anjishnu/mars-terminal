@@ -1910,6 +1910,18 @@ fn seed(path: &Path, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Seed a repo's standing orders, for a test that needs the real upgrade path rather than a
+/// pristine one built from the built-ins.
+/// The same hash `docs_drift` blesses by, for the build-time lock. One hash function for one
+/// question, so the lock can never disagree with the gate.
+pub fn version_of_pub(text: &str) -> String {
+    version_of(text)
+}
+
+pub fn scaffold_docs_pub(repo: &Path) -> Result<()> {
+    scaffold_docs(repo)
+}
+
 /// The comprehensive guide any coding agent reads on entry. A hub in `AGENTS.md` with spokes in
 /// `docs/`, so the cached prefix stays small and detail is loaded only when it is needed.
 fn scaffold_docs(repo: &Path) -> Result<()> {
