@@ -84,6 +84,23 @@ pub enum Row {
 /// and both of those cross to a phone from here.
 const SUMMARY_CHARS: usize = 120;
 const DETAIL_CHARS: usize = 2048;
+
+/// How much of a MESSAGE survives, as opposed to a tool's output.
+///
+/// These shared a cap at 2048, which meant the conversation view could not show the end of a long
+/// reply: the agent finished, the pane went still, and the last thing on screen trailed off into
+/// an ellipsis mid-sentence with no way to reach the rest. Scrolling did not help, because the
+/// text had been cut before it left this machine. A tool's output genuinely wants clipping — it is
+/// a log, and the reader wants the shape of it. A message is the thing they came to read.
+const PROSE_CHARS: usize = 24_000;
+
+/// How many of the newest messages keep their full length.
+///
+/// This payload is re-sent every few seconds while a phone is watching, so a whole transcript at
+/// full length is not a phone-sized thing to send. Reading happens at the END, so that is where
+/// the budget goes: recent messages arrive whole, older ones keep the clip they always had, and
+/// what you are actually reading is never the truncated one.
+const FULL_PROSE_ROWS: usize = 8;
 /// How much of the file's tail to read. The live transcript of a long session on this machine is
 /// 188 MB; reading it whole to show the last twenty rows would stall the bridge every poll.
 const TAIL_BYTES: u64 = 512 * 1024;
@@ -257,7 +274,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
             "user" => {
                 if let Some(text) = content.as_str() {
                     if !is_machinery(text) {
-                        let t = clean(text, DETAIL_CHARS);
+                        let t = clean(text, PROSE_CHARS);
                         if !t.is_empty() {
                             rows.push(Row::User { text: t });
                         }
@@ -283,7 +300,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                             }
                         }
                         "text" => {
-                            let t = clean(block["text"].as_str().unwrap_or(""), DETAIL_CHARS);
+                            let t = clean(block["text"].as_str().unwrap_or(""), PROSE_CHARS);
                             if !t.is_empty() && !is_machinery(&t) {
                                 rows.push(Row::User { text: t });
                             }
@@ -296,7 +313,7 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                 for block in content.as_array().into_iter().flatten() {
                     match block["type"].as_str().unwrap_or("") {
                         "text" => {
-                            let t = clean(block["text"].as_str().unwrap_or(""), DETAIL_CHARS);
+                            let t = clean(block["text"].as_str().unwrap_or(""), PROSE_CHARS);
                             if !t.is_empty() {
                                 rows.push(Row::Assistant { text: t });
                             }
@@ -348,6 +365,19 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
 
     if limit > 0 && rows.len() > limit {
         rows.drain(..rows.len() - limit);
+    }
+    // The newest messages keep their full length; everything above them goes back to the clip.
+    // Done after the window is chosen, so "newest" means newest in what is actually being sent.
+    let mut kept = 0usize;
+    for row in rows.iter_mut().rev() {
+        let text = match row {
+            Row::Assistant { text } | Row::User { text } => text,
+            _ => continue,
+        };
+        kept += 1;
+        if kept > FULL_PROSE_ROWS && text.chars().count() > DETAIL_CHARS {
+            *text = clean(text, DETAIL_CHARS);
+        }
     }
     rows
 }
