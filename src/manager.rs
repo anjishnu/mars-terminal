@@ -3129,11 +3129,48 @@ pub fn rover_chat_stream(
         .arg("--add-dir").arg(repo.display().to_string())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // F4 — THE SESSION TREE, read-only by allow-list.
+    //
+    // Rover was asked, in its own words, whether it could see the other sessions and answered
+    // "no — read-only, restricted to ~/.mars/manager/". So the companion that is supposed to know
+    // what the machine is doing could not read the machine. This grants no new authority: the
+    // tools are still Read/Grep/Glob, and an allow-listed directory is exactly what those already
+    // operate under. Without it, cross-session context and recall are impossible rather than
+    // merely unbuilt.
+    if let Some(sessions) = crate::sys::paths::home_dir().map(|h| h.join(".mars").join("sessions")) {
+        if sessions.is_dir() {
+            cmd.arg("--add-dir").arg(sessions.display().to_string());
+        }
+    }
     if let Some(t) = chat_thread_id(session) {
         cmd.arg("--resume").arg(t);
     }
+    // F5 — A CONSTANT WORKING DIRECTORY.
+    //
+    // This was the session's own cwd, and Claude Code auto-loads CLAUDE.md from wherever it is
+    // told to stand. So every phone question carried the repo's AGENTS.md — build, test, lint and
+    // commit conventions written for an agent that edits code — plus the human's personal global
+    // rules, about 17KB of instructions for a job Rover is not doing. It said so itself when
+    // asked: "those files assume a full coding agent; I'm read-only, so none of that is
+    // actionable here."
+    //
+    // The reason it belongs on the critical path is subtler than the noise or the privacy. cwd
+    // varies per session, so the auto-loaded text varies per session, so the cached system prefix
+    // is DIFFERENT for every session on the machine — and one session's warm-up cannot warm
+    // another no matter what the warm flag does. A constant directory makes the prefix identical
+    // across the host, which is what makes warming shared and the digest in Phase 6 cacheable.
+    //
+    // The project stays readable: it is passed as an allow-listed directory instead, so the
+    // capability is preserved and only the auto-loaded instructions are dropped.
     if let Some(d) = &cwd {
-        cmd.current_dir(d);
+        cmd.arg("--add-dir").arg(d.display().to_string());
+    }
+    let neutral = crate::sys::paths::home_dir().map(|h| h.join(".mars").join("rover"));
+    if let Some(n) = &neutral {
+        let _ = std::fs::create_dir_all(n);
+        cmd.current_dir(n);
+    } else if let Some(d) = &cwd {
+        cmd.current_dir(d); // no home directory to stand in; the old behaviour beats failing
     }
 
     let mut child = match cmd.spawn() {
