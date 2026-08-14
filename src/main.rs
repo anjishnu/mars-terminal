@@ -7816,14 +7816,58 @@ fn selfcheck() -> Result<()> {
         assert!(!board.contains("\"cmd\""),
             "the command label outlived the command: {board}");
 
-        // Nobody watching → nothing sampled. The label exists for the phone, and a desktop that
-        // no one is glancing at must not pay a process per pane for it.
+        // Nobody reading AT ALL → nothing sampled. The label costs a `ps` per pane, and a
+        // standalone editor with no phone and no manager behind it must not pay for one.
         app.rover_active = false;
+        app.board_has_reader = false;
         app.fg_commands.insert(tid, "claude".into());
         app.maybe_sample_foreground();
         assert!(app.fg_commands.is_empty(),
-            "foreground sampling kept state with no phone subscribed");
+            "foreground sampling kept state with no reader at all");
+
+        // But a READER is not a phone. The manager snapshots every session on this host whether
+        // or not a phone is on it, and it reads this exact JSON — so with nobody glancing the
+        // sample must still run. Keying it to the phone is what let a `claude` waiting at a
+        // prompt and a wedged build render as the same row on every unwatched session.
+        let pid = app.focused_pane_id();
+        app.write_to_pane(pid, "sleep 30\n");
+        let mut labelled = None;
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // `send_bytes` queues behind the shell's startup prompt probe, so the command only
+            // reaches the PTY once the terminal has been pumped.
+            app.tick();
+            app.board_has_reader = true;
+            app.rover_active = false;
+            app.frame_tick = 0; // land on the sample tick regardless of cadence
+            app.maybe_sample_foreground();
+            if let Some(cmd) = app.fg_commands.get(&tid) {
+                labelled = Some(cmd.clone());
+                break;
+            }
+        }
+        assert_eq!(labelled.as_deref(), Some("sleep"),
+            "an unwatched session's board never learned what its pane was running — the manager \
+             reads this board and would have had to describe the workspace without naming it");
         println!("[selfcheck] rover: the board says what a pane is running ... PASS");
+
+        // The cost boundary that makes the above affordable: free enrichment for any reader,
+        // model spend only under attention. An unwatched session fills its summaries from the
+        // deterministic tier-0 triage and stops there — no provider is contacted.
+        app.rover_summaries.clear();
+        app.board_has_reader = true;
+        app.rover_active = false;
+        app.frame_tick = 0;
+        for _ in 0..6 {
+            app.tick();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        assert!(!app.bg_busy,
+            "an unwatched session started a background model call");
+        assert!(app.rover_summaries.values().all(|s| s.provider == "tier-0"),
+            "an unwatched session spent a model call on a summary: {:?}",
+            app.rover_summaries.values().map(|s| s.provider.clone()).collect::<Vec<_>>());
+        println!("[selfcheck] rover: an unwatched board is enriched free, never paid ... PASS");
     }
 
     let _ = std::fs::remove_file(&worklog_default);

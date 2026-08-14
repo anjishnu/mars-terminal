@@ -226,3 +226,23 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   ERR for the custom name to win), so renaming a workspace to `42` from either the phone or the
   desk prompt silently falls back to `terminal N` / the filename. Pre-existing and shared by
   both rename paths; a validating UI would have to reject digit-only names on its own.
+- **`mobile_board_json()` has TWO readers, and only one of them used to count.** The phone is
+  intermittent and serves exactly ONE session per connection; the manager snapshot tick
+  (`session.rs`, gated only on `manager_snapshot_secs > 0`, default 60s) reads EVERY session on
+  the host for as long as the daemon lives. All three enrichment paths — `maybe_sample_foreground`
+  (board `cmd`), `maybe_rover_map` (board `summary`), `maybe_rover_brief` — hung off
+  `App::rover_active`, i.e. `!subscribers.is_empty()` on one daemon. So on a machine with N
+  sessions, N−1 boards were permanently bare and the manager wrote its briefings from them: a
+  `claude` waiting at a prompt and a wedged build rendered as the same row (`stalled · no output
+  for Nh`, `cmd=None`). Fixed 2026-08 by splitting **readership** (`App::board_has_reader` —
+  gates free enrichment, host-wide) from **attention** (`rover_active` — gates model spend,
+  per-session). Cadence follows the reader via `App::enrich_secs(watched_secs)`: the phone's
+  interval while glancing, `manager_snapshot_secs` otherwise.
+- **`maybe_rover_map`'s "PASS 1 (free, always)" was not always.** Three separate early returns —
+  no phone, `bg_busy`/`agent_pending`, and a broker whose tunnel was down — skipped the free
+  deterministic pass along with the paid one. A host that cannot reach a model is exactly the
+  host that most needs its tier-0 line. PASS 1 now runs ahead of every model gate.
+- **Driving a pane from a bare `App` in the selfcheck needs `tick()`.** `write_to_pane` →
+  `Terminal::send_bytes` queues into `startup_input` behind the shell's prompt probe and only
+  flushes when the terminal is pumped, so a test that writes a command and then polls without
+  calling `app.tick()` waits forever on input the shell never received.
