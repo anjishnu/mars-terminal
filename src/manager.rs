@@ -2563,6 +2563,11 @@ pub fn snapshot_main(repo: Option<String>) -> Result<()> {
 /// for iterating on the agent was the one command that could not feed it. Uses frames the daemon
 /// has spoken since long before today, so it works against whatever is already running: no
 /// restart, and no interrupting a session someone is working in.
+/// How much of a pane's screen goes into a snapshot. Deliberately larger than a screen: the drain
+/// below keeps the LAST n, so any value at or above the real row count keeps the whole frame, and
+/// a terminal taller than this is the only case that crops.
+const SCREEN_TAIL_LINES: usize = 120;
+
 fn pane_output_of(session: &str, panes: &[String], tail_lines: usize) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     let Ok(path) = crate::session::socket_path(session) else { return serde_json::Value::Object(out) };
@@ -2636,7 +2641,19 @@ pub fn force_snapshot(ts: u64) -> Result<usize> {
     for name in live_session_names() {
         let Some(snap) = board_of(&name) else { continue };
         let panes: Vec<String> = snap.panes.iter().map(|p| p.pane_id.clone()).collect();
-        let output = pane_output_of(&name, &panes, 20);
+        // THE WHOLE SCREEN, not the last twenty lines.
+        //
+        // A pane running a coding agent spends its bottom rows on the composer, a status line and
+        // a spinner — so a 20-line window is mostly chrome, and chrome is identical between two
+        // snapshots taken twenty minutes apart even when the agent has written half a file. That
+        // is why every suppression reason in the census reads "byte-identical tail": the material
+        // change was above the window, every time.
+        //
+        // A full screen at typical geometry is ~40-60 rows, so this is not "more logs" — it is the
+        // same frame the pane is actually showing, uncropped. `plain()` has already stripped the
+        // escapes and blank lines by this point, so the cost is a few hundred bytes per pane on an
+        // artifact that already carries a delta.
+        let output = pane_output_of(&name, &panes, SCREEN_TAIL_LINES);
         emit(&repo, &host_name(), std::slice::from_ref(&snap), ts, 2700, &output)?;
         n += 1;
     }
@@ -3169,6 +3186,96 @@ pub fn health_report(ts: u64) -> Result<String> {
         }
         if nseen == 0 && st.writes >= 10 {
             defects.push(format!("{title}: rewritten {} times, never once seen", st.writes));
+        }
+    }
+
+    // ── COVERAGE, UNDESCRIBED AGE, SUPPRESSION CENSUS ────────────────────────────────────────
+    //
+    // The three metrics that turn "the manager went quiet" from something noticed days later into
+    // a line. All three are counts over data already on disk: the notes themselves, and the
+    // `skipped: [{session, why}]` the run receipts have always carried.
+    //
+    // The census is the interesting one. It answers "what is this system deliberately NOT doing,
+    // and how often" — a question nothing could ask before, and the one that would have named the
+    // `focused` rule on its first day rather than after it had silently excluded the busiest pane
+    // for weeks.
+    {
+        let sessions_root = crate::sys::paths::home_dir().map(|h| h.join(".mars").join("sessions"));
+        let mut live = 0usize;
+        let mut described = 0usize;
+        let mut oldest: Option<u64> = None;
+        if let Some(root) = sessions_root {
+            if let Ok(rd) = std::fs::read_dir(&root) {
+                for sess in rd.flatten() {
+                    let ws = sess.path().join("workspaces");
+                    let Ok(panes) = std::fs::read_dir(&ws) else { continue };
+                    // One pane can have both `<n>.md` (the agent's) and `<n>.computed.md` (the
+                    // deterministic floor). Only the first counts as described: the floor exists
+                    // precisely so that silence is survivable, not so that it can pass for speech.
+                    for f in panes.flatten() {
+                        let name = f.file_name().to_string_lossy().to_string();
+                        if !name.ends_with(".md") || name.ends_with(".computed.md") {
+                            continue;
+                        }
+                        live += 1;
+                        let age = f
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.elapsed().ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(u64::MAX);
+                        // "Described" means described RECENTLY. A note from yesterday about a pane
+                        // that has moved since is not coverage, it is a stale claim.
+                        if age < 2 * 3600 {
+                            described += 1;
+                        }
+                        oldest = Some(oldest.map_or(age, |o: u64| o.max(age)));
+                    }
+                }
+            }
+        }
+        if live > 0 {
+            out.push_str(&format!(
+                "\n  coverage          {described}/{live} panes described in the last 2h\n"
+            ));
+            if let Some(o) = oldest {
+                out.push_str(&format!("  undescribed age   {} (oldest note)\n", coarse_age(o)));
+            }
+            if described == 0 {
+                defects.push(format!(
+                    "no pane described in the last 2h — {live} live, the deterministic floor is \
+                     carrying the board alone"
+                ));
+            }
+        }
+
+        // The census, from receipts the manager already writes.
+        let mut census: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        if let Ok(rd) = std::fs::read_dir(repo.join("runs")) {
+            let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            files.sort();
+            for f in files.iter().rev().take(12) {
+                let Ok(body) = std::fs::read_to_string(f) else { continue };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else { continue };
+                for sk in v["skipped"].as_array().into_iter().flatten() {
+                    let why = sk["why"].as_str().unwrap_or("");
+                    // Bucket by the FIRST few words. A reason carrying an elapsed time is a
+                    // different string every run and would census as one-of-each — the same
+                    // time-varying-text defect this file already normalises for novelty.
+                    let key: String = why.split_whitespace().take(4).collect::<Vec<_>>().join(" ");
+                    let key = if key.is_empty() { "(no reason given)".into() } else { key };
+                    *census.entry(key).or_default() += 1;
+                }
+            }
+        }
+        if !census.is_empty() {
+            let mut rows: Vec<_> = census.into_iter().collect();
+            rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            out.push_str("\n  suppression census, last 12 runs\n");
+            for (why, n) in rows.iter().take(6) {
+                out.push_str(&format!("    {n:>3}  {}\n", why.chars().take(58).collect::<String>()));
+            }
         }
     }
 
