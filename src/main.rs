@@ -7983,6 +7983,45 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] push: one interrupt per tick, to the longest wait ... PASS");
     }
 
+    // ── THE TWO WAYS A BOARD LIES ABOUT CHANGING ─────────────────────────────────────────────
+    //
+    // Both directions, because they are the same defect and they cost opposite things. Over-detect
+    // and the agent rewrites the same memo forever — measured at 5,782 writes of one memo in 24
+    // hours, never read. Under-detect and it never writes anything — measured at 0 of 14 panes
+    // described in two hours, for fifteen days.
+    {
+        // A stall counter advancing is not news. This is the exact shape of the board that
+        // produced the 5,782: identical panes, one elapsed-time phrase moving.
+        let board = |mins: u64| serde_json::json!({
+            "session": "sc-fp",
+            "rows": [{
+                "id": "w1", "paneId": "0", "wid": "w1", "name": "terminal 1",
+                "verdict": "stalled", "kind": "terminal",
+                "why": format!("no output for {mins}m"),
+                "ageSecs": mins * 60,
+            }],
+        }).to_string();
+        let a = crate::manager::detail_fingerprint_for_test(&board(432));
+        let b = crate::manager::detail_fingerprint_for_test(&board(452));
+        assert_eq!(a, b, "a board whose only change is a stall counter must hash the same");
+        println!("[selfcheck] board: a moving stall counter is not news ... PASS");
+
+        // …and something genuinely different still is. Without this the fix above would be a
+        // fingerprint that never changes, which is the other failure wearing the first one's face.
+        let moved = serde_json::json!({
+            "session": "sc-fp",
+            "rows": [{
+                "id": "w1", "paneId": "0", "wid": "w1", "name": "terminal 1",
+                "verdict": "failed", "kind": "terminal",
+                "why": "build failed: missing semicolon",
+                "ageSecs": 60,
+            }],
+        }).to_string();
+        let c = crate::manager::detail_fingerprint_for_test(&moved);
+        assert_ne!(a, c, "a pane that changed what it is doing MUST hash differently");
+        println!("[selfcheck] board: a pane that actually moved is news ... PASS");
+    }
+
         // The cost boundary that makes the above affordable: free enrichment for any reader,
         // model spend only under attention. An unwatched session fills its summaries from the
         // deterministic tier-0 triage and stops there — no provider is contacted.

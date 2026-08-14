@@ -2357,11 +2357,28 @@ fn fingerprint_material(s: &SessionSnap) -> String {
     format!("{}::{}", s.name, parts.join("~"))
 }
 
+/// What the board SAYS, with the parts that move on their own removed.
+///
+/// This hashed `why` verbatim, and `why` carries an elapsed-time phrase — "no output for 7h15m".
+/// So a board that had not moved in seven hours produced a different hash every single tick, the
+/// tick concluded it was news, and the agent rewrote the same memo about it. Measured on this
+/// host: one memo written 5,782 times in 24 hours, never once read.
+///
+/// `normalize_for_novelty` is the same operation the health guardrails use to ask "is this
+/// actually different", which is the same question — and asking it two ways is how the two answers
+/// drift. A stall counter advancing is not news; the pane changing what it is doing is.
+/// Selfcheck seam. The fingerprints are private on purpose — they are an implementation detail of
+/// the tick — but the two failure directions they guard are the most expensive bugs this system
+/// has had, and a test that cannot reach them is a test of something else.
+pub fn detail_fingerprint_for_test(board_json: &str) -> String {
+    parse_board(board_json).map(|s| fingerprint_detail(&s)).unwrap_or_default()
+}
+
 fn fingerprint_detail(s: &SessionSnap) -> String {
     let mut parts: Vec<String> = s
         .panes
         .iter()
-        .map(|p| format!("{}|{}", p.pane_id, p.why.trim()))
+        .map(|p| format!("{}|{}", p.pane_id, normalize_for_novelty(&p.why)))
         .collect();
     parts.sort();
     parts.join("~")
