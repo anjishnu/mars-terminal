@@ -387,10 +387,28 @@ pub fn rover_status() -> (&'static str, u64, String) {
 /// Warm the agent in the background. Idempotent: a second phone connecting must not start a
 /// second warm-up, which would spend a whole turn to learn something already known.
 fn warm_rover(session: String) {
-    static WARMING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if WARMING.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+    // PER SESSION, not per process.
+    //
+    // This was one machine-wide flag, and its comment justified it correctly for the case it was
+    // written for: a second PHONE joining the same session must not warm twice. But the thing
+    // being warmed is per session — `chat.json` lives in the session's own directory — so on a
+    // host running several sessions the first one to connect warmed and created its thread, and
+    // every session after it hit the flag, never warmed, and had no thread at all.
+    //
+    // The user-visible shape of that: the second session shows "Rover ready" (the state is
+    // process-global too), and then pays the entire cold cost inline on the first question, with
+    // nothing covering it. Which is the "it needs a few seconds at the start" complaint — not once
+    // per app launch, but once per session, unhidden, after the UI has claimed to be ready.
+    static WARMING: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    {
+        let Ok(mut set) = WARMING.lock() else { return };
+        let set = set.get_or_insert_with(std::collections::HashSet::new);
+        if !set.insert(session.clone()) {
+            return; // this session is already warming or warm
+        }
     }
+    let warming_key = session.clone();
     thread::spawn(move || {
         let (ms, err) = crate::manager::rover_warm(&session, crate::worklog::now_secs());
         ROVER_RAMP_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -411,7 +429,11 @@ fn warm_rover(session: String) {
                 // Let the next connection try again. A failure here is often transient — a laptop
                 // that woke with no network yet — and latching it until the bridge restarts turns
                 // a bad minute into a dead feature for the rest of the session.
-                WARMING.store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut set) = WARMING.lock() {
+                    if let Some(set) = set.as_mut() {
+                        set.remove(&warming_key);
+                    }
+                }
             }
         }
     });
