@@ -428,6 +428,61 @@ fn main() -> Result<()> {
         // workspaces rooted where they were and any coding agent resumed. Runs as its own process
         // precisely so neither the daemon (which is going away) nor the bridge (the phone's only
         // way back) has to survive its own restart.
+        // Bring THIS MACHINE onto the binary on disk.
+        //
+        // `reboot` is a session verb and stays one — silently redefining it to mean "restart
+        // everything" would surprise anyone with a script or muscle memory, and would restart
+        // sessions that do not need it. But staleness is a property of the HOST: one binary,
+        // every daemon. Making the remedy per-session is what let a daemon sit two weeks behind,
+        // silently dropping frames it was too old to understand, while every other process on the
+        // machine had already been upgraded.
+        //
+        // So: restart what is stale, leave what is current, and say which is which first.
+        Some("upgrade") => {
+            // REPORTS BY DEFAULT. Restarting every stale daemon on a machine is exactly the kind
+            // of act this codebase makes a person press for — "the agent proposes, a human
+            // presses" is the invariant everything else rests on, and a host-wide restart that
+            // happens because you typed a noun would be the one exception.
+            let go = args.any(|f| f == "--yes" || f == "-y");
+            let sessions = session::stale_sessions();
+            if sessions.is_empty() {
+                println!("no live sessions on this host.");
+                return Ok(());
+            }
+            let stale: Vec<&String> = sessions.iter().filter(|(_, s)| *s).map(|(n, _)| n).collect();
+            for (name, is_stale) in &sessions {
+                println!("  {name:<20} {}", if *is_stale { "older code" } else { "current" });
+            }
+            if stale.is_empty() {
+                println!("\nevery session is running the installed binary.");
+            } else if !go {
+                println!(
+                    "\n{} session(s) are behind. `mars upgrade --yes` restarts them.\n\
+                     Each restores its workspaces; agents resume their exact conversation where one\n\
+                     was recorded. Check what is running in them first.",
+                    stale.len()
+                );
+            } else {
+                println!(
+                    "\n{} session(s) to restart. Each restores its workspaces; agents resume their\n\
+                     exact conversation where one was recorded, and are named below if not.",
+                    stale.len()
+                );
+                for name in &stale {
+                    println!();
+                    // reboot_main prints the restore plan for this session before acting, which is
+                    // the part worth reading: it says which agents come back as themselves.
+                    if let Err(e) = session::reboot_main(Some((*name).clone())) {
+                        println!("  {name}: {e}");
+                    }
+                }
+            }
+            // The bridge is not ours to restart: it holds the tunnel, and killing it here would
+            // drop every phone to pick up code that an in-place exec can take without dropping
+            // anything. It upgrades itself from the phone, or on its own next start.
+            println!("\nthe bridge upgrades itself in place — tap `older code · update` on the phone.");
+            return Ok(());
+        }
         Some("reboot") => {
             return session::reboot_main(args.next());
         }

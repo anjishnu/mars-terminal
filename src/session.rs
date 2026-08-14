@@ -134,6 +134,15 @@ pub enum ServerFrame {
         instance_id: String,
         #[serde(default)]
         name: String,
+        /// When this daemon started, so a caller can compare it against the mtime of the binary
+        /// on disk. `version` cannot answer this — it is CARGO_PKG_VERSION, identical across a
+        /// reinstall of the same version over itself, which is the ONLY case that matters here.
+        ///
+        /// `default` on purpose: a daemon old enough not to send it is, by construction, running
+        /// a binary from before this field existed. Zero therefore means "stale" rather than
+        /// "unknown", and the absence answers the question it looks like it is failing to answer.
+        #[serde(default)]
+        started_ts: u64,
     },
     /// Reply to `ClientFrame::BrokerRoute`.
     BrokerRoute {
@@ -252,6 +261,69 @@ pub fn socket_path(name: &str) -> Result<PathBuf> {
 ///
 /// This is the only way to bind to a session that survives a rename. A socket is named after the
 /// session, so `mars rename` moves it; the instance id inside does not move.
+
+/// When this process started, in unix seconds. Recorded once at first call.
+pub fn daemon_started_ts() -> u64 {
+    use std::sync::OnceLock;
+    static STARTED: OnceLock<u64> = OnceLock::new();
+    *STARTED.get_or_init(crate::worklog::now_secs)
+}
+
+/// Is a daemon that started at `started_ts` running older code than is installed?
+///
+/// Compares against the mtime of the binary on disk — the same computation the board already
+/// sends to the phone, lifted so the CLI can ask it too. A `started_ts` of 0 is a daemon that
+/// predates the field, which is itself an answer.
+pub fn daemon_is_stale(started_ts: u64) -> bool {
+    if started_ts == 0 {
+        return true;
+    }
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(m) = std::fs::metadata(&exe) else { return false };
+    let Ok(mtime) = m.modified() else { return false };
+    let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) else { return false };
+    d.as_secs() > started_ts
+}
+
+/// Every live session on this host, with whether its daemon is behind the installed binary.
+pub fn stale_sessions() -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let Ok(dir) = socket_dir() else { return out };
+    let Ok(rd) = std::fs::read_dir(&dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("sock") {
+            continue;
+        }
+        if let Some((name, started)) = probe_started(&p) {
+            out.push((name, daemon_is_stale(started)));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Ask one daemon its name and start time.
+fn probe_started(path: &std::path::Path) -> Option<(String, u64)> {
+    let stream = crate::sys::control::connect(path).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(2500))).ok()?;
+    let mut w = stream.try_clone().ok()?;
+    write_frame(&mut w, &ClientFrame::Status).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(stream).read_line(&mut line).ok()?;
+    match serde_json::from_str::<ServerFrame>(line.trim()).ok()? {
+        ServerFrame::Status { name, started_ts, .. } => {
+            let name = if name.is_empty() {
+                path.file_stem()?.to_str()?.to_string()
+            } else {
+                name
+            };
+            Some((name, started_ts))
+        }
+        _ => None,
+    }
+}
+
 pub fn identify(path: &std::path::Path) -> Option<(String, String, bool)> {
     // More patient than `query_attached`'s 500ms: this is called by a bridge re-resolving its
     // target, sometimes moments after a rename, against a daemon that is also serving an attached
@@ -1252,6 +1324,7 @@ fn client_connection(
                 let _ = write_frame(&mut w, &ServerFrame::Status {
                     attached: attached.load(Ordering::SeqCst),
                     version: VERSION.to_string(),
+                    started_ts: daemon_started_ts(),
                     instance_id: session_instance_id.to_string(),
                     // Left empty deliberately: the socket FILENAME is the current name (a rename
                     // moves the socket), so `identify()` reads it from the path and this cannot
