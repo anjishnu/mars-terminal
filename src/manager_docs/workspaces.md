@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 15 -->
+<!-- mars-doc-version: 16 -->
 # Workspace notes
 
 **Read second**, after the briefing, when a row is tapped. One file per workspace at
@@ -126,13 +126,19 @@ With more than one, bold the one you would take, and keep them genuinely differe
 investigation and a decision to move on are three options; three flavours of "look into it" are
 one.
 
-## Skip the pane they are looking at
+## Describe every workspace, including the focused one
 
-A workspace with **`"focused": true`** in the snapshot gets **no note at all**. That is the pane on
-their screen right now; a note about it describes back to them what they are already reading.
+**`"focused": true` is not a reason to skip a pane.** It used to be: the argument was that a note
+about the pane on their screen describes back to them what they are already reading.
 
-The one exception is `blocked`. A pane waiting on an answer is worth naming even when focused,
-because it is the thing stopping everything else.
+That argument assumes the reader is sitting at the desk. The reader is usually holding a phone,
+where the focused pane is invisible — and it is *the pane they are working in*, so it is the one
+with the most to say. The rule therefore removed exactly the note that mattered most, and did it
+silently: a whole session could go by with the busiest workspace the only undescribed one.
+
+Whether a note is redundant is the READER's judgement, made when the note is read, and the reader
+knows what is on their screen. It is not yours, made when it is written, on behalf of a screen you
+cannot see.
 
 ## Rules
 
