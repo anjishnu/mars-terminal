@@ -7855,6 +7855,79 @@ fn selfcheck() -> Result<()> {
              reads this board and would have had to describe the workspace without naming it");
         println!("[selfcheck] rover: the board says what a pane is running ... PASS");
 
+    // ── PUSH GATES ───────────────────────────────────────────────────────────────────────────
+    //
+    // The rules that decide whether a phone buzzes at 02:00, driven with synthetic boards. The
+    // flapping case is FIRST deliberately: it is the regression test for a memo that rewrote
+    // itself 50,570 times in seven days and was never once read, and its case is drawn from
+    // recorded behaviour rather than invented.
+    {
+        use crate::manager::{push_candidate, PaneFacts};
+        use std::collections::HashMap;
+        let t = crate::tuning::Tuning::default();
+        let agent = |stall: u64, prompt: Option<&str>| PaneFacts {
+            session: "mars-dev".into(),
+            pane: "terminal 2".into(),
+            verdict: "stalled".into(),
+            cmd: Some("claude".into()),
+            stall_secs: stall,
+            prompt: prompt.map(str::to_string),
+        };
+        let now = 1_000_000u64;
+
+        // A pane re-entering the stall every five minutes yields ONE push an hour. Four of eight
+        // observed stall episodes were a single pane doing exactly this.
+        let mut sent: HashMap<String, u64> = HashMap::new();
+        let mut fired = 0;
+        for i in 0..12u64 {
+            let ts = now + i * 300; // every 5 minutes for an hour
+            if let Some(n) = push_candidate(&[agent(900, Some("Proceed? (y/N)"))], false, &sent, ts, &t) {
+                sent.insert(n.key.clone(), ts);
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 1, "a pane flapping every 5min must yield one push per hour, got {fired}");
+        println!("[selfcheck] push: a pane flapping every 5min yields one push per hour ... PASS");
+
+        // Presence beats everything: you are already looking at it.
+        assert!(push_candidate(&[agent(900, Some("Proceed? (y/N)"))], true, &HashMap::new(), now, &t).is_none());
+        println!("[selfcheck] push: a watched session never notifies ... PASS");
+
+        // Older than the ceiling is briefing material. Interrupting now arrives as an accusation.
+        assert!(push_candidate(&[agent(t.push_stale_secs + 60, Some("Proceed? (y/N)"))], false, &HashMap::new(), now, &t).is_none());
+        println!("[selfcheck] push: a stall older than an hour is briefing, not a push ... PASS");
+
+        // Younger than the floor is a flap that has not proved itself yet.
+        assert!(push_candidate(&[agent(t.push_min_stall_secs - 1, Some("Proceed? (y/N)"))], false, &HashMap::new(), now, &t).is_none());
+
+        // A wedged BUILD is not a person being waited on. This is the distinction `cmd` exists
+        // for, and without board-readership it could not be drawn at all.
+        let build = PaneFacts { cmd: Some("npm run build".into()), ..agent(900, None) };
+        assert!(push_candidate(&[build], false, &HashMap::new(), now, &t).is_none(),
+            "a stalled build must never notify — only a person being waited on earns an interrupt");
+        println!("[selfcheck] push: a wedged build is not a person being waited on ... PASS");
+
+        // The happy path, and the shape of what it says.
+        let n = push_candidate(&[agent(900, Some("Do you want to proceed? (y/N)"))], false, &HashMap::new(), now, &t)
+            .expect("a ten-minute agent stall with a prompt should notify");
+        assert_eq!(n.key, "mars-dev:terminal 2");
+        assert!(n.body.contains("proceed"), "the body carries the evidence, not a paraphrase");
+        assert!(n.stakes.is_some(), "a prompt on screen means the stakes ARE derivable");
+
+        // No prompt means we do not know what happens next — so we do not claim to.
+        let quiet = push_candidate(&[agent(900, None)], false, &HashMap::new(), now, &t)
+            .expect("a stalled agent still notifies");
+        assert!(quiet.stakes.is_none(), "an invented stake is worse than none");
+        println!("[selfcheck] push: stakes are derived from the pane or omitted ... PASS");
+
+        // Among several, the one that has waited longest has the best claim on the one interrupt.
+        let mut a = agent(700, Some("A?")); a.pane = "terminal 1".into();
+        let mut b = agent(1400, Some("B?")); b.pane = "terminal 3".into();
+        let pick = push_candidate(&[a, b], false, &HashMap::new(), now, &t).unwrap();
+        assert_eq!(pick.pane, "terminal 3", "oldest eligible stall wins the single interrupt");
+        println!("[selfcheck] push: one interrupt per tick, to the longest wait ... PASS");
+    }
+
         // The cost boundary that makes the above affordable: free enrichment for any reader,
         // model spend only under attention. An unwatched session fills its summaries from the
         // deterministic tier-0 triage and stops there — no provider is contacted.

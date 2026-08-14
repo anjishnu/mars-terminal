@@ -2855,6 +2855,128 @@ pub fn runner_ok(repo: &Path) -> Result<(), String> {
 }
 
 /// Why the agent is or is not about to run. Every gate, in one place, instead of five files.
+
+// ── PUSH: who has earned an interrupt ────────────────────────────────────────────────────────
+//
+// The gates, and nothing else. Pure by design: `--selfcheck` drives this with synthetic boards
+// exactly as it drives `emit`, so the rules that decide whether a phone buzzes at 02:00 are
+// tested without a network, a phone, or a key.
+//
+// The governing asymmetry: the cost of a false positive is not the interruption, it is the
+// PERMANENT loss of the channel. A muted app cannot be un-muted by a better algorithm. So every
+// gate here fails closed, and the whole thing ships deliberately under-noisy.
+
+/// A pane reduced to exactly what the gates need. Deliberately owned strings and no borrow of the
+/// board: the caller assembles this from whatever it has, and the rules cannot reach for anything
+/// they were not given.
+#[derive(Clone, Debug)]
+pub struct PaneFacts {
+    pub session: String,
+    pub pane: String,
+    pub verdict: String,
+    /// The FOREGROUND command. This is the field `board-readership` supplies, and without it
+    /// "your agent is waiting for you" cannot be told from "the build is wedged" — which is the
+    /// entire notification.
+    pub cmd: Option<String>,
+    pub stall_secs: u64,
+    /// What the pane is asking, if it is asking anything. Evidence, never invented.
+    pub prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notification {
+    /// `<session>:<pane>` — the cooldown identity, and what a tap deep-links to.
+    pub key: String,
+    pub session: String,
+    pub pane: String,
+    /// The DECISION, not the machine state.
+    pub title: String,
+    /// The evidence: what it actually said.
+    pub body: String,
+    /// What happens if you do nothing. The most calming content available, and omitted rather
+    /// than guessed — an invented stake is worse than none.
+    pub stakes: Option<String>,
+}
+
+/// The commands that mean a person is the bottleneck. A shell sitting at a prompt is idle; an
+/// agent sitting at a prompt is waiting for you, and only the second is worth a buzz.
+const INTERACTIVE_AGENTS: [&str; 5] = ["claude", "codex", "aider", "cursor-agent", "gemini"];
+
+fn is_agent(cmd: Option<&str>) -> bool {
+    cmd.map(|c| {
+        let base = c.rsplit('/').next().unwrap_or(c);
+        let word = base.split_whitespace().next().unwrap_or(base);
+        INTERACTIVE_AGENTS.contains(&word)
+    })
+    .unwrap_or(false)
+}
+
+/// N1 — *your agent is waiting on you*.
+///
+/// `watched` is presence: you are already looking, so there is nothing to tell you. `last_sent`
+/// is the per-pane cooldown, keyed on identity rather than content — the failure it exists for
+/// wrote different words every single time.
+///
+/// Returns at most ONE notification per call. Two phones buzzing about two panes in the same
+/// second is the shape of a system nobody trusts; the quieter one goes in the briefing.
+pub fn push_candidate(
+    panes: &[PaneFacts],
+    watched: bool,
+    last_sent: &std::collections::HashMap<String, u64>,
+    ts: u64,
+    t: &crate::tuning::Tuning,
+) -> Option<Notification> {
+    // Gate 4 — you are not already looking.
+    if watched {
+        return None;
+    }
+    let mut best: Option<(u64, Notification)> = None;
+    for p in panes {
+        // Gate 1 — someone is waiting on YOU. `blocked` was measured firing zero times across
+        // 108 snapshots, so a push gated on that verdict would deliver nothing at all; the real
+        // signal is a stall on a pane running an interactive agent.
+        if p.verdict != "stalled" || !is_agent(p.cmd.as_deref()) {
+            continue;
+        }
+        // Gate 2 — it has waited long enough to be real, not a flap.
+        if p.stall_secs < t.push_min_stall_secs {
+            continue;
+        }
+        // Gate 6 — and not so long that the moment has passed.
+        if p.stall_secs > t.push_stale_secs {
+            continue;
+        }
+        let key = format!("{}:{}", p.session, p.pane);
+        // Gate 5 — not already said. Identity, not content.
+        if let Some(prev) = last_sent.get(&key) {
+            if ts.saturating_sub(*prev) < t.push_cooldown_secs {
+                continue;
+            }
+        }
+        let prompt = p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let n = Notification {
+            key,
+            session: p.session.clone(),
+            pane: p.pane.clone(),
+            title: match prompt {
+                Some(_) => format!("{} needs an answer in {}", p.cmd.as_deref().unwrap_or("your agent"), p.pane),
+                None => format!("{} is waiting in {}", p.cmd.as_deref().unwrap_or("your agent"), p.pane),
+            },
+            body: prompt.unwrap_or("It has produced nothing for a while.").to_string(),
+            // Derived, not invented: a stalled agent at a prompt genuinely does keep waiting, and
+            // saying so is what converts an open loop into an informed choice to ignore it. With
+            // no prompt on screen we do not know what happens next, so we say nothing.
+            stakes: prompt.map(|_| "It will keep waiting — nothing expires.".to_string()),
+        };
+        // Oldest first among the eligible: the one that has been waiting longest has the best
+        // claim on the single interrupt this call is allowed to spend.
+        if best.as_ref().map(|(s, _)| p.stall_secs > *s).unwrap_or(true) {
+            best = Some((p.stall_secs, n));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 /// Strip everything that changes without the situation changing.
 ///
 /// The single most expensive bug in this system's history was a memo that rewrote itself 50,570

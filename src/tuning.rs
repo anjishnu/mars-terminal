@@ -68,6 +68,12 @@ pub struct Tuning {
     pub poll_interval_ms: u64,
     pub which_key_delay_ms: u64,
     pub nudge_threshold: u32,
+    /// How long a pane must have been stalled before it may interrupt a person.
+    pub push_min_stall_secs: u64,
+    /// Past this, the moment has passed: it becomes briefing material rather than a buzz.
+    pub push_stale_secs: u64,
+    /// One notification per pane per this long, regardless of what the text says.
+    pub push_cooldown_secs: u64,
     pub max_panes: usize,
     pub scroll_margin: usize,
     pub page_overlap: usize,
@@ -199,6 +205,9 @@ impl Default for Tuning {
             poll_interval_ms: 16,
             which_key_delay_ms: 200,
             nudge_threshold: 3,
+            push_min_stall_secs: 600,
+            push_stale_secs: 3600,
+            push_cooldown_secs: 3600,
             max_panes: 4,
             scroll_margin: 3,
             page_overlap: 2,
@@ -332,6 +341,21 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
         ("nudge_threshold", knob(json!(d.nudge_threshold),
             "How many times an action is run from the command bar before the \
              '💡 next time: <key>' graduation hint appears in the status line.")),
+        ("push_min_stall_secs", knob(json!(d.push_min_stall_secs),
+            "How long a pane must sit stalled before it may interrupt you. Half of all observed \
+             stall episodes were one pane flapping at ~5-minute intervals; a floor removes them \
+             and loses nothing."
+        )),
+        ("push_stale_secs", knob(json!(d.push_stale_secs),
+            "Past this age a stall stops being a notification and becomes briefing material. If \
+             we did not tell you within the hour we have forfeited the right to interrupt, and \
+             pushing then arrives as an accusation."
+        )),
+        ("push_cooldown_secs", knob(json!(d.push_cooldown_secs),
+            "One notification per pane per this long, REGARDLESS of whether the text changed. \
+             This is the gate that would have stopped a memo that rewrote itself 50,570 times \
+             with different words every time."
+        )),
         ("max_panes", knob(json!(d.max_panes),
             "Maximum panes per tab. Splits beyond this are refused.")),
         ("scroll_margin", knob(json!(d.scroll_margin),
@@ -644,6 +668,9 @@ pub fn load() -> Tuning {
         t.poll_interval_ms      = get_u64(&map, "poll_interval_ms", t.poll_interval_ms).max(1);
         t.which_key_delay_ms    = get_u64(&map, "which_key_delay_ms", t.which_key_delay_ms);
         t.nudge_threshold       = get_u64(&map, "nudge_threshold", t.nudge_threshold as u64) as u32;
+        t.push_min_stall_secs   = get_u64(&map, "push_min_stall_secs", t.push_min_stall_secs);
+        t.push_stale_secs       = get_u64(&map, "push_stale_secs", t.push_stale_secs);
+        t.push_cooldown_secs    = get_u64(&map, "push_cooldown_secs", t.push_cooldown_secs);
         t.max_panes             = get_u64(&map, "max_panes", t.max_panes as u64) as usize;
         t.scroll_margin         = get_u64(&map, "scroll_margin", t.scroll_margin as u64) as usize;
         t.page_overlap          = get_u64(&map, "page_overlap", t.page_overlap as u64) as usize;
