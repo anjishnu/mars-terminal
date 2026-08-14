@@ -2855,6 +2855,220 @@ pub fn runner_ok(repo: &Path) -> Result<(), String> {
 }
 
 /// Why the agent is or is not about to run. Every gate, in one place, instead of five files.
+/// Strip everything that changes without the situation changing.
+///
+/// The single most expensive bug in this system's history was a memo that rewrote itself 50,570
+/// times in seven days — and every rewrite had genuinely different text, so a content hash
+/// admitted all of them. What varied was an elapsed-time phrase, a count and a path. What did not
+/// vary was the situation: one pane, failed, for a week.
+///
+/// So novelty has to be measured on what remains after the moving parts are removed. Shared with
+/// Package E's `why` comparison deliberately — two callers asking "is this actually different"
+/// must not answer it two different ways.
+pub fn normalize_for_novelty(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            // Any run of digits — and the unit stuck to it — becomes one token. "14m32s", "3 files"
+            // and "1h19m" are the same shape of fact each time they are written.
+            while chars.peek().is_some_and(|n| n.is_ascii_digit()) {
+                chars.next();
+            }
+            while chars.peek().is_some_and(|n| matches!(n, 's' | 'm' | 'h' | 'd' | '%')) {
+                chars.next();
+            }
+            out.push('#');
+            continue;
+        }
+        if c == '/' {
+            // A path is an identity, not a change. Collapse to its last component.
+            let mut seg = String::new();
+            while chars.peek().is_some_and(|n| !n.is_whitespace()) {
+                seg.push(chars.next().unwrap());
+            }
+            out.push_str(seg.rsplit('/').next().unwrap_or(""));
+            continue;
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Token overlap, 0.0–1.0. Used for board repetition, which `AGENTS.md` names as the single most
+/// common failure — a memo whose body restates its own headline.
+fn jaccard(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let ta: HashSet<&str> = a.split_whitespace().collect();
+    let tb: HashSet<&str> = b.split_whitespace().collect();
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    ta.intersection(&tb).count() as f64 / ta.union(&tb).count() as f64
+}
+
+/// The same artifact, named two ways.
+///
+/// The archive files a memo under its bare title; the phone reports having seen `card-<title>-<ts>`
+/// or `memo-<title>`. Joining them raw counts a memo that WAS read as never read, which turns the
+/// most important guardrail here — written versus seen — into a number that always accuses. The
+/// prefixes and the minted timestamp are packaging, not identity.
+fn join_key(s: &str) -> String {
+    let mut t = s.trim().to_ascii_lowercase();
+    for p in ["card-", "memo-", "item-"] {
+        if let Some(rest) = t.strip_prefix(p) {
+            t = rest.to_string();
+            break;
+        }
+    }
+    // A trailing unix timestamp is when this card was minted, not which memo it is.
+    if let Some((head, tail)) = t.rsplit_once('-') {
+        if tail.len() >= 9 && tail.chars().all(|c| c.is_ascii_digit()) {
+            t = head.to_string();
+        }
+    }
+    t
+}
+
+/// One artifact target's write history, for the guardrails.
+#[derive(Default)]
+struct TargetStats {
+    writes: usize,
+    versions: std::collections::HashSet<String>,
+    novel: usize,
+    last_norm: Option<String>,
+    repetition: Vec<f64>,
+    first_ts: u64,
+    last_ts: u64,
+}
+
+/// TIER-0 GUARDRAILS — deterministic, free, no model and no human.
+///
+/// Every number here is computed from files the system already writes. The point is that a
+/// week-long silent failure becomes a line somebody reads: the 50,570-write memo was visible in
+/// this data from its first hour, and nothing was looking.
+pub fn health_report(ts: u64) -> Result<String> {
+    let Some(repo) = repo_dir() else { anyhow::bail!("no manager repo") };
+    let mut out = String::new();
+    out.push_str("manager health — tier-0 guardrails\n\n");
+
+    // What was WRITTEN: every archived artifact version, last 24h.
+    let mut targets: std::collections::HashMap<String, TargetStats> = std::collections::HashMap::new();
+    let cutoff = ts.saturating_sub(24 * 3600);
+    let arch = repo.join("archive");
+    if let Ok(rd) = std::fs::read_dir(&arch) {
+        for e in rd.flatten() {
+            let Ok(body) = std::fs::read_to_string(e.path()) else { continue };
+            for line in body.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                let at = v["at_ts"].as_u64().unwrap_or(0);
+                if at < cutoff {
+                    continue;
+                }
+                let Some(title) = v["title"].as_str().or_else(|| v["kind"].as_str()) else { continue };
+                let text = v["text"].as_str().unwrap_or("");
+                let st = targets.entry(join_key(title)).or_default();
+                st.writes += 1;
+                if let Some(ver) = v["version"].as_str() {
+                    st.versions.insert(ver.to_string());
+                }
+                let norm = normalize_for_novelty(text);
+                if st.last_norm.as_deref() != Some(norm.as_str()) {
+                    st.novel += 1;
+                }
+                st.last_norm = Some(norm);
+                // The headline against the body it introduces — a memo restating its own board row.
+                let (head, body_rest) = text.split_once('\n').unwrap_or((text, ""));
+                if !body_rest.trim().is_empty() {
+                    st.repetition.push(jaccard(
+                        &normalize_for_novelty(head),
+                        &normalize_for_novelty(body_rest),
+                    ));
+                }
+                if st.first_ts == 0 || at < st.first_ts {
+                    st.first_ts = at;
+                }
+                st.last_ts = st.last_ts.max(at);
+            }
+        }
+    }
+
+    // What was SEEN: distinct versions of each target that reached a human.
+    let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    if let Ok(body) = std::fs::read_to_string(repo.join("events.jsonl")) {
+        for line in body.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if v["kind"].as_str() != Some("seen") {
+                continue;
+            }
+            let Some(t) = v["target"].as_str() else { continue };
+            seen.entry(join_key(t))
+                .or_default()
+                .insert(v["version"].as_str().unwrap_or("").to_string());
+        }
+    }
+
+    if targets.is_empty() {
+        out.push_str("  no artifacts written in the last 24h — nothing to judge\n");
+        return Ok(out);
+    }
+
+    let mut rows: Vec<(&String, &TargetStats)> = targets.iter().collect();
+    rows.sort_by_key(|(_, st)| std::cmp::Reverse(st.writes));
+
+    out.push_str("  target                       writes  seen  amp   novelty  repeat  unread\n");
+    let mut defects: Vec<String> = Vec::new();
+    for (title, st) in rows.iter().take(12) {
+        let nseen = seen.get(*title).map(|s| s.len()).unwrap_or(0);
+        // Written versus read. Rewriting what nobody has read is waste by definition, and this is
+        // the ratio that would have caught the 50,570 on day one.
+        let amp = if nseen == 0 { st.writes as f64 } else { st.writes as f64 / nseen as f64 };
+        let novelty = st.novel as f64 / st.writes.max(1) as f64;
+        let repeat = if st.repetition.is_empty() {
+            0.0
+        } else {
+            st.repetition.iter().sum::<f64>() / st.repetition.len() as f64
+        };
+        let unread = if nseen == 0 && st.last_ts > 0 { coarse_age(ts.saturating_sub(st.first_ts)) } else { "—".into() };
+        out.push_str(&format!(
+            "  {:<28} {:>6} {:>5} {:>5.0} {:>8.0}% {:>6.2} {:>7}\n",
+            title.chars().take(28).collect::<String>(),
+            st.writes, nseen, amp, novelty * 100.0, repeat, unread
+        ));
+        if amp > 100.0 {
+            defects.push(format!("{title}: {amp:.0}:1 write amplification — a defect, full stop"));
+        }
+        if st.writes >= 10 && novelty < 0.20 {
+            defects.push(format!("{title}: {:.0}% novelty — churning, not changing", novelty * 100.0));
+        }
+        if repeat > 0.5 {
+            defects.push(format!("{title}: body restates its own headline ({repeat:.2} overlap)"));
+        }
+        if nseen == 0 && st.writes >= 10 {
+            defects.push(format!("{title}: rewritten {} times, never once seen", st.writes));
+        }
+    }
+
+    // Briefing staleness — both halves already exist on disk.
+    if let Ok(m) = std::fs::metadata(repo.join("mission_briefing.md")) {
+        if let Some(age) = m.modified().ok().and_then(|t| t.elapsed().ok()) {
+            out.push_str(&format!("\n  briefing written {} ago\n", coarse_age(age.as_secs())));
+        }
+    }
+
+    out.push('\n');
+    if defects.is_empty() {
+        out.push_str("  no tier-0 defects\n");
+    } else {
+        out.push_str("  DEFECTS\n");
+        for d in defects {
+            out.push_str(&format!("    ✗ {d}\n"));
+        }
+    }
+    Ok(out)
+}
+
 pub fn status_report(ts: u64) -> Result<String> {
     let Some(repo) = repo_dir() else { anyhow::bail!("no manager repo") };
     let live = live_session_names();

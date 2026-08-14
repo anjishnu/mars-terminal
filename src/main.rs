@@ -297,6 +297,10 @@ fn main() -> Result<()> {
                 "run" => println!("{}", manager::run_once(ts, flags.iter().any(|f| f == "--force"))?),
                 "snapshot" => println!("snapshotted {} live session(s)", manager::force_snapshot(ts)?),
                 "status" => print!("{}", manager::status_report(ts)?),
+                // Tier-0 guardrails. Deliberately beside `status`, which is already the one place
+                // that explains why the agent is or is not running — this answers the next
+                // question, which is whether what it produces is worth anything.
+                "health" => print!("{}", manager::health_report(ts)?),
                 other => anyhow::bail!("unknown: mars manager {other} (status | run [--force] | snapshot)"),
             }
             return Ok(());
