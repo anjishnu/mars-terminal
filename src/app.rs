@@ -1271,6 +1271,62 @@ impl App {
                         };
                     }
                 }
+                // ── PROVENANCE: every absence on this row says why it is absent ──────────────
+                //
+                // A missing field and a field nobody computed look identical to a consumer, and
+                // that single ambiguity is the shape of four separate bugs this system has had:
+                // `cmd: null` meant both "nothing is running" and "nobody looked"; a missing note
+                // meant both "nothing worth saying" and "deliberately skipped"; an unchanged tail
+                // meant both "genuinely quiet" and "we hashed the wrong input".
+                //
+                // Judgements only — not every field. `by` is deterministic | agent | none, and
+                // `none` must carry a `why`. This is the mechanical form of the sentence this
+                // codebase already wrote about its own run receipts: a skip with a reason is a
+                // clean outcome and silence is not.
+                {
+                    let is_terminal = matches!(
+                        self.panes.get(&s.pane_id).map(|p| &p.content),
+                        Some(PaneContent::Terminal(_))
+                    );
+                    let cmd_prov = if !is_terminal {
+                        serde_json::json!({ "by": "none", "why": "not a terminal" })
+                    } else if row.get("cmd").is_some() {
+                        serde_json::json!({ "by": "deterministic", "from": "foreground pid" })
+                    } else {
+                        // The pane is a terminal and nothing is running in the foreground — a real
+                        // fact, not a gap, and the row should say which it is.
+                        serde_json::json!({ "by": "none", "why": "no foreground command" })
+                    };
+                    let chat_prov = if !is_terminal {
+                        serde_json::json!({ "by": "none", "why": "not a terminal" })
+                    } else if row.get("chat").is_some() {
+                        serde_json::json!({ "by": "deterministic", "from": "claude session id" })
+                    } else {
+                        serde_json::json!({ "by": "none", "why": "no conversation bound to this pane" })
+                    };
+                    let summary_prov = match row.get("summary") {
+                        None => serde_json::json!({ "by": "none", "why": "not mapped yet" }),
+                        Some(v) if v.get("fallback").and_then(|b| b.as_bool()).unwrap_or(false) => {
+                            match v.get("staleReason").and_then(|x| x.as_str()) {
+                                Some(err) => serde_json::json!({ "by": "deterministic", "from": "tier-0", "why": err }),
+                                None => serde_json::json!({ "by": "deterministic", "from": "tier-0" }),
+                            }
+                        }
+                        Some(v) => serde_json::json!({
+                            "by": "agent",
+                            "from": v.get("computedBy").and_then(|x| x.as_str()).unwrap_or("model"),
+                        }),
+                    };
+                    row["provenance"] = serde_json::json!({
+                        "cmd": cmd_prov,
+                        "chat": chat_prov,
+                        "summary": summary_prov,
+                        // What was actually hashed to decide this pane had or had not moved. Named
+                        // so a wrong choice of input is visible in the artifact rather than
+                        // inferred months later from a board nobody could explain.
+                        "tail": { "by": "deterministic", "from": "screen:full" },
+                    });
+                }
                 Some(row)
             })
             .collect();

@@ -7858,8 +7858,20 @@ fn selfcheck() -> Result<()> {
         };
 
         let board = app.mobile_board_json();
-        assert!(!board.contains("\"cmd\""),
-            "an unsampled pane already claimed a running command: {board}");
+        // Read the FIELD, not the substring. This searched the whole document for `"cmd"` and so
+        // began failing the moment rows gained a `provenance.cmd` — a test breaking for a reason
+        // that has nothing to do with what it was checking. The claim is about this row's value.
+        {
+            let v: serde_json::Value = serde_json::from_str(&board)?;
+            let row = v["rows"].as_array().and_then(|r| r.first()).cloned().unwrap_or_default();
+            assert!(row["cmd"].is_null(),
+                "an unsampled pane already claimed a running command: {board}");
+            // ...and it says so, rather than leaving the absence to be guessed at.
+            assert_eq!(row["provenance"]["cmd"]["by"].as_str(), Some("none"),
+                "an unsampled pane must report cmd as none: {board}");
+            assert!(row["provenance"]["cmd"]["why"].as_str().is_some(),
+                "...and must say why: {board}");
+        }
 
         app.fg_commands.insert(tid, "claude".into());
         let board = app.mobile_board_json();
@@ -7868,12 +7880,44 @@ fn selfcheck() -> Result<()> {
         assert_eq!(row["cmd"].as_str(), Some("claude"),
             "the board dropped the pane's foreground command: {board}");
 
+        // EVERY judgement on the row says how it was reached. The rule that makes this worth
+        // having is the one about `none`: an absence without a reason is the thing that made four
+        // separate bugs invisible, so a row may omit a value but may not omit why.
+        let prov = &row["provenance"];
+        assert!(prov.is_object(), "a board row carries no provenance: {board}");
+        for field in ["cmd", "chat", "summary", "tail"] {
+            let p = &prov[field];
+            let by = p["by"].as_str().unwrap_or("");
+            assert!(
+                matches!(by, "deterministic" | "agent" | "none"),
+                "provenance.{field}.by is not one of deterministic|agent|none: {p}"
+            );
+            if by == "none" {
+                assert!(
+                    p["why"].as_str().map(|w| !w.trim().is_empty()).unwrap_or(false),
+                    "provenance.{field} says `none` without saying why — that is the bug this \
+                     field exists to prevent: {p}"
+                );
+            } else {
+                assert!(
+                    p["from"].as_str().map(|f| !f.trim().is_empty()).unwrap_or(false),
+                    "provenance.{field} claims to be computed but does not name its input: {p}"
+                );
+            }
+        }
+        assert_eq!(prov["cmd"]["by"].as_str(), Some("deterministic"),
+            "a pane with a running foreground command must report cmd as computed: {board}");
+        println!("[selfcheck] board: every judgement says how it was reached ... PASS");
+
         // Quiet again → the label goes. A row still saying `claude` after the agent exited is a
         // worse answer than a row that says nothing.
         app.fg_commands.remove(&tid);
         let board = app.mobile_board_json();
-        assert!(!board.contains("\"cmd\""),
-            "the command label outlived the command: {board}");
+        {
+            let v: serde_json::Value = serde_json::from_str(&board)?;
+            let row = v["rows"].as_array().and_then(|r| r.first()).cloned().unwrap_or_default();
+            assert!(row["cmd"].is_null(), "the command label outlived the command: {board}");
+        }
 
         // Nobody reading AT ALL → nothing sampled. The label costs a `ps` per pane, and a
         // standalone editor with no phone and no manager behind it must not pay for one.
