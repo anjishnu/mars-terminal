@@ -526,7 +526,10 @@ fn main() -> Result<()> {
                     }
                     println!("state: {}\n", briefs::state_of(&dir).label());
                     println!("Assigning types exactly this into the pane:\n");
-                    println!("  {msg}");
+                    for line in msg.lines() {
+                        println!("  {line}");
+                    }
+                    println!();
                     println!(
                         "That is the whole message. Every rule a worker follows lives in\n\
                          WORKING-MODEL.md, versioned, so the instruction stays two addresses and is\n\
@@ -8276,8 +8279,17 @@ fn selfcheck() -> Result<()> {
         assert_eq!(msg, briefs::assignment("brief-1-x", home).unwrap(), "same bytes every time");
         assert!(msg.contains("/home/x/.mars/briefs/WORKING-MODEL.md"), "the working model: {msg}");
         assert!(msg.contains("/home/x/.mars/briefs/brief-1-x/brief.md"), "the brief: {msg}");
-        assert!(msg.lines().count() == 1 && msg.len() < 200,
-            "an assignment is two addresses, not a thousand-line prompt ({} bytes)", msg.len());
+        assert!(msg.starts_with("First read ") && msg.trim_end().ends_with("Start building."),
+            "first, then, go — an agent handed paths with no imperative asks what to do next");
+        assert!(msg.lines().count() == 3 && msg.len() < 320,
+            "an assignment is two addresses and a go, not a thousand-line prompt ({} bytes)", msg.len());
+        // The guard against the paragraph growing back. Every rule a worker follows belongs in
+        // WORKING-MODEL.md, where it is versioned; a rule that leaks into the typed message is a
+        // rule with one home, rewritten by whoever next edits the composer, invisible to whoever
+        // approved the work. That is the file this whole mechanism exists to avoid recreating.
+        for rule in ["BINDING", "DONE:", "disallowedTools", "acceptEdits", "blocked", "branch"] {
+            assert!(!msg.contains(rule), "{rule:?} is a RULE — it belongs in WORKING-MODEL.md, not the message");
+        }
         assert!(briefs::assignment("../../etc/passwd", home).is_none());
 
         // THE TOOL SCOPE. Derived from the argv of the process actually running — not a marker,

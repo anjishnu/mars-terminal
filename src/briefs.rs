@@ -213,8 +213,14 @@ pub fn assignment(id: &str, home: &Path) -> Option<String> {
         return None;
     }
     let briefs = home.join(".mars").join("briefs");
+    // First, then, go. An agent handed two paths and no imperative reads them and asks what you
+    // would like it to do — a wasted round trip, and on a phone a wasted round trip is a round
+    // trip you may not be there for. The old flow closed this with "start the work immediately";
+    // dropping it while shortening the message would have been a quiet regression.
     Some(format!(
-        "Read {} — that is how we work here. Then read {} — that is what to build.\n",
+        "First read {} — that is how we work here.\n\
+         Then read {} — that is what to build.\n\
+         Start building.\n",
         briefs.join("WORKING-MODEL.md").display(),
         briefs.join(id).join("brief.md").display(),
     ))
