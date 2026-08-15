@@ -212,6 +212,22 @@ fn apply_config_from(path: &std::path::Path) {
     }
 }
 
+/// Every verb the CLI actually dispatches.
+///
+/// Kept beside the dispatcher because it is checked against the AGENT'S OWN INSTRUCTIONS: the
+/// manager docs tell the agent which commands exist, and a doc naming a command that does not is
+/// worse than a missing feature — it sends the agent to run something that fails, then to reason
+/// from the failure. `docs/tools.md` documented five such commands, and instructed the agent to
+/// cite line ids from one of them.
+///
+/// Add a verb here when you add it to the match below. The selfcheck fails if a doc names a verb
+/// that is not in this list.
+pub const CLI_VERBS: &[&str] = &[
+    "attach", "ask", "briefing", "config", "help", "keys", "kill", "list", "ls", "manager",
+    "new", "pair", "probe", "qr", "reboot", "rename", "reset", "resume", "serve", "session",
+    "setup", "snapshot", "ssh", "theme", "upgrade", "version", "workspace",
+];
+
 fn main() -> Result<()> {
     // A previously killed client may have left this TTY in raw mode — repair
     // it before printing anything (and before crossterm snapshots "original").
@@ -8098,6 +8114,65 @@ fn selfcheck() -> Result<()> {
 
         let _ = std::fs::remove_dir_all(&root);
         println!("[selfcheck] health: the deterministic floor never counts as coverage ... PASS");
+    }
+
+    // ── THE AGENT'S INSTRUCTIONS MUST DESCRIBE A REAL MACHINE ────────────────────────────────
+    //
+    // `docs/tools.md` documented five commands — `mars panes`, `lines`, `grep`, `ledger`,
+    // `events` — none of which exist, and told the agent to cite line ids from one of them. That
+    // is not a stale doc. It is an instruction to run something that fails and then reason from
+    // the failure, given to the one reader that cannot check.
+    //
+    // The same defect appears twice in this codebase, in the two files where it matters most:
+    // this one misleads the agent, and `policy.md` grants autonomy that nothing parses, which
+    // misleads the human about what protects them.
+    {
+        let docs: &[(&str, &str)] = &[
+            ("AGENTS.md", include_str!("manager_docs/AGENTS.md")),
+            ("prompt.md", include_str!("manager_docs/prompt.md")),
+            ("docs/tools.md", include_str!("manager_docs/tools.md")),
+            ("docs/memos.md", include_str!("manager_docs/memos.md")),
+            ("docs/workspaces.md", include_str!("manager_docs/workspaces.md")),
+            ("docs/briefing.md", include_str!("manager_docs/briefing.md")),
+            ("docs/receipts.md", include_str!("manager_docs/receipts.md")),
+            ("docs/memory.md", include_str!("manager_docs/memory.md")),
+            ("docs/layout.md", include_str!("manager_docs/layout.md")),
+        ];
+        let mut phantom: Vec<String> = Vec::new();
+        for (name, body) in docs {
+            for line in body.lines() {
+                // `mars <verb>` wherever it appears — prose or fenced block. A doc that mentions a
+                // command at all is telling the agent it exists.
+                let mut rest: &str = line;
+                while let Some(i) = rest.find("mars ") {
+                    rest = &rest[i + 5..];
+                    let verb: String = rest
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                        .collect();
+                    if verb.len() < 2 || CLI_VERBS.contains(&verb.as_str()) {
+                        continue;
+                    }
+                    // Prose like "mars was" or "mars is" is not a command claim.
+                    if matches!(verb.as_str(), "was" | "is" | "and" | "the" | "already" | "does"
+                        | "will" | "can" | "has" | "run" | "runs" | "reads" | "writes" | "keeps"
+                        | "terminal" | "session" | "sessions" | "itself" | "on" | "in" | "to") {
+                        continue;
+                    }
+                    phantom.push(format!("{name}: `mars {verb}`"));
+                }
+            }
+        }
+        phantom.sort();
+        phantom.dedup();
+        assert!(
+            phantom.is_empty(),
+            "the manager docs name {} command(s) the CLI does not dispatch — the agent is being \
+             told to run things that do not exist:\n  {}",
+            phantom.len(),
+            phantom.join("\n  ")
+        );
+        println!("[selfcheck] docs: every command the agent is told about exists ... PASS");
     }
 
         // The cost boundary that makes the above affordable: free enrichment for any reader,
