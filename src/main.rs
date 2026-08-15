@@ -8066,6 +8066,40 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] board: a pane that actually moved is news ... PASS");
     }
 
+    // ── THE FLOOR MUST NOT PASS FOR SPEECH ───────────────────────────────────────────────────
+    //
+    // The failure this guards ran for fifteen days: the agent wrote nothing, `.computed.md` was
+    // rewritten every tick, every surface looked populated, and coverage was zero. Nothing noticed
+    // because nothing distinguished a description somebody wrote from a placeholder standing where
+    // one should have been.
+    {
+        let root = std::env::temp_dir().join(format!("mars-sc-cov-{}", std::process::id()));
+        let ws = root.join("s1").join("workspaces");
+        std::fs::create_dir_all(&ws)?;
+
+        // A pane carrying ONLY the deterministic floor is not described.
+        std::fs::write(ws.join("0.computed.md"), "2 running · 1 idle\n")?;
+        let (described, live, _) = crate::manager::coverage_of(&root);
+        assert_eq!((described, live), (0, 0),
+            "a `.computed.md` alone must count as neither described nor a live description");
+
+        // The agent's own note is.
+        std::fs::write(ws.join("0.md"), "terminal 1 is mid-refactor on the parser\n")?;
+        let (described, live, oldest) = crate::manager::coverage_of(&root);
+        assert_eq!((described, live), (1, 1), "a fresh agent note is coverage");
+        assert!(oldest.unwrap_or(u64::MAX) < 60, "a note just written cannot be hours old");
+
+        // A second pane with only a floor drags coverage down rather than being ignored — the
+        // denominator is what makes 0/13 legible as a defect instead of an empty report.
+        std::fs::write(ws.join("1.computed.md"), "idle\n")?;
+        let (described, live, _) = crate::manager::coverage_of(&root);
+        assert_eq!((described, live), (1, 1),
+            "the floor is not counted in either half — it is not a pane's description");
+
+        let _ = std::fs::remove_dir_all(&root);
+        println!("[selfcheck] health: the deterministic floor never counts as coverage ... PASS");
+    }
+
         // The cost boundary that makes the above affordable: free enrichment for any reader,
         // model spend only under attention. An unwatched session fills its summaries from the
         // deterministic tier-0 triage and stops there — no provider is contacted.

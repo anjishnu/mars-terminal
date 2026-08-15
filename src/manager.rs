@@ -3098,6 +3098,43 @@ struct TargetStats {
     last_ts: u64,
 }
 
+/// How many live panes have a description somebody could read, and how stale the worst one is.
+///
+/// Pure over a directory so the rule can be tested rather than trusted — and the rule is the whole
+/// point. A pane can hold both `<n>.md` (written by the agent) and `<n>.computed.md` (the
+/// deterministic floor). **Only the first counts.** The floor exists so that silence is
+/// survivable, not so that it can pass for speech, and conflating them is exactly how this system
+/// went fifteen days with nothing readable while every surface looked populated.
+///
+/// "Described" also means described RECENTLY. A note from yesterday about a pane that has moved
+/// since is not coverage, it is a stale claim wearing coverage's face.
+pub fn coverage_of(sessions_root: &Path) -> (usize, usize, Option<u64>) {
+    let (mut described, mut live, mut oldest) = (0usize, 0usize, None::<u64>);
+    let Ok(rd) = std::fs::read_dir(sessions_root) else { return (0, 0, None) };
+    for sess in rd.flatten() {
+        let Ok(panes) = std::fs::read_dir(sess.path().join("workspaces")) else { continue };
+        for f in panes.flatten() {
+            let name = f.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".md") || name.ends_with(".computed.md") {
+                continue;
+            }
+            live += 1;
+            let age = f
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(u64::MAX);
+            if age < 2 * 3600 {
+                described += 1;
+            }
+            oldest = Some(oldest.map_or(age, |o: u64| o.max(age)));
+        }
+    }
+    (described, live, oldest)
+}
+
 /// TIER-0 GUARDRAILS — deterministic, free, no model and no human.
 ///
 /// Every number here is computed from files the system already writes. The point is that a
@@ -3218,40 +3255,10 @@ pub fn health_report(ts: u64) -> Result<String> {
     // for weeks.
     {
         let sessions_root = crate::sys::paths::home_dir().map(|h| h.join(".mars").join("sessions"));
-        let mut live = 0usize;
-        let mut described = 0usize;
-        let mut oldest: Option<u64> = None;
-        if let Some(root) = sessions_root {
-            if let Ok(rd) = std::fs::read_dir(&root) {
-                for sess in rd.flatten() {
-                    let ws = sess.path().join("workspaces");
-                    let Ok(panes) = std::fs::read_dir(&ws) else { continue };
-                    // One pane can have both `<n>.md` (the agent's) and `<n>.computed.md` (the
-                    // deterministic floor). Only the first counts as described: the floor exists
-                    // precisely so that silence is survivable, not so that it can pass for speech.
-                    for f in panes.flatten() {
-                        let name = f.file_name().to_string_lossy().to_string();
-                        if !name.ends_with(".md") || name.ends_with(".computed.md") {
-                            continue;
-                        }
-                        live += 1;
-                        let age = f
-                            .metadata()
-                            .ok()
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| t.elapsed().ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(u64::MAX);
-                        // "Described" means described RECENTLY. A note from yesterday about a pane
-                        // that has moved since is not coverage, it is a stale claim.
-                        if age < 2 * 3600 {
-                            described += 1;
-                        }
-                        oldest = Some(oldest.map_or(age, |o: u64| o.max(age)));
-                    }
-                }
-            }
-        }
+        let (described, live, oldest) = sessions_root
+            .as_deref()
+            .map(coverage_of)
+            .unwrap_or((0, 0, None));
         if live > 0 {
             out.push_str(&format!(
                 "\n  coverage          {described}/{live} panes described in the last 2h\n"
