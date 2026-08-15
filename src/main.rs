@@ -511,6 +511,28 @@ fn main() -> Result<()> {
                     let _ = briefs::scaffold();
                     println!("{}", path.display());
                 }
+                // WHAT WOULD THIS WORKER BE TOLD? The design's own answer to "the prompt is
+                // inspectable" — and until this existed the honest answer was that you would have
+                // to read the source. Printed before assigning, not reconstructed after.
+                "show" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(home) = sys::paths::home_dir() else { anyhow::bail!("no home directory") };
+                    let Some(msg) = briefs::assignment(&id, &home) else {
+                        anyhow::bail!("usage: mars brief show <brief-id>")
+                    };
+                    let dir = home.join(".mars").join("briefs").join(&id);
+                    if !dir.join("brief.md").exists() {
+                        anyhow::bail!("no brief at {}", dir.display());
+                    }
+                    println!("state: {}\n", briefs::state_of(&dir).label());
+                    println!("Assigning types exactly this into the pane:\n");
+                    println!("  {msg}");
+                    println!(
+                        "That is the whole message. Every rule a worker follows lives in\n\
+                         WORKING-MODEL.md, versioned, so the instruction stays two addresses and is\n\
+                         the same bytes for every worker."
+                    );
+                }
                 "worker" => {
                     println!(
                         "Run this in the pane you want to work in, then assign a brief to it:\n\n  {}",
@@ -521,7 +543,7 @@ fn main() -> Result<()> {
                          scope — read from the process itself, not from a marker."
                     );
                 }
-                other => anyhow::bail!("unknown: mars brief {other}   (try: ls | new | worker)"),
+                other => anyhow::bail!("unknown: mars brief {other}   (try: ls | new | show | worker)"),
             }
             return Ok(());
         }
