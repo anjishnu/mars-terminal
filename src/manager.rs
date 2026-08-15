@@ -1965,6 +1965,11 @@ pub fn scaffold_docs_pub(repo: &Path) -> Result<()> {
 /// The comprehensive guide any coding agent reads on entry. A hub in `AGENTS.md` with spokes in
 /// `docs/`, so the cached prefix stays small and detail is loaded only when it is needed.
 fn scaffold_docs(repo: &Path) -> Result<()> {
+    // The worker's standing orders ride along with the manager's. They live under `~/.mars/briefs`
+    // rather than in this repo — a worker is not the manager and reads none of its docs — but they
+    // want the same guarantee: seeded on start, repaired when a newer version ships, and never
+    // silently absent. Best-effort: a machine with no home directory still gets a manager.
+    let _ = crate::briefs::scaffold();
     seed(&repo.join("AGENTS.md"), include_str!("manager_docs/AGENTS.md"))?;
     // Claude Code auto-loads CLAUDE.md, not AGENTS.md — so without this the agent spends its
     // first calls hunting for its own standing orders. Measured across 863 runs: 259

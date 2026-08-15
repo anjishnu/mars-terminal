@@ -68,6 +68,14 @@ pub enum ClientFrame {
     /// pushing structured `Board`/`Briefing` frames on the tick cadence. A phone
     /// glancing must not kick the person at the keyboard.
     Subscribe,
+    /// Hand a brief to the agent already running in a pane.
+    ///
+    /// A distinct frame from `PaneInput` because it is the one input that must be REFUSED under a
+    /// condition only the daemon can evaluate: whether the process in that pane was started with
+    /// the worker tool scope. The bridge cannot check it — it has no pid — and a bridge that
+    /// checked a board field and then typed would leave a gap between the two in which the pane
+    /// could change. Check and act belong in the same place.
+    AssignBrief { pane: usize, brief: String },
     /// Pane-targeted raw input from a Rover subscriber (answering a `[y/N]`) — written
     /// straight to that pane's terminal, WITHOUT taking over the session.
     PaneInput { pane: usize, data: String },
@@ -589,6 +597,8 @@ enum SrvEvent {
     Rename(String),
     /// A nested `mars <file>` — open it as a new tab here.
     OpenFile(String),
+    /// Hand a brief to the agent in a pane — refused unless that agent carries the worker scope.
+    AssignBrief { pane: usize, brief: String },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
     Subscribe { stream: crate::sys::control::Stream },
@@ -944,6 +954,19 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             Ok(SrvEvent::PaneInput { pane, data }) => {
                 // The phone answered a prompt — write it to that pane's terminal.
                 app.write_to_pane(pane, &data);
+            }
+            Ok(SrvEvent::AssignBrief { pane, brief }) => {
+                // THE ONE PLACE THIS CAN BE REFUSED, AND IT FAILS CLOSED.
+                //
+                // The worker deny-list used to ride on the spawn command. Assignment now targets a
+                // pane that already holds an agent, so there is no spawn left to carry it — and an
+                // absent deny-list is invisible rather than loud. So the scope is read off the argv
+                // of the process actually running, here, in the only process that has its pid, and
+                // a pane that was not started as a worker is told why rather than handed a brief.
+                match app.assign_brief_to_pane(pane, &brief) {
+                    Ok(()) => {}
+                    Err(why) => app.write_to_pane(pane, &format!("\r# mars: {why}\r")),
+                }
             }
             Ok(SrvEvent::WatchPane { pane, cols, rows, raw }) => {
                 let raw = raw && pane.is_some();
@@ -1377,6 +1400,11 @@ fn client_connection(
                 match serde_json::from_str::<ClientFrame>(line.trim()) {
                     Ok(ClientFrame::PaneInput { pane, data }) => {
                         if tx.send(SrvEvent::PaneInput { pane, data }).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientFrame::AssignBrief { pane, brief }) => {
+                        if tx.send(SrvEvent::AssignBrief { pane, brief }).is_err() {
                             break;
                         }
                     }

@@ -2122,6 +2122,64 @@ impl App {
     /// Write raw bytes to a specific pane's terminal (the Rover phone answering a
     /// prompt). Pane-targeted and non-takeover — the desktop client's focus is
     /// untouched, and a non-terminal pane is a silent no-op.
+    /// Hand a brief to the agent already running in a pane, or say why not.
+    ///
+    /// **This is the gate the whole assignment design rests on, and it is the only step in the
+    /// plan that could fail OPEN.** Assignment used to spawn `claude` with
+    /// `--permission-mode acceptEdits --disallowedTools …`, so the scope arrived with the worker.
+    /// Assigning into an existing pane means there is no spawn command left to carry it — and a
+    /// missing deny-list produces no error at all, just a worker that can edit `build.rs`.
+    ///
+    /// So the scope is read from the argv of the process that is actually running. Not a marker
+    /// file, which would keep saying "worker" about a pane whose `claude` was interrupted and
+    /// restarted bare; not a board field, which the bridge would have to check before typing,
+    /// leaving a gap in which the pane could change. The live argv is the fact itself.
+    ///
+    /// Every refusal names what to do about it, because the alternative is a phone button that
+    /// does nothing for a reason nobody can see.
+    pub fn assign_brief_to_pane(&mut self, pane_id: crate::pane::PaneId, brief: &str) -> Result<(), String> {
+        if !crate::briefs::safe_id(brief) {
+            return Err(format!("{brief:?} is not a brief id"));
+        }
+        let home = crate::sys::paths::home_dir().ok_or("no home directory")?;
+        let dir = home.join(".mars").join("briefs").join(brief);
+        if !dir.join("brief.md").exists() {
+            return Err(format!("no brief.md in {}", dir.display()));
+        }
+        // Already handed out. Not an error worth blocking on — a brief can legitimately be
+        // re-assigned after a worker died — but it must be said, because the alternative is
+        // silently starting a second worker on a branch the first one already has commits on.
+        if crate::briefs::state_of(&dir) != crate::briefs::State::Draft {
+            return Err(format!(
+                "{brief} has already been started ({}). Read its in_process.md before re-assigning",
+                crate::briefs::state_of(&dir).label()
+            ));
+        }
+        let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
+            Some(PaneContent::Terminal(t)) => *t,
+            _ => return Err("that workspace is a document, not a terminal".into()),
+        };
+        let pid = self
+            .terms
+            .get(&tid)
+            .and_then(|t| t.foreground_pid())
+            .ok_or("nothing is running in that workspace — start it as a worker first")?;
+        let argv = crate::briefs::argv_of(pid)
+            .ok_or("could not read what is running in that workspace")?;
+        if !crate::briefs::worker_argv_ok(&argv) {
+            return Err(
+                "that agent was not started as a worker, so it has no tool scope. \
+                 Start one with the worker command and assign again"
+                    .into(),
+            );
+        }
+        let msg = crate::briefs::assignment(brief, &home).ok_or("bad brief id")?;
+        if let Some(t) = self.terms.get_mut(&tid) {
+            t.send_bytes(msg.as_bytes());
+        }
+        Ok(())
+    }
+
     pub fn write_to_pane(&mut self, pane_id: crate::pane::PaneId, data: &str) {
         let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
             Some(PaneContent::Terminal(t)) => *t,

@@ -1784,6 +1784,42 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let day = v.get("day").and_then(|x| x.as_str()).unwrap_or("").to_string();
             let _ = tx.send(manager_archive_json(&day));
         }
+        // The queue. A directory read, computed on demand — there is no index to go stale, and
+        // "what is in flight" is answered by which files exist rather than by a stored status.
+        Some("brief.list") => {
+            let rows: Vec<serde_json::Value> = crate::briefs::list()
+                .into_iter()
+                .map(|b| serde_json::json!({
+                    "id": b.id, "title": b.title, "state": b.state.label(),
+                    "priority": b.priority, "branch": b.branch,
+                    "addresses": b.addresses, "createdTs": b.created_ts,
+                }))
+                .collect();
+            let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": rows}).to_string());
+        }
+        // Hand a brief to a worker. The bridge forwards and does NOT judge — the pane's tool scope
+        // is read from the argv of the process actually running, which only the daemon can see.
+        Some("brief.assign") => {
+            if let (Some(pane), Some(brief)) = (
+                v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()),
+                v.get("brief").and_then(|x| x.as_str()),
+            ) {
+                crate::manager::record_client_event("act", &v, crate::worklog::now_secs());
+                let _ = session::write_frame(writer, &ClientFrame::AssignBrief {
+                    pane, brief: brief.to_string(),
+                });
+            }
+        }
+        // Start an agent in a pane WITH the worker tool scope. One composer, host-side: the phone
+        // never builds a shell line for a host whose version it does not know, and the deny-list
+        // has exactly one definition.
+        Some("brief.worker") => {
+            if let Some(pane) = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()) {
+                let _ = session::write_frame(writer, &ClientFrame::PaneInput {
+                    pane, data: crate::briefs::worker_start_command(),
+                });
+            }
+        }
         Some("fs.read") => {
             let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
             let _ = tx.send(fs_read_json(path));

@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod banner;
 mod briefing;
+mod briefs;
 // The ssh/keyd broker is optional as one unit. Without the feature it is replaced
 // by an inert stub, so callers never learn the capability is missing.
 #[cfg(feature = "ssh")]
@@ -223,7 +224,7 @@ fn apply_config_from(path: &std::path::Path) {
 /// Add a verb here when you add it to the match below. The selfcheck fails if a doc names a verb
 /// that is not in this list.
 pub const CLI_VERBS: &[&str] = &[
-    "attach", "ask", "briefing", "config", "help", "keys", "kill", "list", "ls", "manager",
+    "attach", "ask", "brief", "briefing", "config", "help", "keys", "kill", "list", "ls", "manager",
     "new", "pair", "probe", "qr", "reboot", "rename", "reset", "resume", "serve", "session",
     "setup", "snapshot", "ssh", "theme", "upgrade", "version", "workspace",
 ];
@@ -454,6 +455,76 @@ fn main() -> Result<()> {
         // machine had already been upgraded.
         //
         // So: restart what is stale, leave what is current, and say which is which first.
+        // `mars brief` — the queue, a brief, and the command that starts a worker.
+        //
+        // Read-only plus one scaffold. Nothing here assigns: assignment needs a live pane whose
+        // agent carries the worker scope, which is a daemon question, and duplicating the check
+        // here would be a second copy of the one gate that must not disagree with itself.
+        Some("brief") => {
+            let sub = args.next().unwrap_or_default();
+            match sub.as_str() {
+                "" | "ls" | "list" => {
+                    let all = briefs::list();
+                    if all.is_empty() {
+                        println!(
+                            "no briefs yet.\n\n\
+                             `mars brief new \"<title>\"` writes one from the template.\n\
+                             `mars brief worker` prints the command that starts a pane as a worker."
+                        );
+                        return Ok(());
+                    }
+                    for b in &all {
+                        println!("  {:<10} p{:<4} {:<44} {}", b.state.label(), b.priority, b.id, b.title);
+                        for m in &b.addresses {
+                            println!("  {:<10} {:<5} └─ addresses {m}", "", "");
+                        }
+                    }
+                    // State is which files exist, so this line is a reading of the directory
+                    // rather than a counter anyone maintains.
+                    println!(
+                        "\n{} brief(s): {} draft, {} started, {} reported.",
+                        all.len(),
+                        all.iter().filter(|b| b.state == briefs::State::Draft).count(),
+                        all.iter().filter(|b| b.state == briefs::State::Started).count(),
+                        all.iter().filter(|b| b.state == briefs::State::Reported).count(),
+                    );
+                }
+                // The template is the point of this subcommand. A brief written from scratch is a
+                // brief with no forks, and a design with no forks is prose — the reader cannot see
+                // what was decided, so approving it means reading all of it.
+                "new" => {
+                    let title = args.collect::<Vec<_>>().join(" ");
+                    if title.trim().is_empty() {
+                        anyhow::bail!("usage: mars brief new \"<title>\"");
+                    }
+                    let ts = worklog::now_secs();
+                    let id = briefs::mint_id(&title, ts);
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    std::fs::create_dir_all(&dir)?;
+                    let path = dir.join("brief.md");
+                    if path.exists() {
+                        anyhow::bail!("{} already exists", path.display());
+                    }
+                    std::fs::write(&path, briefs::template(&id, &title, ts))?;
+                    let _ = briefs::scaffold();
+                    println!("{}", path.display());
+                }
+                "worker" => {
+                    println!(
+                        "Run this in the pane you want to work in, then assign a brief to it:\n\n  {}",
+                        briefs::worker_start_command().trim_end()
+                    );
+                    println!(
+                        "\nAssignment refuses any pane whose agent is not running with exactly this\n\
+                         scope — read from the process itself, not from a marker."
+                    );
+                }
+                other => anyhow::bail!("unknown: mars brief {other}   (try: ls | new | worker)"),
+            }
+            return Ok(());
+        }
         Some("upgrade") => {
             // REPORTS BY DEFAULT. Restarting every stale daemon on a machine is exactly the kind
             // of act this codebase makes a person press for — "the agent proposes, a human
@@ -7601,6 +7672,25 @@ fn selfcheck() -> Result<()> {
                     Some((f.next()?, f.next()?, f.next()?))
                 })
                 .collect();
+            // The worker's standing orders ride in the same lock and carry the same hazard — an
+            // edit without a bump leaves every host on its old copy, silently — but they are not a
+            // manager doc, so they are checked beside GUARDED_DOCS rather than counted with it.
+            {
+                let (_, want_ver, want_hash) = recorded
+                    .iter()
+                    .find(|(r, _, _)| *r == "briefs/WORKING-MODEL.md")
+                    .expect("WORKING-MODEL.md is absent from versions.lock — run tools/doc-lock.py");
+                let ver = crate::briefs::doc_version(crate::briefs::WORKING_MODEL).to_string();
+                let hash = manager::version_of_pub(crate::briefs::WORKING_MODEL);
+                assert!(
+                    !(&hash != want_hash && &ver == want_ver),
+                    "WORKING-MODEL.md was edited without bumping its mars-doc-version (still {ver}). \
+                     Bump it, then run tools/doc-lock.py"
+                );
+                assert_eq!(&hash, want_hash, "WORKING-MODEL.md changed — run tools/doc-lock.py");
+            }
+            let recorded: Vec<_> =
+                recorded.into_iter().filter(|(r, _, _)| *r != "briefs/WORKING-MODEL.md").collect();
             assert_eq!(
                 recorded.len(),
                 manager::GUARDED_DOCS.len(),
@@ -8097,6 +8187,108 @@ fn selfcheck() -> Result<()> {
             "watched sessions never notify, and the wire must pass that through");
 
         println!("[selfcheck] push: a real board shape reaches the gates ... PASS");
+    }
+
+    // ── BRIEFS: THE ARTIFACT, AND THE GATE THAT FAILS CLOSED ─────────────────────────────────
+    //
+    // Design: `work_memos/the-work-model.md`. Two things are worth testing and one of them is the
+    // reason the module exists at all — the worker tool scope. Everything else in the plan fails
+    // by not working; that one fails by working with no boundary.
+    {
+        use crate::briefs;
+
+        // Ids: timestamp plus a semantic suffix. Never derived from the title alone, because a
+        // title is a mutable value and an id derived from one points somewhere else after a rename.
+        let a = briefs::mint_id("Adaptive boot litany", 1786569213);
+        assert_eq!(a, "brief-1786569213-adaptive-boot-litany");
+        assert_eq!(briefs::mint_id("!!! ???", 42), "brief-42", "an unusable title still yields an id");
+        assert!(briefs::safe_id(&a));
+        // The id travels into a shell as part of a path, and it is chosen upstream of us.
+        for bad in ["brief-$(whoami)", "brief-a`id`", "../etc", "notabrief", "brief-a b"] {
+            assert!(!briefs::safe_id(bad), "{bad:?} must not be treated as a brief id");
+        }
+
+        // State is which siblings exist. Nothing stored, so nothing can disagree with reality.
+        let tmp = std::env::temp_dir().join(format!("mars-briefs-sc-{}", std::process::id()));
+        let d = tmp.join("brief-1-x");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("brief.md"), "---\ntitle: x\npriority: 70\ncreated_ts: 1\n---\nbody\n").unwrap();
+        assert_eq!(briefs::state_of(&d), briefs::State::Draft);
+        std::fs::write(d.join("in_process.md"), "---\nbrief: brief-1-x\n---\n").unwrap();
+        assert_eq!(briefs::state_of(&d), briefs::State::Started);
+        std::fs::write(d.join("completed.md"), "---\noutcome: done\n---\n").unwrap();
+        assert_eq!(briefs::state_of(&d), briefs::State::Reported, "the later fact wins");
+
+        // THE INFERENCE THAT MUST NEVER BE MADE. A worker that dies leaves `in_process.md` behind,
+        // so its presence means "somebody was told", never "somebody is working". Liveness is a
+        // question about a pane. This module has no opinion, and this asserts it stays that way —
+        // it is the stale-status bug that has landed here four times, pre-empted once.
+        std::fs::remove_file(d.join("completed.md")).unwrap();
+        assert_eq!(briefs::state_of(&d), briefs::State::Started);
+        assert!(
+            briefs::State::Started.label() != "running",
+            "state must not be named for liveness it cannot know"
+        );
+
+        // Reading: the pointer to a memo lives on the BRIEF, because a memo is rewritten
+        // constantly (one measured at 50,570 times in 7 days) and a pointer in that file is a
+        // pointer the next rewrite drops.
+        std::fs::write(
+            d.join("brief.md"),
+            "---\ntitle: adaptive litany\npriority: 70\ncreated_ts: 99\nbranch: adaptive\n\
+             addresses:\n  - {session: mars-dev, memo: terminal-1-failed}\n  - {session: nourish, memo: slow-build}\nnext: x\n---\nbody\n",
+        ).unwrap();
+        let b = briefs::read(&d).expect("a directory with a brief.md is a brief");
+        assert_eq!(b.title, "adaptive litany");
+        assert_eq!(b.priority, 70);
+        assert_eq!(b.branch.as_deref(), Some("adaptive"));
+        assert_eq!(b.addresses, vec!["mars-dev/terminal-1-failed", "nourish/slow-build"],
+            "many memos to one brief — which is what actually happens");
+        // A directory with no brief.md is not a half-brief, it is not a brief.
+        assert!(briefs::read(&tmp.join("brief-2-empty")).is_none());
+
+        // The instruction is TWO PATHS. Not a paragraph: a paragraph varies per worker and per
+        // version of whatever composed it, which makes "what was this worker told" unanswerable.
+        let home = std::path::Path::new("/home/x");
+        let msg = briefs::assignment("brief-1-x", home).unwrap();
+        assert_eq!(msg, briefs::assignment("brief-1-x", home).unwrap(), "same bytes every time");
+        assert!(msg.contains("/home/x/.mars/briefs/WORKING-MODEL.md"), "the working model: {msg}");
+        assert!(msg.contains("/home/x/.mars/briefs/brief-1-x/brief.md"), "the brief: {msg}");
+        assert!(msg.lines().count() == 1 && msg.len() < 200,
+            "an assignment is two addresses, not a thousand-line prompt ({} bytes)", msg.len());
+        assert!(briefs::assignment("../../etc/passwd", home).is_none());
+
+        // THE TOOL SCOPE. Derived from the argv of the process actually running — not a marker,
+        // which would keep saying "worker" about a pane whose claude was restarted bare.
+        let good = briefs::worker_start_command();
+        assert!(briefs::worker_argv_ok(&good), "the command we compose must pass our own check");
+        assert!(!briefs::worker_argv_ok("claude"), "a bare agent is not a worker");
+        assert!(!briefs::worker_argv_ok("cargo build"), "not an agent at all");
+        assert!(
+            !briefs::worker_argv_ok("claude --permission-mode acceptEdits"),
+            "the permission mode without the deny-list is the dangerous half on its own"
+        );
+        // A PARTIAL deny-list is the failure this exists to catch, and it is invisible at a glance
+        // because the command still looks long and careful.
+        let partial = good.replace("'Edit(.claude/**)' ", "");
+        assert!(!briefs::worker_argv_ok(&partial), "every entry, not merely some");
+        let no_brief_guard = good.replace("'Edit(**/briefs/*/brief.md)' ", "");
+        assert!(!briefs::worker_argv_ok(&no_brief_guard),
+            "a worker that can edit its own spec can satisfy the version it wrote");
+
+        // The standing orders ship with a version marker, or `seed` can never repair them.
+        assert!(briefs::doc_version(briefs::WORKING_MODEL) >= 1, "WORKING-MODEL.md needs a version");
+        assert_eq!(briefs::doc_version("no marker here"), 0, "absent reads as oldest, so we replace it");
+        for must in ["Blocked is terminal", "in_process.md", "completed.md", "Notes for later"] {
+            assert!(briefs::WORKING_MODEL.contains(must), "the orders must say {must:?}");
+        }
+        // If the orders name a deny-list entry, it has to be one we actually pass.
+        assert!(briefs::WORKER_DENY.contains(&"**/briefs/*/brief.md"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        println!("[selfcheck] briefs: state is which files exist, never liveness ... PASS");
+        println!("[selfcheck] briefs: an assignment is two paths, byte-identical ... PASS");
+        println!("[selfcheck] briefs: a partial worker deny-list is not a worker ... PASS");
     }
 
     // ── THE TWO WAYS A BOARD LIES ABOUT CHANGING ─────────────────────────────────────────────

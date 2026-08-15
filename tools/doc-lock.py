@@ -34,6 +34,15 @@ for rel, fname in entries:
     h = version_of(text)
     lines.append(f"{rel} {ver} {h}")
 
+# The worker's standing orders are not a manager doc — a worker reads none of the manager's — but
+# they carry the same hazard: an edit without a version bump leaves every host on its old copy with
+# no way to tell. Locked here so the same build-time check covers both.
+extra = MD / "WORKING-MODEL.md"
+if extra.exists():
+    text = extra.read_text()
+    m = re.search(r"mars-doc-version:\s*(\d+)", text)
+    lines.append(f"briefs/WORKING-MODEL.md {m.group(1) if m else '-'} {version_of(text)}")
+
 out = MD / "versions.lock"
 out.write_text(
     "# Generated: the version marker and content hash of every guarded doc.\n"
