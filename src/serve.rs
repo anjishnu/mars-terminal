@@ -650,6 +650,79 @@ const BRIDGE_HEADER: &str = "X-Mars-Bridge";
 ///
 /// Never call it from the serving thread: the request comes back to this process, and a bridge
 /// waiting on its own answer cannot give one.
+
+/// Run the notification gates over one board and, if something has earned an interrupt, render the
+/// frame for it.
+///
+/// `sent` is this connection's cooldown memory — keyed on `<session>:<pane>` rather than on
+/// content, because the failure it exists to prevent wrote different words every single time.
+fn notify_for_board(
+    board_json: &str,
+    sent: &mut std::collections::HashMap<String, u64>,
+) -> Option<String> {
+    let session = serde_json::from_str::<serde_json::Value>(board_json)
+        .ok()?["session"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    notify_frame_from_board(
+        board_json,
+        crate::manager::presence_watched(&session),
+        sent,
+        crate::worklog::now_secs(),
+        &crate::tuning::Tuning::default(),
+    )
+}
+
+/// The reader, separated from the I/O so a selfcheck can drive it.
+///
+/// **This split is the point.** The six gates were written, tested, and passed for weeks while
+/// nothing called them — and a reader that misspells one field name reproduces exactly that: every
+/// gate green, every board silently ineligible. The test that matters is not "do the rules work",
+/// it is "does a real board reach the rules".
+pub fn notify_frame_from_board(
+    board_json: &str,
+    watched: bool,
+    sent: &mut std::collections::HashMap<String, u64>,
+    ts: u64,
+    t: &crate::tuning::Tuning,
+) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(board_json).ok()?;
+    let session = v["session"].as_str().unwrap_or("").to_string();
+    let facts: Vec<crate::manager::PaneFacts> = v["rows"]
+        .as_array()?
+        .iter()
+        .map(|r| crate::manager::PaneFacts {
+            session: session.clone(),
+            pane: r["name"].as_str().unwrap_or("a workspace").to_string(),
+            verdict: r["verdict"].as_str().unwrap_or("").to_string(),
+            cmd: r["cmd"].as_str().map(str::to_string),
+            // Silence, not run time — see `quietSecs` in `mobile_board_json`. Falls back to
+            // `ageSecs` only for a board old enough not to carry it, where the two agree for the
+            // short-lived commands that case covers.
+            stall_secs: r["quietSecs"].as_u64().or_else(|| r["ageSecs"].as_u64()).unwrap_or(0),
+            prompt: r["blocked"]["prompt"].as_str().map(str::to_string),
+        })
+        .collect();
+    let n = crate::manager::push_candidate(&facts, watched, sent, ts, t)?;
+    sent.insert(n.key.clone(), ts);
+    let mut out = serde_json::json!({
+        "t": "notify", "key": n.key, "title": n.title, "body": n.body,
+    });
+    if let Some(s) = n.stakes {
+        out["stakes"] = serde_json::json!(s);
+    }
+    // The pane the tap should land on. Without it the notification opens the app and leaves you to
+    // find the thing yourself, which is most of the way back to not having been told.
+    if let Some(p) = v["rows"].as_array().and_then(|rows| {
+        rows.iter().find(|r| r["name"].as_str() == Some(n.pane.as_str()))
+            .and_then(|r| r["paneId"].as_str())
+    }) {
+        out["paneId"] = serde_json::json!(p);
+    }
+    Some(out.to_string())
+}
+
 fn tunnel_answers(base: &str) -> Result<(), String> {
     let ours = |r: &ureq::Response| r.header(BRIDGE_HEADER).is_some();
     match ureq::get(base).timeout(Duration::from_secs(6)).call() {
@@ -967,6 +1040,10 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     thread::spawn(move || {
         let mut lines = BufReader::new(reader_stream);
         let mut line = String::new();
+        // Cooldown memory, one map per connection. Deliberately not persisted: a reconnect is a
+        // new session and the phone's own 60s dedup covers the replay. Persisting it would mean a
+        // notification you never received still burning its hour.
+        let mut notify_sent: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         loop {
             line.clear();
             match lines.read_line(&mut line) {
@@ -978,6 +1055,16 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                     // Structured board JSON is `{"session":…,"rows":[…],"ts":…}`; wrap it
                     // into the client's `{t:"snapshot",…}` event by splicing after the `{`.
                     ServerFrame::Board { json } => {
+                        // EVERY BOARD IS A CHANCE TO INTERRUPT SOMEBODY, so the gates run here —
+                        // the bridge sees every board, and it is the only process that both knows
+                        // the rules and has a socket to the phone.
+                        //
+                        // The phone is a renderer. It never re-judges: a second copy of the rules
+                        // on the client is two copies that will disagree, and the client is the
+                        // one that cannot see a stall age or a foreground command.
+                        if let Some(n) = notify_for_board(&json, &mut notify_sent) {
+                            let _ = tx.send(n);
+                        }
                         let wrapped = format!("{{\"t\":\"snapshot\",{}", &json[1..]);
                         if tx.send(wrapped).is_err() {
                             break;

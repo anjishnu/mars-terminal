@@ -8043,6 +8043,62 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] push: one interrupt per tick, to the longest wait ... PASS");
     }
 
+    // ── DOES A REAL BOARD REACH THE RULES ────────────────────────────────────────────────────
+    //
+    // The six gates above are pure and have passed since the day they were written, during all of
+    // which nothing called them. That is the failure this block exists for: a reader that reads
+    // `age` where the board writes `ageSecs`, or `command` where it writes `cmd`, leaves every one
+    // of those PASS lines true and the channel silent. So this drives the wire, not the rules —
+    // with a board built from `mobile_board_json`'s actual field names.
+    #[cfg(feature = "web")]
+    {
+        use std::collections::HashMap;
+        let t = crate::tuning::Tuning::default();
+        let board = serde_json::json!({
+            "session": "sc-wire",
+            "ts": 0,
+            "rows": [
+                // Not a person being waited on — a build. Must not produce a frame.
+                {"id": "1", "name": "terminal 1", "verdict": "stalled", "kind": "terminal",
+                 "why": "cargo · silent 30m", "ageSecs": 1800, "quietSecs": 1800,
+                 "paneId": "7", "cmd": "cargo"},
+                // The real thing: an interactive agent, quiet well past the minimum — and note
+                // `ageSecs` far past the hour while `quietSecs` is not. That is the ordinary shape
+                // of a long-lived agent session, and reading the wrong one of these two fields
+                // discards it as stale while every gate selfcheck stays green.
+                {"id": "2", "name": "terminal 2", "verdict": "stalled", "kind": "terminal",
+                 "why": "claude · silent 20m", "ageSecs": 9000, "quietSecs": 1200,
+                 "paneId": "9", "cmd": "claude"},
+            ],
+        }).to_string();
+
+        let mut sent: HashMap<String, u64> = HashMap::new();
+        let raw = crate::serve::notify_frame_from_board(&board, false, &mut sent, 10_000, &t)
+            .expect("a stalled agent on a real board shape must produce a notify frame");
+        let f: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(f["t"], "notify");
+        assert_eq!(f["key"], "sc-wire:terminal 2", "cooldown identity is session:pane");
+        assert!(f["title"].as_str().unwrap().contains("claude"),
+            "the title names the agent, which only arrives via the `cmd` field: {}", f["title"]);
+        assert!(f["title"].as_str().unwrap().contains("terminal 2"),
+            "the wedged cargo pane must not be the one reported");
+        // The tap target. Without it the notification opens the app and leaves you to find the
+        // thing yourself, which is most of the way back to not having been told.
+        assert_eq!(f["paneId"], "9", "the frame deep-links to the pane it is about");
+
+        // The reader must also carry the cooldown through: a board arriving a second later is the
+        // same situation, and the gate that stopped the 50,570 lives on identity, not content.
+        assert!(crate::serve::notify_frame_from_board(&board, false, &mut sent, 10_060, &t).is_none(),
+            "a second board inside the cooldown must not notify again");
+
+        // Presence, end to end: the same board, while somebody is looking at it.
+        let mut fresh: HashMap<String, u64> = HashMap::new();
+        assert!(crate::serve::notify_frame_from_board(&board, true, &mut fresh, 10_000, &t).is_none(),
+            "watched sessions never notify, and the wire must pass that through");
+
+        println!("[selfcheck] push: a real board shape reaches the gates ... PASS");
+    }
+
     // ── THE TWO WAYS A BOARD LIES ABOUT CHANGING ─────────────────────────────────────────────
     //
     // Both directions, because they are the same defect and they cost opposite things. Over-detect

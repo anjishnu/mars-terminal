@@ -1074,6 +1074,21 @@ fn presence_path(sdir: &Path) -> PathBuf {
 /// `away_secs` is computed here, at the transition, rather than derived later from two
 /// timestamps by whoever happens to ask — the process that watched the gap is the only one that
 /// can sign for how long it was.
+/// Is somebody looking at this session right now?
+///
+/// Gate 4 of the notification rules, and the one that decides whether an interrupt is an interrupt
+/// at all: telling you about a pane you are already watching is noise with a buzz attached.
+/// Unknown reads as NOT watched — a session with no presence file has never been looked at, which
+/// is the case where a notice is most likely to be wanted.
+pub fn presence_watched(session_name: &str) -> bool {
+    let Some(sdir) = existing_session_dir(session_name) else { return false };
+    std::fs::read_to_string(presence_path(&sdir))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|p| p["watched"].as_bool())
+        .unwrap_or(false)
+}
+
 pub fn mark_presence(session_name: &str, watched: bool, ts: u64) {
     let Some(sdir) = existing_session_dir(session_name) else { return };
     let path = presence_path(&sdir);

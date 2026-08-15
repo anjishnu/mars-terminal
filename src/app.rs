@@ -1175,7 +1175,7 @@ impl App {
                 let mut row = serde_json::json!({
                     "id": s.tab_index.to_string(),
                     "name": label,
-                    "verdict": s.verdict.label(), // failed|blocked|done|running|idle
+                    "verdict": s.verdict.label(), // failed|blocked|stalled|done|running|idle
                     "kind": kind,                 // editor → the phone renders it as a document
                     "why": description,
                     "ageSecs": s.age_secs,
@@ -1193,6 +1193,13 @@ impl App {
                     if let Some(cmd) = self.fg_commands.get(t) {
                         row["cmd"] = serde_json::json!(cmd);
                     }
+                    // HOW LONG IT HAS BEEN SILENT, which is not `ageSecs`. `ageSecs` measures how
+                    // long the current command has been running — for a `claude` pane that is the
+                    // age of the whole session. The notification gates ask "has it waited long
+                    // enough" and "has the moment passed", and both mean silence: a claude session
+                    // open ninety minutes but quiet for twelve is a live interrupt, and reading
+                    // `ageSecs` would have discarded it as stale.
+                    row["quietSecs"] = serde_json::json!(self.pane_quiet_secs(*t));
                     // The DURABLE id, beside the runtime handle. `paneId` addresses this pane in
                     // this daemon; `wid` still names this workspace after a reboot, and is what
                     // anything filed against a workspace is filed under.
