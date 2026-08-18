@@ -1793,6 +1793,14 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                     "id": b.id, "title": b.title, "state": b.state.label(),
                     "priority": b.priority, "branch": b.branch,
                     "addresses": b.addresses, "createdTs": b.created_ts,
+                    // The forks are what approval reads, and the verify list is what pressing
+                    // assign authorises to run. Both belong on the card rather than one tap in:
+                    // a command nobody saw is a command nobody approved.
+                    "forks": b.forks, "verify": b.verify,
+                    "repo": b.repo.as_ref().map(|r| r.display().to_string()),
+                    "report": b.report.as_ref().map(|r| serde_json::json!({
+                        "outcome": r.outcome, "pr": r.pr, "met": r.met, "total": r.total,
+                    })),
                 }))
                 .collect();
             let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": rows}).to_string());

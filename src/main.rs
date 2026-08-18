@@ -526,6 +526,29 @@ fn main() -> Result<()> {
                         anyhow::bail!("no brief at {}", dir.display());
                     }
                     println!("state: {}\n", briefs::state_of(&dir).label());
+                    // WHAT THE APPROVAL CARD SHOWS, so the desk and the phone cannot come to
+                    // disagree about what a person was looking at when they pressed.
+                    if let Some(b) = briefs::read(&dir) {
+                        for f in &b.forks {
+                            println!("  · {f}");
+                        }
+                        if !b.verify.is_empty() {
+                            println!("\n  pressing assign authorises these to run in {}:",
+                                b.repo.as_ref().map(|r| r.display().to_string()).unwrap_or_else(|| "?".into()));
+                            for c in &b.verify {
+                                match briefs::verify_argv(c) {
+                                    Ok(_) => println!("    $ {c}"),
+                                    Err(why) => println!("    ! {c}\n        {why}"),
+                                }
+                            }
+                        }
+                        if let Some(r) = &b.report {
+                            println!("\n  reported {} — {}/{} criteria met{}",
+                                r.outcome, r.met, r.total,
+                                r.pr.as_ref().map(|u| format!("\n  {u}")).unwrap_or_default());
+                        }
+                        println!();
+                    }
                     println!("Assigning types exactly this into the pane — ONE line, wrapped here\n\
                               only for reading:\n");
                     let mut col = 0;
@@ -8599,6 +8622,7 @@ fn selfcheck() -> Result<()> {
         let ghost = briefs::Brief {
             id: "brief-9-verify".into(), title: "t".into(), state: briefs::State::Draft,
             priority: 0, branch: None, addresses: vec![], created_ts: 1,
+            forks: vec![], report: None,
             repo: Some(std::path::PathBuf::from("/no/such/dir")),
             verify: vec!["cargo build".into()],
         };
@@ -8640,6 +8664,50 @@ fn selfcheck() -> Result<()> {
                      "./target/debug/mars --selfcheck", "pytest -q", "go test ./..."] {
             assert!(briefs::verify_argv(real).is_ok(), "{real:?} is a normal check and must run");
         }
+
+        // ── WHAT THE APPROVAL CARD READS ─────────────────────────────────────────────────
+        //
+        // The forks ARE the design, so three lines is the decision. Parsed from the body, not
+        // duplicated into the frontmatter, because two copies stop agreeing the moment somebody
+        // edits one of them.
+        let fdir = tmp.join("brief-9-forks");
+        std::fs::create_dir_all(&fdir).unwrap();
+        std::fs::write(fdir.join("brief.md"), concat!(
+            "---\ntitle: f\ncreated_ts: 1\n---\n",
+            "## HLD\n\n",
+            "### Fork 1 — where does the directory come from?\n\n",
+            "- **Option A** — the Status frame. *For:* one round trip. *Against:* version skew\n",
+            "- **Option C ✅ chosen** — read `restore.json`. *Why this and not the others:* already written\n\n",
+            "### Fork 2 — where does it go in the table?\n\n",
+            "- **Option D ✅ chosen** — a width-aware column. *Why this:* narrow terminals\n\n",
+            "## Decisions already made\n\n- something else chosen long ago\n",
+        )).unwrap();
+        let fb = briefs::read(&fdir).expect("a brief");
+        assert_eq!(fb.forks.len(), 2, "expected one line per fork, got {:?}", fb.forks);
+        assert!(fb.forks[0].starts_with("Fork 1 — where does the directory come from? → "),
+            "the question must lead — it is what the reader is deciding: {:?}", fb.forks[0]);
+        assert!(fb.forks[0].contains("Option C") && fb.forks[0].contains("restore.json"),
+            "the ruled option must be named: {:?}", fb.forks[0]);
+        assert!(!fb.forks[0].contains("Why this") && !fb.forks[0].contains("**"),
+            "a card shows the decision, not the argument or the markup: {:?}", fb.forks[0]);
+        assert!(fb.forks.iter().all(|f| f.chars().count() <= 140), "a fork line must fit a phone");
+        assert!(!fb.forks[0].contains("  "), "double space where a marker was stripped: {:?}", fb.forks[0]);
+        assert!(!fb.forks[0].contains("chosen"),
+            "every one of these lines was chosen, so the word carries nothing: {:?}", fb.forks[0]);
+        // A `chosen` further down the document must not attach to a fork it does not belong to.
+        assert!(!fb.forks.iter().any(|f| f.contains("long ago")),
+            "a later section leaked into the forks: {:?}", fb.forks);
+
+        // The report, and the disagreement worth surfacing: `done` beside an unmet criterion.
+        assert!(fb.report.is_none(), "no completed.md is no report, not an empty one");
+        std::fs::write(fdir.join("completed.md"),
+            "---\noutcome: done\npr: https://example.com/pull/3\nacceptance:\n               - {n: 1, met: true}\n  - {n: 2, met: false, why: \"needs a device\"}\n---\nbody\n").unwrap();
+        let fb = briefs::read(&fdir).expect("a brief");
+        let r = fb.report.expect("completed.md is a report");
+        assert_eq!((r.met, r.total), (1, 2), "the tally is counted, not taken on trust");
+        assert_eq!(r.outcome, "done");
+        assert_eq!(r.pr.as_deref(), Some("https://example.com/pull/3"));
+        assert_eq!(fb.state, briefs::State::Reported, "the report and the state must agree");
 
         // The orders must actually hand verification over, or the worker still runs them.
         assert!(briefs::WORKING_MODEL.contains("You do not run the brief's `verify:` commands"),

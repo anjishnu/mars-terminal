@@ -150,7 +150,28 @@ pub struct Brief {
     /// The commands that decide whether this was built. Run by MARS, never by the worker — see
     /// `verify`.
     pub verify: Vec<String>,
+    /// One line per fork, already ruled: the question and the option chosen.
+    ///
+    /// **This is what approval actually reads.** The forks ARE the design, so three lines is the
+    /// decision; a prose summary would send the reader into the file, and a reader who has to open
+    /// a 300-line document on a phone does not approve, they defer.
+    pub forks: Vec<String>,
+    pub report: Option<Report>,
     pub created_ts: u64,
+}
+
+/// What a worker reported, read from `completed.md`. `None` until there is one.
+#[derive(Clone, Debug)]
+pub struct Report {
+    /// `done` | `partial` | `blocked` | `rejected`. Kept as written rather than parsed into an
+    /// enum: an outcome we do not recognise must still reach the reader, because the two that
+    /// matter most are the two nobody expects.
+    pub outcome: String,
+    pub pr: Option<String>,
+    /// Criteria met, and how many there were. A tally, not a verdict — `9/11` and `11/11` are
+    /// different things to walk into.
+    pub met: usize,
+    pub total: usize,
 }
 
 /// One verify command and what actually happened when it ran.
@@ -177,7 +198,7 @@ pub fn read(brief_dir: &Path) -> Option<Brief> {
         return None;
     }
     let text = std::fs::read_to_string(brief_dir.join("brief.md")).ok()?;
-    let (front, _) = crate::manager::split_front(&text)?;
+    let (front, body) = crate::manager::split_front(&text)?;
     let f = |k: &str| {
         front.lines().find_map(|l| {
             let (key, v) = l.split_once(':')?;
@@ -192,6 +213,8 @@ pub fn read(brief_dir: &Path) -> Option<Brief> {
         addresses: parse_addresses(front),
         repo: f("repo").filter(|r| !r.is_empty() && r != "null").map(PathBuf::from),
         verify: parse_list(front, "verify:"),
+        forks: parse_forks(body),
+        report: read_report(brief_dir),
         created_ts: f("created_ts").and_then(|t| t.parse().ok()).unwrap_or(0),
         id,
     })
@@ -223,7 +246,88 @@ fn parse_addresses(front: &str) -> Vec<String> {
     out
 }
 
-/// A YAML list of plain strings under `key`. Hand-parsed for the same reason `parse_addresses` is:
+/// One line per fork: the question, and the option that was ruled.
+///
+/// Read from the body rather than recorded in the frontmatter, because the body is the thing a
+/// human approved — a duplicated summary in the frontmatter is a summary that stops matching the
+/// design the first time somebody edits one and not the other.
+fn parse_forks(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut question: Option<String> = None;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("### Fork") {
+            // "### Fork 2 — where does it go?" → "Fork 2 — where does it go?"
+            question = Some(format!("Fork{}", rest.trim_end_matches(':')).trim().to_string());
+            continue;
+        }
+        // Headings other than a fork end the fork we were collecting, so a chosen marker further
+        // down the document cannot attach itself to a question it does not belong to.
+        if trimmed.starts_with("## ") {
+            question = None;
+            continue;
+        }
+        if question.is_some() && trimmed.contains("chosen") {
+            let choice = strip_md(trimmed);
+            if let Some(q) = question.take() {
+                out.push(format!("{q} → {choice}"));
+            }
+        }
+    }
+    out
+}
+
+/// Markdown down to the words, and only the first clause of them. A card shows the decision, not
+/// the argument for it — the argument is in the brief, one tap away.
+fn strip_md(line: &str) -> String {
+    let s = line.trim_start_matches(['-', ' ', '*']);
+    let s = s.split(" *For:*").next().unwrap_or(s);
+    let s = s.split(" *Why").next().unwrap_or(s);
+    let s = s.replace("**", "").replace("✅", "").replace('`', "");
+    // "chosen" is what every one of these lines says, so it carries nothing — the line is only
+    // here because it was chosen. Dropping it buys back the width the option text needs.
+    let s = s.replace(" chosen ", " ").replace("chosen", "");
+    // First sentence only. The rest is the justification, and the justification is in the brief.
+    let s = s.split(". ").next().unwrap_or(&s).to_string();
+    // Whitespace collapsed AFTER the removals, which is where the double spaces come from.
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let s = s.trim().trim_start_matches('—').trim().trim_end_matches(['.', ',', ' ']).to_string();
+    if s.chars().count() > 72 {
+        format!("{}…", s.chars().take(71).collect::<String>().trim_end())
+    } else {
+        s
+    }
+}
+
+/// The worker's report, if there is one.
+fn read_report(brief_dir: &Path) -> Option<Report> {
+    let text = std::fs::read_to_string(brief_dir.join("completed.md")).ok()?;
+    let (front, _) = crate::manager::split_front(&text)?;
+    let f = |k: &str| {
+        front.lines().find_map(|l| {
+            let (key, v) = l.split_once(':')?;
+            (key.trim() == k).then(|| v.trim().trim_matches('"').to_string())
+        })
+    };
+    // Every `{n: …, met: …}` row. Counted rather than trusted: `outcome: done` beside 9 of 11 met
+    // is exactly the disagreement worth showing, and a card that printed only the outcome would
+    // hide it.
+    let (mut met, mut total) = (0usize, 0usize);
+    for line in front.lines().map(str::trim).filter(|l| l.starts_with("- {n:")) {
+        total += 1;
+        if line.contains("met: true") {
+            met += 1;
+        }
+    }
+    Some(Report {
+        outcome: f("outcome").unwrap_or_else(|| "unknown".into()),
+        pr: f("pr").filter(|p| p.starts_with("http")),
+        met,
+        total,
+    })
+}
+
+/// A YAML list of plain strings under `key`./// A YAML list of plain strings under `key`. Hand-parsed for the same reason `parse_addresses` is:
 /// a malformed list must cost one field, never the whole document.
 fn parse_list(front: &str, key: &str) -> Vec<String> {
     let mut out = Vec::new();
