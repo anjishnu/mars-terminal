@@ -1172,6 +1172,23 @@ fn arrival(repo: &Path, sessions: &[SessionSnap], floor_secs: u64) -> Option<Arr
 // than skips.
 
 /// Snapshot filenames under a session dir that the agent has not consumed, oldest first.
+/// Did this snapshot record a MATERIAL change?
+///
+/// Absent `novelty` reads as material, deliberately. The field arrived after these files did, and
+/// an unknown reason is not a reason to skip — treating it as "no news" would silently swallow
+/// every snapshot written before the upgrade, which is the failure this whole gate exists to make
+/// visible rather than to cause.
+fn snapshot_is_material(sdir: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(sdir.join("snapshots").join(name)) else {
+        return true;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return true };
+    match v.get("novelty") {
+        Some(n) => n["material"].as_bool().unwrap_or(true),
+        None => true,
+    }
+}
+
 fn snapshots_after(sdir: &Path, after: Option<&str>) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(sdir.join("snapshots")) else {
         return Vec::new();
@@ -1243,9 +1260,29 @@ pub fn compose_batch(
             away = Some(a.away_secs);
         }
         let pending = snapshots_after(&sdir, after.as_deref());
-        if pending.is_empty() {
+        // EXISTENCE STOPS BEING THE TEST.
+        //
+        // A run over nothing but detail-triggered snapshots is a run about a progress bar: the
+        // board has not moved, and 140 seconds of model time goes to establishing that. Now that
+        // each snapshot records WHY it was written, the batch can drop the ones that say
+        // "nothing material".
+        //
+        // An arrival still offers everything, unfiltered — "what did I miss" is a different
+        // question from "what changed", and answering the first one needs the detail.
+        //
+        // Snapshots written before `novelty` existed are treated as material: an unknown reason
+        // is not a reason to skip, and a silent downgrade would hide the whole backlog.
+        let offered: Vec<String> = if away.is_some() {
+            pending.clone()
+        } else {
+            pending.iter().filter(|n| snapshot_is_material(&sdir, n)).cloned().collect()
+        };
+        if offered.is_empty() {
+            // The cursor still advances over what was skipped — see `compose_batch`'s cursor
+            // handling — so nothing is re-read forever.
             continue;
         }
+        let pending = offered;
         let covers_from = pending.first().cloned();
         let mut entry = serde_json::json!({
             "id": id,
@@ -1332,8 +1369,41 @@ pub fn nudge_reason(
     if arrived {
         return Some("arrived");
     }
+    // THE FLOOR IS A RATE LIMIT, NOT THE TRIGGER.
+    //
+    // This used to return `"material-change"` on the clock alone, having consulted nothing about
+    // the board — the name described an intention the code never carried out. With the floor as
+    // the only live term (`fresh_block` fires zero times on this host, because `blocked` is never
+    // set in a snapshot), the wake condition was "20 minutes have passed and a snapshot exists".
+    //
+    // Now materiality is recorded on each snapshot, so ask. Both conditions must hold: something
+    // actually changed, AND enough time has passed to be worth a run.
     let last = state["last_nudge_ts"].as_u64().unwrap_or(0);
-    (ts.saturating_sub(last) >= floor_secs).then_some("material-change")
+    if ts.saturating_sub(last) < floor_secs {
+        return None;
+    }
+    let material = sessions.iter().any(|s| {
+        existing_session_dir(&s.name).is_some_and(|sdir| {
+            // Only what the agent has not already been shown. A material change it was woken for
+            // an hour ago is not news now.
+            let after = cursor_for(repo, &sdir);
+            snapshots_after(&sdir, after.as_deref())
+                .iter()
+                .any(|n| snapshot_is_material(&sdir, n))
+        })
+    });
+    material.then_some("material-change")
+}
+
+/// Where the agent's cursor has reached for this session, if anywhere.
+///
+/// Read from the same `memory/cursor.json` the batch uses, keyed by the session's id — which is
+/// the directory name. Keying by NAME here would have reintroduced D2 in a second place.
+fn cursor_for(repo: &Path, sdir: &Path) -> Option<String> {
+    let id = sdir.file_name()?.to_str()?;
+    let cur: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(repo.join("memory/cursor.json")).ok()?).ok()?;
+    cur[id].as_str().map(String::from)
 }
 
 /// Record that the agent was woken. Stores the blocked set alongside, so the next tick can tell
@@ -2112,6 +2182,25 @@ pub fn emit(
     let mut briefs: Vec<(String, String)> = Vec::new();
 
     for s in sessions {
+        // BEFORE `session_dir_fp`, WHICH REWRITES `meta.json` WITH THESE VERY FINGERPRINTS.
+        //
+        // Read afterwards, the comparison is against what we just wrote, so every snapshot reports
+        // "nothing changed" — including the first sight of a session. Caught by the selfcheck
+        // asserting that a session's first snapshot is material; the ordering is the whole
+        // correctness of this bit.
+        let (fp_now, det_now) = (fingerprint_material(s), fingerprint_detail(s));
+        let prev = existing_session_dir(&s.name)
+            .and_then(|d| std::fs::read_to_string(d.join("meta.json")).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        // No previous meta means this session is new, and a new session is material by definition
+        // — "what did I miss" has a real answer the first time.
+        let material_changed = prev.as_ref()
+            .map(|m| m["fingerprint"].as_str() != Some(fp_now.as_str()))
+            .unwrap_or(true);
+        let detail_changed = prev.as_ref()
+            .map(|m| m["detail"].as_str() != Some(det_now.as_str()))
+            .unwrap_or(true);
+
         // Session artifacts live under ~/.mars/sessions/<id>/, NOT under the manager repo keyed by
         // name. A rename now rewrites meta.json instead of forking a new directory.
         let Some(sdir) =
@@ -2130,9 +2219,21 @@ pub fn emit(
         std::fs::create_dir_all(&cards)?;
         std::fs::create_dir_all(&snaps)?;
 
+        // WHY THIS SNAPSHOT EXISTS, recorded rather than recomputed. The gate in `tick_session`
+        // answers this on every tick and used to throw the answer away, so `compose_batch` had
+        // nothing to filter on and fell back to the only test left — does a snapshot exist.
+        // Existence became the content check, and the agent was woken every 20 minutes to
+        // establish that a board had not moved.
+        //
         // 1. The stimulus for this session — what an agent reads, or a human with `jq`.
         let stim = serde_json::json!({
             "at": iso(ts), "at_ts": ts, "origin": origin, "session": s.name,
+            "novelty": {
+                "material": material_changed,
+                "detail": detail_changed,
+                "fp": fp_now,
+                "det": det_now,
+            },
             "health": s.health,
             "goals": goals_json(),
             "workspaces": s.panes.iter().map(|p| {
@@ -2399,13 +2500,27 @@ fn write_meta(
         .as_ref()
         .and_then(|v| v["created_ts"].as_u64())
         .unwrap_or(ts);
+    // AN EMPTY FINGERPRINT IS "THE CALLER DID NOT KNOW", NOT "THE BOARD IS EMPTY".
+    //
+    // `session_dir()` passes `("", "")` — it exists for callers that only want the path — and
+    // writing those through blanked the two values the idle fast path compares against. The next
+    // tick then found `m["fingerprint"] != mat`, decided the board had changed, and wrote a
+    // snapshot over a board that had not moved. An empty board still fingerprints as `name::`,
+    // never as "", so the blank is unambiguous and the old value is the better answer.
+    let keep = |new: &str, key: &str| -> String {
+        if new.is_empty() {
+            existing.as_ref().and_then(|v| v[key].as_str()).unwrap_or_default().to_string()
+        } else {
+            new.to_string()
+        }
+    };
     let meta = serde_json::json!({
         "id": id, "name": name, "instance_id": instance_id,
         "created": iso(created), "created_ts": created,
         "updated": iso(ts), "updated_ts": ts,
         // What the idle fast path compares against.
-        "fingerprint": fp,
-        "detail": detail,
+        "fingerprint": keep(fp, "fingerprint"),
+        "detail": keep(detail, "detail"),
     });
     if let Ok(txt) = serde_json::to_string_pretty(&meta) {
         let _ = std::fs::write(dir.join("meta.json"), txt);

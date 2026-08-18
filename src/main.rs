@@ -3737,6 +3737,36 @@ fn selfcheck() -> Result<()> {
         assert!(ev2.is_empty(), "re-emitted cards for unchanged state: {ev2:?}");
         assert_eq!(cards().len(), 2, "duplicate card written: {:?}", cards());
 
+        // T2b — AND THE SECOND SNAPSHOT MUST SAY WHY IT EXISTS.
+        //
+        // The gate answers "did anything material change" on every tick and used to throw the
+        // answer away, so the batch had nothing to filter on and fell back to the only test left:
+        // does a snapshot exist. Existence became the content check, and the agent was woken every
+        // 20 minutes to establish that a board had not moved — 140 seconds a time.
+        {
+            let novelty = |ord: usize| -> serde_json::Value {
+                let mut files: Vec<_> = std::fs::read_dir(sdir.join("snapshots")).unwrap()
+                    .flatten().map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
+                    .collect();
+                files.sort();
+                let f = files.get(ord).unwrap_or_else(|| panic!("no snapshot #{ord}"));
+                serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(f).unwrap())
+                    .unwrap()["novelty"].clone()
+            };
+            let first = novelty(0);
+            assert_eq!(first["material"], serde_json::json!(true),
+                "the first sight of a session is material — 'what did I miss' has a real answer");
+            // The identical re-emit above.
+            let second = novelty(1);
+            assert_eq!(second["material"], serde_json::json!(false),
+                "an unchanged board recorded itself as news: {second}");
+            assert_eq!(first["fp"], second["fp"],
+                "the same board produced two material fingerprints: {first} vs {second}");
+            assert!(second["fp"].is_string() && second["det"].is_string(),
+                "the snapshot must carry the fingerprints it was judged by: {second}");
+        }
+
         // T3 — when the world moves on, the card expires. Declarative staleness: nothing
         //      re-examined the card, the condition simply stopped holding.
         let s2 = snap(vec![pane("4", "claude", "running", "", 3), pane("3", "sweep", "done", "", 9)]);
