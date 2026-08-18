@@ -2,7 +2,7 @@
 # Regenerate with tools/doc-lock.py after bumping a doc's mars-doc-version.
 # A doc whose text changed while its version did not is the one mistake that stops the
 # manager on every host at once; the selfcheck compares against this file to catch it.
-AGENTS.md 22 2d3c5f16ba01e04a
+AGENTS.md 23 97aa856dc2374c01
 prompt.md 6 21044b003d0fbe8e
 docs/layout.md 2 6c8d68bd6b5a3959
 docs/cards.md - 300d6b690e13a297

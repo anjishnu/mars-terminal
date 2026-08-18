@@ -3696,7 +3696,7 @@ fn selfcheck() -> Result<()> {
         let pane = |pane_id: &str, name: &str, verdict: &str, why: &str, age: u64| PaneRow {
             id: pane_id.into(), pane_id: pane_id.into(), wid: pane_id.into(), name: name.into(),
             verdict: verdict.into(), kind: "terminal".into(), why: why.into(),
-            age_secs: age, blocked_prompt: (verdict == "blocked").then(|| why.to_string()), focused: false,
+            age_secs: age, blocked_prompt: (verdict == "blocked").then(|| why.to_string()), focused: false, chat: None, cmd: None,
         };
         let snap = |panes: Vec<PaneRow>| vec![SessionSnap {
             name: "0".into(), health: "up 3h · load 2.1".into(), panes,
@@ -3765,6 +3765,54 @@ fn selfcheck() -> Result<()> {
                 "the same board produced two material fingerprints: {first} vs {second}");
             assert!(second["fp"].is_string() && second["det"].is_string(),
                 "the snapshot must carry the fingerprints it was judged by: {second}");
+        }
+
+        // T2c — THE CONVERSATION REACHES THE SNAPSHOT, AND IS BOUNDED.
+        //
+        // The board has carried `chat` since board-readership landed; `PaneRow` had no field for
+        // it, so `parse_board` dropped it and the manager's only material for an agent pane was
+        // the last 20 rendered lines — the composer, the spinner, the status bar.
+        {
+            let board = serde_json::json!({
+                "session": "0", "health": "up",
+                "rows": [{
+                    "id": "4", "paneId": "4", "wid": "4", "name": "claude",
+                    "verdict": "stalled", "kind": "terminal", "why": "no output for 2h24m",
+                    "ageSecs": 8_640, "focused": false,
+                    "cmd": "claude", "chat": "no-such-conversation-id",
+                }],
+            }).to_string();
+            let parsed = manager::parse_board_for_test(&board).expect("board did not parse");
+            let pane = &parsed.panes[0];
+            assert_eq!(pane.cmd.as_deref(), Some("claude"),
+                "the manager cannot tell an agent pane from a shell");
+            assert_eq!(pane.chat.as_deref(), Some("no-such-conversation-id"),
+                "the conversation id is on the wire and still being dropped");
+            // Absent/unreadable is an empty window, never a failure — a pane whose transcript has
+            // been pruned must still produce a snapshot.
+            assert!(manager::CHAT_WINDOW > 0 && manager::CHAT_WINDOW <= 12,
+                "the window is unbounded or pointless: {}", manager::CHAT_WINDOW);
+            // A window bounded only by COUNT is not bounded. Measured live: one pane's six rows
+            // came to 6,524 tokens because a single row held an enormous tool result.
+            let huge = manager::clamp_conversation_for_test(vec![
+                serde_json::json!({"kind": "tool", "text": "x".repeat(40_000),
+                                   "summary": "y".repeat(9_000), "detail": "z".repeat(9_000)}),
+            ]);
+            let bytes = serde_json::to_string(&huge).unwrap().len();
+            assert!(bytes < 6_000, "a single event still carries {bytes} bytes into every run");
+            let txt = huge[0]["text"].as_str().unwrap();
+            assert!(txt.contains("trimmed"), "trimming is silent: {}", &txt[..40.min(txt.len())]);
+            assert!(txt.ends_with('x'), "trimmed the tail — the verdict of a long result is at its END");
+
+            // An empty chat id is absent, not a lookup for "".
+            let blank = manager::parse_board_for_test(&serde_json::json!({
+                "session": "0", "health": "up",
+                "rows": [{ "id": "1", "paneId": "1", "name": "sh", "verdict": "idle",
+                           "kind": "terminal", "why": "", "ageSecs": 1, "focused": false,
+                           "cmd": "", "chat": "" }],
+            }).to_string()).expect("board did not parse");
+            assert!(blank.panes[0].chat.is_none() && blank.panes[0].cmd.is_none(),
+                "an empty string became a conversation id");
         }
 
         // T3 — when the world moves on, the card expires. Declarative staleness: nothing
@@ -3942,7 +3990,7 @@ fn selfcheck() -> Result<()> {
                 panes: vec![PaneRow {
                     id: "1".into(), pane_id: "1".into(), wid: "1".into(), name: "terminal 1".into(),
                     verdict: "idle".into(), kind: "terminal".into(), why: String::new(),
-                    age_secs: age, blocked_prompt: None, focused: false,
+                    age_secs: age, blocked_prompt: None, focused: false, chat: None, cmd: None,
                 }],
             }];
             let summary_at = |age: u64, ts: u64| -> String {
@@ -6877,9 +6925,32 @@ fn selfcheck() -> Result<()> {
                 assert!(manager::AGENTS_MD.contains(must),
                     "the run has no gate on whether it is worth writing: {must:?}");
             }
+            // The snapshot now costs tokens to carry a conversation. If the checklist never
+            // mentions it, that is cost with no benefit — the exact trade this was priced against.
+            assert!(manager::AGENTS_MD.contains("`conversation`"),
+                "snapshots carry the conversation and the agent is never told to use it");
+        }
+
+        // A NOTE IN THE LOG IS NOT A FAILED RUN. The watermark line explaining a bad tally would
+        // otherwise be counted as one more failure by the very reading it exists to correct.
+        {
+            let log = repo.join("memory/runs.jsonl");
+            let before = std::fs::read_to_string(&log).unwrap_or_default();
+            let runs = before.lines().filter(|l| l.contains("\"ok\"")).count();
+            std::fs::write(&log, format!(
+                "{before}{}\n",
+                serde_json::json!({"note": "scored before the id/name fix", "scored_ts": 1u64}),
+            ))?;
+            let (ok, total, _) = manager::run_tally_for_test(&repo);
+            assert_eq!(total as usize, runs.min(20),
+                "a note was counted as a run: {ok}/{total} over {runs} real rows");
+            assert!(manager::recent_runs(&repo, 5).iter().all(|v| v["ok"].is_boolean()),
+                "a note was handed to the agent as one of its runs");
+            std::fs::write(&log, before)?;
         }
 
         println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
+        println!("[selfcheck] manager: a note in the run log is not a failed run ... PASS");
         println!("[selfcheck] manager: an unbounded memory file is a scored fault, not a sentence ... PASS");
         println!("[selfcheck] manager: the agent is shown its own score, and the checklist has no dead step ... PASS");
         println!("[selfcheck] manager: a session's id and name are both accepted, neither guessed ... PASS");
@@ -7188,7 +7259,7 @@ fn selfcheck() -> Result<()> {
                 panes: vec![manager::PaneRow {
                     id: "0".into(), pane_id: "0".into(), wid: "0".into(), name: "terminal 1".into(),
                     verdict: "running".into(), kind: "terminal".into(), why: String::new(),
-                    age_secs: 5, blocked_prompt: None, focused: false,
+                    age_secs: 5, blocked_prompt: None, focused: false, chat: None, cmd: None,
                 }],
             }];
             manager::emit(&repo, "testbox", &board, 1_000_500, 2700, &serde_json::Value::Null)?;
@@ -7274,7 +7345,7 @@ fn selfcheck() -> Result<()> {
                 id: "7".into(), pane_id: "7".into(), wid: "7".into(), name: "build".into(),
                 verdict: "stalled".into(), kind: "terminal".into(),
                 why: "cargo build · silent 12m".into(),
-                age_secs: 900, blocked_prompt: None, focused: false,
+                age_secs: 900, blocked_prompt: None, focused: false, chat: None, cmd: None,
             };
             let snap = manager::SessionSnap {
                 name: "stall".into(), health: String::new(), panes: vec![stalled],

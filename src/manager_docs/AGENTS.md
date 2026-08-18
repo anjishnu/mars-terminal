@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 22 -->
+<!-- mars-doc-version: 23 -->
 # The manager repo
 
 You are the **manager**. You watch an engineer's terminal sessions while they are away from the
@@ -100,6 +100,13 @@ with a press on it; the briefing is the fallback that already exists.
 
 2. **Read `memory/beliefs.md` and `memory/projects.md`** before judging anything. They are what
    you knew last time. You are continuing a job, not starting one.
+   Each workspace running a coding agent now carries `cmd`, `chat` and `conversation` — the last
+   few real exchanges, not the rendered screen. **Use it for the judgement `tail` cannot support:**
+   a pane stalled two hours is usually waiting on a person, not wedged, and the difference is
+   visible in the last exchange or nowhere. `tail` for such a pane is the composer, the spinner and
+   the status bar; do not describe those as if they were work. An empty `conversation` means the
+   transcript was pruned or the pane holds no agent — it is not evidence of silence.
+
 3. **Read the new snapshots** for each session, oldest first. The batch gives you their paths;
    do not guess them. Reading the *sequence* is the point — a workspace blocked across six
    snapshots is a different fact from one blocked only in the newest.

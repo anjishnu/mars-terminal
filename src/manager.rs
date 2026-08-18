@@ -36,6 +36,16 @@ pub struct PaneRow {
     pub blocked_prompt: Option<String>,
     /// The pane the engineer is looking at right now. A note about it describes their own screen.
     pub focused: bool,
+    /// WHICH conversation this pane is holding, when it is running a coding agent.
+    ///
+    /// The board has carried this since `board-readership` landed; `PaneRow` had no field for it,
+    /// so `parse_board` read the enriched board and dropped it — which is why every snapshot said
+    /// `chat: null` and why the agent's only material for an agent pane was the last 20 rendered
+    /// lines: the composer, the spinner and the status bar. Chrome, not content.
+    pub chat: Option<String>,
+    /// What the pane is RUNNING, from the PTY's foreground process group (`claude`, `cargo`, …).
+    /// Absent means the pane sits at a prompt — not that nothing is known.
+    pub cmd: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -970,6 +980,10 @@ fn parse_board(json: &str) -> Option<SessionSnap> {
             age_secs: r["ageSecs"].as_u64().unwrap_or(0),
             blocked_prompt: r["blocked"]["prompt"].as_str().map(|s| s.to_string()),
             focused: r["focused"].as_bool().unwrap_or(false),
+            // Both already on the wire. Read them, or the manager keeps judging an agent pane by
+            // its spinner.
+            chat: r["chat"].as_str().filter(|s| !s.is_empty()).map(String::from),
+            cmd: r["cmd"].as_str().filter(|s| !s.is_empty()).map(String::from),
         })
         .collect();
     Some(SessionSnap {
@@ -1822,7 +1836,13 @@ fn run_tally(repo: &Path) -> (u64, u64, serde_json::Value) {
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    let tail: Vec<&serde_json::Value> = all.iter().rev().take(20).collect();
+    // A ROW WITHOUT `ok` IS NOT A RUN, AND MUST NOT COUNT AS A FAILED ONE.
+    //
+    // `runs.jsonl` also carries notes — a watermark saying everything above it was scored by a
+    // comparison that has since been fixed. Read naively, `v["ok"]` is absent, `unwrap_or(false)`
+    // makes it false, and a note explaining a bad tally would itself make the tally worse.
+    let all: Vec<&serde_json::Value> = all.iter().filter(|v| v["ok"].is_boolean()).collect();
+    let tail: Vec<&serde_json::Value> = all.iter().rev().take(20).copied().collect();
     let total = tail.len() as u64;
     let ok = tail.iter().filter(|v| v["ok"].as_bool().unwrap_or(false)).count() as u64;
     // p50 and p90 rather than a mean: run times are long-tailed, and the tail is the thing worth
@@ -2082,6 +2102,8 @@ pub fn recent_runs(repo: &Path, n: usize) -> Vec<serde_json::Value> {
     let rows: Vec<serde_json::Value> = text
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        // Same reason as `run_tally`: a note in the log is not one of the agent's runs.
+        .filter(|v| v["ok"].is_boolean())
         .collect();
     rows.iter()
         .rev()
@@ -2098,6 +2120,61 @@ pub fn recent_runs(repo: &Path, n: usize) -> Vec<serde_json::Value> {
         }))
         .collect()
 }
+
+/// `parse_board` for the selfcheck — the board→snapshot boundary is where two fields were being
+/// silently discarded, so it is worth driving directly rather than through a whole emit.
+pub fn parse_board_for_test(json: &str) -> Option<SessionSnap> {
+    parse_board(json)
+}
+
+/// `clamp_conversation` for the selfcheck.
+pub fn clamp_conversation_for_test(rows: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    clamp_conversation(rows)
+}
+
+/// `run_tally` for the selfcheck — the tally is otherwise only reachable through a full emit.
+pub fn run_tally_for_test(repo: &Path) -> (u64, u64, serde_json::Value) {
+    run_tally(repo)
+}
+
+/// The most text one conversation event may contribute.
+///
+/// SIX EVENTS IS NOT SIX BOUNDED EVENTS. Priced at 1,600–2,900 tokens per agent pane and measured
+/// live at 1,125 and 1,673 — and then at 6,524, because one row held a single enormous tool result.
+/// A window bounded only by count is not bounded, and this snapshot is read on every run that
+/// happens at all.
+///
+/// Trimmed at the tail rather than the head: a long result's verdict is at the end, and the whole
+/// point of carrying the conversation is to see where it got to.
+const CHAT_ROW_CHARS: usize = 900;
+
+/// Trim each event's text so the window is bounded in bytes and not merely in events.
+fn clamp_conversation(mut rows: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    for r in &mut rows {
+        for key in ["text", "summary", "detail"] {
+            let Some(s) = r.get(key).and_then(|v| v.as_str()) else { continue };
+            if s.chars().count() > CHAT_ROW_CHARS {
+                let cut = s.chars().count() - CHAT_ROW_CHARS;
+                let kept: String = s.chars().skip(cut).collect();
+                r[key] = serde_json::json!(format!("…[{cut} chars trimmed]… {kept}"));
+            }
+        }
+    }
+    rows
+}
+
+/// How many conversation events ride in a snapshot, per pane.
+///
+/// Priced against two real transcripts on this machine — 24 text events and 336. The whole of the
+/// second is ~76,000 tokens and grows without bound, so the window is the only affordable shape.
+/// Six costs ~1,600–2,900 tokens per agent pane, roughly doubling a snapshot; twenty costs
+/// ~3,200–6,400 and quadruples it.
+///
+/// Six, because the question this exists to answer is *"stalled two hours — waiting on input, or
+/// wedged?"*, and that is visible in the last exchange or not at all. It is affordable now for a
+/// reason that is not about the number: since the wake gate started testing materiality, most
+/// ticks do not run at all, so this is paid on the runs that were going to think anyway.
+pub const CHAT_WINDOW: usize = 6;
 
 /// The agent's own checklist, as shipped. Exposed so a selfcheck can assert that an instruction
 /// exists — or, more usefully, that a dead one no longer does.
@@ -2342,6 +2419,19 @@ pub fn emit(
                     "kind": p.kind, "why": p.why, "ageSecs": p.age_secs,
                     "blockedPrompt": p.blocked_prompt,
                     "focused": p.focused,
+                    // WHAT THE PANE IS DOING, not what its spinner looks like.
+                    //
+                    // `tail` for an agent pane is the composer, the progress bar and the status
+                    // line — chrome. The conversation is the content, and its id has been on the
+                    // board since `board-readership`; nothing read it. Bounded to the last few
+                    // events: the whole of one transcript here is 76,000 tokens, and a snapshot
+                    // that grows with a conversation is one nobody can afford to read.
+                    "cmd": p.cmd,
+                    "chat": p.chat,
+                    "conversation": p.chat.as_deref()
+                        .and_then(|c| crate::timeline::rows_for(c, CHAT_WINDOW))
+                        .map(|rows| clamp_conversation(crate::timeline::rows_json(&rows)))
+                        .unwrap_or_default(),
                     "output": { "tail": tail, "delta": delta, "signals": sig },
                 })
             }).collect::<Vec<_>>(),
@@ -2738,6 +2828,9 @@ fn read_all_sessions() -> Vec<SessionSnap> {
                     age_secs: w["ageSecs"].as_u64().unwrap_or(0),
                     blocked_prompt: w["blockedPrompt"].as_str().map(|s| s.to_string()),
                     focused: w["focused"].as_bool().unwrap_or(false),
+                    // Reading a STORED snapshot back, so these come from the snapshot's own keys.
+                    chat: w["chat"].as_str().filter(|s| !s.is_empty()).map(String::from),
+                    cmd: w["cmd"].as_str().filter(|s| !s.is_empty()).map(String::from),
                 }).collect::<Vec<_>>()).unwrap_or_default();
                 (v["health"].as_str().unwrap_or_default().to_string(), panes)
             })
