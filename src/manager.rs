@@ -1565,7 +1565,7 @@ fn score_runs(repo: &Path, ts: u64) {
             // mtime — so that timestamp is when WE last wrote the batch (stamping delivered_ts),
             // which made every duration come out as zero. The receipt is the last thing written
             // in a run and is a real write, so its mtime is the honest finish time.
-            let finished = mtime_secs(&repo.join("runs").join(&name)).max(mtime_secs(&path));
+            let finished = mtime_secs(&receipt_path_for(repo, &name)).max(mtime_secs(&path));
             let duration = (delivered > 0 && finished >= delivered).then(|| finished - delivered);
 
             let sessions = batch["sessions"].as_array().cloned().unwrap_or_default();
@@ -1574,7 +1574,24 @@ fn score_runs(repo: &Path, ts: u64) {
             // rather than checking a fixed list of files exists — see `docs/receipts.md`. A rule
             // of "produce a file per workspace" reliably produces a file per workspace, including
             // for the workspaces that did not change, which is the padding we are trying to stop.
-            let receipt: serde_json::Value = std::fs::read_to_string(repo.join("runs").join(&name))
+            // D3. A receipt under a NEAR-MISS filename and an absent run are opposite facts
+            // about the agent, and reading one as the other tunes the manager backwards.
+            //
+            // `docs/receipts.md` said to write `runs/<batch-filename>.json`, and the batch
+            // filename already ends in `.json` — so a literal reading produces `….json.json`.
+            // Twelve receipts on this host are named that way, including recent ones, and every
+            // one of them scored as a run that did nothing at all. The contract is fixed too, but
+            // the reader accepts both spellings and says which it found.
+            let rdir = repo.join("runs");
+            let documented = rdir.join(&name);
+            let (rpath, misnamed) = if documented.exists() {
+                (documented, None)
+            } else {
+                let alt = rdir.join(format!("{name}.json"));
+                let found = alt.exists().then(|| alt.clone());
+                (alt, found)
+            };
+            let receipt: serde_json::Value = std::fs::read_to_string(&rpath)
                 .ok()
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or_else(|| serde_json::json!({}));
@@ -1615,16 +1632,39 @@ fn score_runs(repo: &Path, ts: u64) {
             // 2. Every session in the batch must be accounted for — written about, or skipped
             //    WITH A REASON. Silence is the only thing not allowed; deciding there is nothing
             //    to say is a valid outcome and is recorded as one.
+            //
+            // D2. THE BATCH CARRIES TWO SPELLINGS OF ONE IDENTITY, AND THIS COMPARED THE WRONG
+            // ONE. Every entry has both `id` and `name`; the skip list was matched against the
+            // NAME while the cursor check below uses the ID, and the receipts on disk key their
+            // skips by id — 552 by `"0"`, 546 by `"1"`. So `skipped` could never match, and the
+            // only way left to score a clean run was for `claimed` to hold a path under the
+            // session's dir: that is, to WRITE A FILE.
+            //
+            // Which is the exact behaviour `docs/receipts.md` opens by rejecting — "a rule that
+            // says 'write a file per workspace' reliably produces a file per workspace, including
+            // for the workspaces that did not change". The design was right and this line
+            // delivered its opposite, at a cost of 363 faults and, most likely, a briefing
+            // rewritten over a board that had not moved.
+            //
+            // The id is canonical — a name is a label the engineer changes — but a receipt keyed
+            // by name is still a true account of the run, so both are accepted. That is a
+            // compatibility shim, not the design; the doc now says which one to use.
             for sess in &sessions {
+                let sid = sess["id"].as_str().unwrap_or_default();
                 let sname = sess["name"].as_str().unwrap_or_default();
                 let dir = sess["dir"].as_str().unwrap_or_default();
                 let touched = claimed.iter().any(|f| f.starts_with(dir));
                 let skipped = receipt["skipped"].as_array().is_some_and(|a| {
-                    a.iter().any(|k| k["session"].as_str() == Some(sname)
-                        && k["why"].as_str().is_some_and(|w| !w.trim().is_empty()))
+                    a.iter().any(|k| {
+                        let key = k["session"].as_str().unwrap_or_default();
+                        !key.is_empty()
+                            && (key == sid || key == sname)
+                            && k["why"].as_str().is_some_and(|w| !w.trim().is_empty())
+                    })
                 });
                 if !touched && !skipped {
-                    faults.push(serde_json::json!({ "kind": "unaccounted", "session": sname }));
+                    // Reported by ID, so the fault names the same identity the cursor does.
+                    faults.push(serde_json::json!({ "kind": "unaccounted", "session": sid }));
                 }
             }
             // 3. The cursor may not advance past what the batch actually offered — that would
@@ -1644,6 +1684,13 @@ fn score_runs(repo: &Path, ts: u64) {
             let no_receipt = receipt.get("wrote").is_none();
             if no_receipt {
                 faults.push(serde_json::json!({ "kind": "no-receipt" }));
+            }
+            // Its own kind, deliberately. Folding it into `no-receipt` would keep saying the run
+            // produced nothing, which is the misreading this exists to end.
+            if let Some(p) = misnamed {
+                faults.push(serde_json::json!({
+                    "kind": "receipt-misnamed", "found": p.display().to_string(),
+                }));
             }
             lines.push_str(&format!(
                 "{}\n",
@@ -1927,6 +1974,22 @@ fn seed(path: &Path, body: &str) -> Result<()> {
 
 /// Seed a repo's standing orders, for a test that needs the real upgrade path rather than a
 /// pristine one built from the built-ins.
+/// Where a run's receipt actually is.
+///
+/// Two spellings because the contract was ambiguous: the documented name, and the one a literal
+/// reading of it produces (`<batch>.json` where `<batch>` already ends in `.json`). Shared so the
+/// finish-time stat and the receipt read cannot look in different places — which is how a run
+/// could be timed from a file that was never opened.
+pub fn receipt_path_for(repo: &Path, name: &str) -> PathBuf {
+    let rdir = repo.join("runs");
+    let documented = rdir.join(name);
+    if documented.exists() {
+        documented
+    } else {
+        rdir.join(format!("{name}.json"))
+    }
+}
+
 /// The same hash `docs_drift` blesses by, for the build-time lock. One hash function for one
 /// question, so the lock can never disagree with the gate.
 /// Will the next run be allowed to start, as far as the standing orders are concerned?

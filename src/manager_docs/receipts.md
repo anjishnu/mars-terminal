@@ -1,7 +1,7 @@
-<!-- mars-doc-version: 2 -->
+<!-- mars-doc-version: 3 -->
 # Run receipts
 
-At the end of every run, write `~/.mars/manager/runs/<batch-filename>.json` — your own account of
+At the end of every run, write `~/.mars/manager/runs/<batch-filename>` — your own account of
 what you just did. Mars checks that account against the filesystem.
 
 ```json
@@ -33,6 +33,16 @@ verifies the statement. Three things are checked, and only these:
 1. **Every file you say you wrote exists and post-dates the batch.** This catches the failure that
    matters most — a run that reports success and wrote nothing, which from the outside is
    indistinguishable from a quiet board.
+**The filename is the batch's own, unchanged.** The batch is `batch-2026-07-30T05-10-00Z.json`,
+so the receipt is `runs/batch-2026-07-30T05-10-00Z.json` — do not append a second `.json`. Twelve
+receipts on this machine were written as `….json.json`, and every one of them was scored as a run
+that did nothing, because the reader could not find it.
+
+**`skipped[].session` and `cursor` both use the session's `id`, not its `name`.** The batch gives
+you both — `{"id": "1", "name": "replyguy", …}` — and the id is the one that means something: a
+name is a label the engineer can change between runs. A receipt keyed by name is still accepted, so
+an old one does not suddenly fail, but write the id.
+
 2. **Every session in the batch is accounted for** — written about, or in `skipped` with a
    non-empty reason. Deciding there is nothing to say is a correct outcome and is recorded as
    one. Silence is the only thing that counts as a fault.

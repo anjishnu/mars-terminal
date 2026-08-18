@@ -6635,7 +6635,10 @@ fn selfcheck() -> Result<()> {
             let _ = std::fs::remove_file(repo.join("memory/runs.jsonl"));
             std::fs::write(repo.join("inbox/done").join(batch), serde_json::json!({
                 "opened_ts": opened,
-                "sessions": [{ "id": "0", "name": "0", "dir": sdir.display().to_string(),
+                // ID AND NAME MUST DIFFER HERE. They were both "0", which made the two
+                // identities indistinguishable — so a scorer comparing the wrong one passed this
+                // check for 789 real runs while never matching a single receipt on disk.
+                "sessions": [{ "id": "0", "name": "replyguy", "dir": sdir.display().to_string(),
                                "snapshots": ["a.json", "b.json"] }],
             }).to_string()).unwrap();
             std::fs::write(repo.join("runs").join(batch), receipt.to_string()).unwrap();
@@ -6690,6 +6693,38 @@ fn selfcheck() -> Result<()> {
         assert!(skipped["ok"].as_bool().unwrap_or(false),
             "a reasoned skip was scored as a failure — writing nothing must stay a success: {skipped}");
 
+        // The fault names the ID, so it says the same thing the cursor check does.
+        assert!(silent["faults"].as_array().is_some_and(|a| a.iter()
+            .any(|f| f["kind"] == "unaccounted" && f["session"] == "0")),
+            "the fault must name the session by id: {silent}");
+
+        // ...AND a skip keyed by NAME is still a true account of the run. The id is canonical —
+        // a name is a label the engineer changes — but an agent that used the name described what
+        // it did, and scoring that as silence is what taught the agent to pad.
+        let by_name = score("batch-skip-name.json", serde_json::json!({
+            "wrote": [], "skipped": [{"session": "replyguy", "why": "nothing moved"}],
+            "cursor": { "0": "b.json" },
+        }), 7_000_000, false);
+        assert!(by_name["ok"].as_bool().unwrap_or(false),
+            "a skip keyed by name scored as silence: {by_name}");
+
+        // A skip naming NEITHER identity is still silence — the shim accepts two spellings of one
+        // session, not any string at all.
+        let wrong = score("batch-skip-wrong.json", serde_json::json!({
+            "wrote": [], "skipped": [{"session": "some-other-box", "why": "nothing moved"}],
+            "cursor": { "0": "b.json" },
+        }), 7_000_000, false);
+        assert!(kinds(&wrong).iter().any(|k| k == "unaccounted"),
+            "a skip for a session not in the batch cleared the fault: {wrong}");
+
+        // An empty reason is not a reason, whichever key it is filed under.
+        let empty = score("batch-skip-empty.json", serde_json::json!({
+            "wrote": [], "skipped": [{"session": "0", "why": "   "}],
+            "cursor": { "0": "b.json" },
+        }), 7_000_000, false);
+        assert!(kinds(&empty).iter().any(|k| k == "unaccounted"),
+            "a skip with a blank reason passed as accounted: {empty}");
+
         // Cursor past what the batch offered: marking snapshots read that nobody read.
         let overrun = score("batch-overrun.json", serde_json::json!({
             "wrote": [brief], "skipped": [], "cursor": { "0": "z.json" },
@@ -6701,7 +6736,7 @@ fn selfcheck() -> Result<()> {
         let _ = std::fs::remove_file(repo.join("runs/batch-none.json"));
         std::fs::write(repo.join("inbox/done/batch-none.json"), serde_json::json!({
             "opened_ts": 7_000_000u64,
-            "sessions": [{ "id": "0", "name": "0", "dir": sdir.display().to_string(),
+            "sessions": [{ "id": "0", "name": "replyguy", "dir": sdir.display().to_string(),
                            "snapshots": ["a.json"] }],
         }).to_string())?;
         let _ = std::fs::remove_file(repo.join("memory/runs.jsonl"));
@@ -6709,7 +6744,44 @@ fn selfcheck() -> Result<()> {
         let log = std::fs::read_to_string(repo.join("memory/runs.jsonl")).unwrap_or_default();
         assert!(log.contains("no-receipt"), "a run with no receipt scored clean: {log}");
 
+        // A RECEIPT UNDER A NEAR-MISS NAME IS NOT AN ABSENT RUN. The contract said
+        // `runs/<batch-filename>.json` and the batch filename already ends in `.json`, so a
+        // literal reading produced `….json.json` — twelve of them on this host, every one scored
+        // as a run that did nothing at all.
+        {
+            let batch = "batch-misnamed.json";
+            let _ = std::fs::remove_file(repo.join("runs").join(batch));
+            std::fs::write(repo.join("inbox/done").join(batch), serde_json::json!({
+                "opened_ts": 7_000_000u64,
+                "sessions": [{ "id": "0", "name": "replyguy", "dir": sdir.display().to_string(),
+                               "snapshots": ["a.json"] }],
+            }).to_string())?;
+            // Written the way a literal reading of the old contract produces.
+            std::fs::write(repo.join("runs").join(format!("{batch}.json")), serde_json::json!({
+                "wrote": [], "skipped": [{"session": "0", "why": "nothing moved"}],
+                "cursor": { "0": "a.json" },
+            }).to_string())?;
+            let _ = std::fs::remove_file(repo.join("memory/runs.jsonl"));
+            manager::emit(&repo, "testbox", &[], 7_000_300, 2700, &serde_json::Value::Null)?;
+            let log = std::fs::read_to_string(repo.join("memory/runs.jsonl")).unwrap_or_default();
+            let row: serde_json::Value = log.lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .find(|v: &serde_json::Value| v["batch"].as_str() == Some(batch))
+                .expect("the misnamed run was not scored at all");
+            let ks = kinds(&row);
+            assert!(ks.iter().any(|k| k == "receipt-misnamed"),
+                "a receipt under the near-miss name was not reported as such: {row}");
+            // The point of the separate kind: the run's CONTENT must now read correctly.
+            assert!(!ks.iter().any(|k| k == "no-receipt"),
+                "a found receipt still scored as absent: {row}");
+            assert!(!ks.iter().any(|k| k == "unaccounted"),
+                "the receipt was found but its skips were ignored: {row}");
+            let _ = std::fs::remove_file(repo.join("runs").join(format!("{batch}.json")));
+        }
+
         println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
+        println!("[selfcheck] manager: a session's id and name are both accepted, neither guessed ... PASS");
+        println!("[selfcheck] manager: a misnamed receipt is found and named, not read as absent ... PASS");
 
         {
             use manager::suggested_rename as sr;
