@@ -126,10 +126,18 @@ The daily rhythm:
 `mars ls` tells you the state at a glance:
 
 ```
-SESSION              STATUS
-work                 detached — reattach: mars attach work
-review               attached
+  #  SESSION            WHERE  DIR                      STATUS             AS OF    SUMMARY
+  1  work               local  ~/Code/api               detached           now      → ship the retry backoff
+  2  review             local  ~/Code/api +1            attached           now      failed: 3 tests red · 2h ago
+  3  gpubox             remote —                        agent active       16d ago
 ```
+
+`DIR` is where the session's workspaces were opened (`+1` = one more workspace in a
+different directory); it comes from the session's restore manifest, so it is the
+directory a tab was *spawned* in, not a live `pwd`. Remotes show `—` — nothing
+records a remote's working directory. On a narrow terminal the column gives way to
+an indented `↳ ~/Code/api` line under each row, and `#` or a name prefix at the
+follow-up prompt opens that session.
 
 Safety nets, on by default: modified files autosave every 30s and on every
 detach/disconnect (scratch buffers are never touched), and each daemon logs to
