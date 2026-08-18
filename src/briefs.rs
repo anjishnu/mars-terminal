@@ -141,7 +141,32 @@ pub struct Brief {
     /// file with that churn is a pointer the next rewrite drops. The memo surface computes the
     /// reverse index by reading this directory.
     pub addresses: Vec<String>,
+    /// Where the work happens, recorded at MINT time from the pane the draft was pressed in.
+    ///
+    /// A brief without this is a brief whose acceptance nobody can check: `verify:` names commands
+    /// and commands need a directory, and by the time anyone asks, the pane may hold something
+    /// else entirely. Captured once, when it is a fact.
+    pub repo: Option<PathBuf>,
+    /// The commands that decide whether this was built. Run by MARS, never by the worker — see
+    /// `verify`.
+    pub verify: Vec<String>,
     pub created_ts: u64,
+}
+
+/// One verify command and what actually happened when it ran.
+#[derive(Clone, Debug)]
+pub struct VerifyRow {
+    pub cmd: String,
+    /// `None` when the command never ran — refused, or the program is not on this machine. A
+    /// missing exit code and a non-zero one are different facts and must not render the same.
+    pub exit: Option<i32>,
+    pub note: String,
+}
+
+impl VerifyRow {
+    pub fn ok(&self) -> bool {
+        self.exit == Some(0)
+    }
 }
 
 /// Read one brief. `None` when the directory holds no `brief.md`, which is how a half-created or
@@ -165,6 +190,8 @@ pub fn read(brief_dir: &Path) -> Option<Brief> {
         priority: f("priority").and_then(|p| p.parse().ok()).unwrap_or(0),
         branch: f("branch").filter(|b| !b.is_empty() && b != "null"),
         addresses: parse_addresses(front),
+        repo: f("repo").filter(|r| !r.is_empty() && r != "null").map(PathBuf::from),
+        verify: parse_list(front, "verify:"),
         created_ts: f("created_ts").and_then(|t| t.parse().ok()).unwrap_or(0),
         id,
     })
@@ -190,6 +217,29 @@ fn parse_addresses(front: &str) -> Vec<String> {
             let memo = between(t, "memo:", '}').unwrap_or_default();
             if !memo.is_empty() {
                 out.push(if session.is_empty() { memo } else { format!("{session}/{memo}") });
+            }
+        }
+    }
+    out
+}
+
+/// A YAML list of plain strings under `key`. Hand-parsed for the same reason `parse_addresses` is:
+/// a malformed list must cost one field, never the whole document.
+fn parse_list(front: &str, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in front.lines() {
+        if line.starts_with(key) {
+            // `verify: []` on one line is an empty list, not the start of one.
+            inside = !line[key.len()..].trim().starts_with('[');
+            continue;
+        }
+        if inside {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix('-') else { break };
+            let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            if !v.is_empty() {
+                out.push(v.to_string());
             }
         }
     }
@@ -222,7 +272,7 @@ pub fn list() -> Vec<Brief> {
 /// Returns the id and the path. Fails rather than overwrites: an id collides only when two briefs
 /// were minted in the same second with the same title, and silently clobbering the first is worse
 /// than making the second press again.
-pub fn create(title: &str, ts: u64) -> std::io::Result<(String, PathBuf)> {
+pub fn create(title: &str, ts: u64, repo: Option<&Path>) -> std::io::Result<(String, PathBuf)> {
     let id = mint_id(title, ts);
     let root = dir().ok_or_else(|| std::io::Error::other("no home directory"))?;
     let bdir = root.join(&id);
@@ -234,7 +284,7 @@ pub fn create(title: &str, ts: u64) -> std::io::Result<(String, PathBuf)> {
             format!("{} already exists", path.display()),
         ));
     }
-    std::fs::write(&path, template(&id, title, ts))?;
+    std::fs::write(&path, template(&id, title, ts, repo))?;
     let _ = scaffold();
     Ok((id, path))
 }
@@ -343,6 +393,158 @@ fn deny_section(argv: &str) -> &str {
     match argv.find("--allowedTools") {
         Some(a) if a > d => &argv[d..a],
         _ => &argv[d..],
+    }
+}
+
+/// Split a verify command into argv, or refuse it.
+///
+/// **There is no shell anywhere in this path, and that is the whole security argument.** These
+/// strings are written by a planner — a model — into a file, and then executed by the daemon. Run
+/// through `sh -c` they would be arbitrary code with the user's privileges; run as argv they can
+/// only start a program with arguments, which is exactly what a verify command is.
+///
+/// So any byte that only means something to a shell is a refusal rather than an escape. That also
+/// makes PLANNING-MODEL's "one plain command per entry" rule mechanical instead of advisory: a
+/// planner that writes `source x && y` gets a refusal naming the character, not a command that
+/// quietly does more than it looks like.
+pub fn verify_argv(cmd: &str) -> Result<Vec<String>, String> {
+    const SHELL_ONLY: &[char] = &['&', '|', ';', '$', '`', '>', '<', '(', ')', '{', '}', '*', '?', '~', '!', '\n'];
+    if let Some(c) = cmd.chars().find(|c| SHELL_ONLY.contains(c)) {
+        return Err(format!(
+            "{c:?} only means something to a shell, and there is no shell here — \
+             write one plain command per verify entry"
+        ));
+    }
+    // Quotes are honoured so an argument may contain spaces; nothing else about them is special.
+    let mut argv: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for ch in cmd.chars() {
+        match ch {
+            '"' | '\'' if quote.is_none() => quote = Some(ch),
+            c if Some(c) == quote => quote = None,
+            c if c.is_whitespace() && quote.is_none() => {
+                if !cur.is_empty() {
+                    argv.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote".into());
+    }
+    if !cur.is_empty() {
+        argv.push(cur);
+    }
+    if argv.is_empty() {
+        return Err("empty command".into());
+    }
+    // AND argv[0] MUST NOT BE AN INTERPRETER.
+    //
+    // Filtering metacharacters does nothing if the shell is the program: `sh -c "…"` carries its
+    // whole payload inside a quoted argument, where no character is special. Found by a selfcheck
+    // that then went on to run what it had smuggled, which is the most direct possible proof that
+    // the character filter alone was not a boundary.
+    //
+    // This closes the escalation from "one command" to "arbitrary code". It does NOT make an
+    // arbitrary command safe — `verify: ["rm -rf ~"]` needs no interpreter — and nothing here
+    // pretends otherwise. What makes the list safe to run is that a human reads it: the commands
+    // are shown on the approval card, and pressing assign is the authorization.
+    const INTERPRETERS: &[&str] = &[
+        "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "ash",
+        "env", "eval", "exec", "xargs", "nohup", "sudo", "doas", "ssh", "script",
+        "python", "python2", "python3", "perl", "ruby", "node", "deno", "bun", "osascript",
+    ];
+    let prog = std::path::Path::new(&argv[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&argv[0]);
+    if INTERPRETERS.contains(&prog) {
+        return Err(format!(
+            "{prog:?} runs whatever it is handed, so a quoted argument would be a shell by another \
+             name — name the program the check actually runs"
+        ));
+    }
+    Ok(argv)
+}
+
+/// Run a brief's `verify:` commands and report what actually happened.
+///
+/// **Mars runs these, not the worker, and that is a change of who is trusted.** A worker running
+/// its own acceptance checks and then writing down its own exit codes is grading its own homework;
+/// nothing downstream could tell a passing run from a confident claim. Worse, in practice it did
+/// not even get that far — every verify command hit a permission prompt, so an unattended worker
+/// stopped dead at the first one and waited for a human who by construction was not there.
+///
+/// Both problems have the same fix. The commands are in the brief's frontmatter, and a human read
+/// them when they approved it, which is the moment they were actually reading. So run them here,
+/// observe the exit codes, and let the worker get on with building.
+///
+/// Computed on demand, never stored: a verification is a fact about a tree at a moment, and a
+/// recorded one starts lying the next time anybody commits.
+pub fn verify(b: &Brief, timeout: std::time::Duration) -> Vec<VerifyRow> {
+    let Some(repo) = b.repo.as_ref().filter(|r| r.is_dir()) else {
+        return b.verify.iter().map(|c| VerifyRow {
+            cmd: c.clone(),
+            exit: None,
+            note: match &b.repo {
+                Some(r) => format!("{} is not a directory any more", r.display()),
+                None => "this brief records no repo — it predates `repo:` in the template".into(),
+            },
+        }).collect();
+    };
+    b.verify.iter().map(|cmd| {
+        let argv = match verify_argv(cmd) {
+            Ok(a) => a,
+            Err(why) => return VerifyRow { cmd: cmd.clone(), exit: None, note: format!("refused: {why}") },
+        };
+        match run_argv(&argv, repo, timeout) {
+            Ok((code, tail)) => VerifyRow { cmd: cmd.clone(), exit: Some(code), note: tail },
+            Err(why) => VerifyRow { cmd: cmd.clone(), exit: None, note: why },
+        }
+    }).collect()
+}
+
+/// Run one argv in a directory, with a wall-clock bound. Returns the exit code and the tail of
+/// whatever it said — the last few lines, because that is where a build puts its verdict.
+fn run_argv(
+    argv: &[String],
+    dir: &Path,
+    timeout: std::time::Duration,
+) -> Result<(i32, String), String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run {:?}: {e}", argv[0]))?;
+    // A verify command that never returns must not hold the daemon. Polled rather than blocked on,
+    // so the bound is real; a command still running at the deadline is reported as unfinished
+    // rather than waited out, because "we do not know" is the honest answer and a hang is a defect
+    // in the brief worth seeing.
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = child.wait_with_output().map(|o| {
+                    let mut s = String::from_utf8_lossy(&o.stdout).to_string();
+                    s.push_str(&String::from_utf8_lossy(&o.stderr));
+                    s
+                }).unwrap_or_default();
+                let tail = out.lines().rev().take(3).collect::<Vec<_>>()
+                    .into_iter().rev().collect::<Vec<_>>().join(" · ");
+                return Ok((status.code().unwrap_or(-1), tail.chars().take(300).collect()));
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                return Err(format!("still running after {}s", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(120)),
+            Err(e) => return Err(format!("{e}")),
+        }
     }
 }
 
@@ -515,7 +717,8 @@ pub fn doc_version(text: &str) -> u32 {
 /// Note that every fork ships with an option already chosen. Three options and no recommendation
 /// reads as thorough and is an abdication: it hands the reader the work the document existed to
 /// do. The reader OVERRIDES a choice; they do not ANSWER a question.
-pub fn template(id: &str, title: &str, ts: u64) -> String {
+pub fn template(id: &str, title: &str, ts: u64, repo: Option<&Path>) -> String {
+    let repo = repo.map(|r| r.display().to_string()).unwrap_or_else(|| "null".into());
     format!(
         "---\n\
          id: {id}\n\
@@ -523,6 +726,7 @@ pub fn template(id: &str, title: &str, ts: u64) -> String {
          priority: 50\n\
          created_ts: {ts}\n\
          branch: {id}\n\
+         repo: {repo}\n\
          addresses: []\n\
          verify: []\n\
          ---\n\
@@ -561,6 +765,9 @@ pub fn template(id: &str, title: &str, ts: u64) -> String {
          ### Artefact 2 of 3\n\
          \n\
          ### Artefact 3 of 3\n\
+         \n\
+         `verify:` is run by MARS, not by the worker — one plain command per entry, no shell\n\
+         metacharacters, since there is no shell.\n\
          \n\
          ## Acceptance\n\
          \n\

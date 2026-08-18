@@ -1820,6 +1820,27 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 });
             }
         }
+        // Acceptance, observed rather than reported. Runs the brief's own commands here, in the
+        // directory the brief recorded, with no shell anywhere in the path.
+        Some("brief.verify") => {
+            let id = v.get("brief").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let tx2 = tx.clone();
+            // Off the reader thread: a build is minutes, and the bridge must keep serving the
+            // board while it runs — a phone that goes dead during a verify looks like a crash.
+            std::thread::spawn(move || {
+                let rows = crate::briefs::dir()
+                    .filter(|_| crate::briefs::safe_id(&id))
+                    .and_then(|root| crate::briefs::read(&root.join(&id)))
+                    .map(|b| crate::briefs::verify(&b, std::time::Duration::from_secs(600)))
+                    .unwrap_or_default();
+                let out: Vec<serde_json::Value> = rows.iter()
+                    .map(|r| serde_json::json!({"cmd": r.cmd, "exit": r.exit, "note": r.note}))
+                    .collect();
+                let _ = tx2.send(serde_json::json!({
+                    "t": "brief.verified", "brief": id, "rows": out,
+                }).to_string());
+            });
+        }
         // Same, for the planner scope — the one role allowed to write a brief.
         Some("brief.planner") => {
             if let Some(pane) = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()) {

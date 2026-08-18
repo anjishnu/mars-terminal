@@ -2226,7 +2226,12 @@ impl App {
             );
         }
         let ts = crate::worklog::now_secs();
-        let (id, _path) = crate::briefs::create(title, ts).map_err(|e| e.to_string())?;
+        // The pane's own directory, captured now. This is the only moment it is knowable without
+        // guessing: by the time anyone runs the brief's verify commands, the pane may hold
+        // something else, or nothing.
+        let repo = self.terms.get(&tid).and_then(|t| t.spawn_cwd.clone());
+        let (id, _path) =
+            crate::briefs::create(title, ts, repo.as_deref()).map_err(|e| e.to_string())?;
         let msg = crate::briefs::draft_assignment(&id, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
             t.send_bytes(crate::briefs::typed_bytes(&msg).as_bytes());

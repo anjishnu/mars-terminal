@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 2 -->
+<!-- mars-doc-version: 3 -->
 # How we work here
 
 You are a worker. You have been handed one brief and nothing else. This file is the whole protocol;
@@ -112,8 +112,6 @@ files: [src/rover/ui/MissionSurface.tsx]
 acceptance:
   - {n: 1, met: true}
   - {n: 2, met: false, why: "needs a device; could not verify headless"}
-verify:
-  - {cmd: "npx tsc --noEmit", exit: 0}
 ---
 ## What I did
 ## What I did not do, and why
@@ -137,10 +135,20 @@ still leaves a report somebody can read.
 
 ## Verify before you claim
 
-Your brief carries `verify:` commands. Run them. Put their real exit codes in `completed.md`.
+**You do not run the brief's `verify:` commands. Mars does.**
 
-`outcome: done` is your word, and it is checked: the branch must exist, the files you named must
-actually have changed, and the commands you claimed must actually have exited zero. A file changed
+They are in the brief's frontmatter, a human read them when they approved it, and Mars runs them in
+the recorded directory and observes the exit codes. Two reasons, and the second is the one that
+bites: an agent that runs its own acceptance checks and then writes down its own exit codes is
+grading its own homework — and in practice it never even got that far, because every one of those
+commands hit a permission prompt and stopped a worker that had nobody there to answer it.
+
+So build the thing, and leave the verdict to something that is not you. `mars brief verify <id>`
+is how a human sees it, and the phone has a press for the same thing.
+
+That does **not** make you incurious. Build, run, and iterate however you like while you work —
+what changes is only who writes the verdict down. `outcome: done` is still your word and is still
+checked: the branch must exist, and the files you named must actually have changed. A file changed
 with no matching revision in `in_process.md` is a mismatch somebody will ask about.
 
 The standard here is the same one applied everywhere else in this system — **a skip with a reason
@@ -160,6 +168,7 @@ outcome without opening anything.
 |---|---|
 | edit `brief.md` or this file | you would be changing what was approved, or the rules you are judged against |
 | work on `main`, or merge | a human verifies and merges; that is a second decision |
+| run the brief's `verify:` commands | Mars runs them and observes the codes; yours would be a claim |
 | widen the brief | anything outside `## Acceptance` goes in `## Notes for later` |
 | wait when blocked | write the question, print `BLOCKED:`, stop |
 | start work you noticed yourself | notes go in `completed.md`; a human decides what becomes work |
