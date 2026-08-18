@@ -217,6 +217,36 @@ pub fn install_panic_restore() {
 
 // ── Socket paths ─────────────────────────────────────────────────────────────
 
+/// Mention Rover exactly once, ever, on this machine.
+///
+/// **Nothing in Mars mentions Rover today.** A person can use Mars for months without learning
+/// that their sessions are reachable from a phone, because the only route to that knowledge is a
+/// command they have no reason to guess. One line, on the first session this machine ever creates.
+///
+/// Marked by a file rather than by a counter, because the question is "has this been said" and a
+/// count would have to be right about every path that says it. Absent marker → say it; then the
+/// marker exists and no path says it again, including this one.
+pub fn mention_rover_once() {
+    let Some(home) = crate::sys::paths::home_dir() else { return };
+    let marker = home.join(".mars").join("rover-mentioned");
+    if marker.exists() {
+        return;
+    }
+    if let Some(d) = marker.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    // Written BEFORE printing. If the write fails the line is skipped rather than repeated
+    // forever — a hint that reappears every session is an advert, and this gets one chance.
+    if std::fs::write(&marker, "shown\n").is_err() {
+        return;
+    }
+    println!(
+        "  \x1b[38;5;208mRover\x1b[0m — these sessions are readable from a phone or another browser."
+    );
+    println!("  Run \x1b[1mmars pair --open\x1b[0m here, or \x1b[1mmars pair\x1b[0m for a phone. Shown once.");
+    println!();
+}
+
 pub fn socket_dir() -> Result<PathBuf> {
     let base = std::env::var_os(RUNTIME_DIR_ENV)
         .map(PathBuf::from)

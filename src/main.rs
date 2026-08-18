@@ -421,6 +421,8 @@ fn main() -> Result<()> {
             let name = args
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("usage: mars new <name> [file]"))?;
+            // First session this machine ever makes: say Rover exists. Once, then never.
+            session::mention_rover_once();
             return session::session_main(&name, args.next());
         }
         // Reattach: named, or the most recently active session.
@@ -428,6 +430,10 @@ fn main() -> Result<()> {
             return session::resume_main(args.next());
         }
         Some("ls") | Some("list") | Some("--list") => {
+            // Also here, sharing the one marker: a person who reaches `mars ls` before `mars new`
+            // is exactly the person who has not found Rover yet, and the TUI would have wiped the
+            // line on session start anyway.
+            session::mention_rover_once();
             let interactive = !args.any(|a| a == "--no-prompt");
             return session::list_main(interactive);
         }
@@ -763,6 +769,10 @@ fn main() -> Result<()> {
             }
             if has("--link") {
                 return serve::link_main(session);
+            }
+            // The desktop case: no QR, no paste, no phone. See `serve::open_main`.
+            if has("--open") {
+                return serve::open_main(session);
             }
             // Pin the tunnel URL. Without it ngrok mints a fresh random host on every restart, so
             // every phone must re-scan — the most common way Rover "stops working". It lived only

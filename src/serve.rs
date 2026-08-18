@@ -134,27 +134,107 @@ fn daemon_fingerprint(session: &str) -> String {
 
 // ── mars qr ──────────────────────────────────────────────────────────────────
 
-pub fn qr_main(session_arg: Option<String>) -> Result<()> {
-    let session = resolve_session(session_arg)?;
+/// The LAN pairing link: the bundle served by THIS host, with the credentials in the fragment.
+///
+/// One builder, because it is now printed as a QR, opened in a browser and named in the pair
+/// output. Three copies of a URL whose fragment carries a single-use token is three chances for
+/// one of them to drift into a link that looks right and pairs nothing.
+///
+/// The fragment, never a query — it stays out of server logs and out of the Referer header.
+pub fn lan_pair_url(session: &str) -> Result<String> {
     let ip = lan_ip();
     let port = DEFAULT_PORT;
     let token = mint_token()?;
-    let fp = daemon_fingerprint(&session);
-
-    // The phone loads the app and reads endpoint+identity+token from the FRAGMENT
-    // (never a query — it stays out of server logs). LAN prototype: ws:// same host.
+    let fp = daemon_fingerprint(session);
     let endpoint = format!("ws://{ip}:{port}/ws");
-    let url = format!(
+    Ok(format!(
         "http://{ip}:{port}/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    );
+    ))
+}
+
+/// `mars pair --open` — the desktop case, with no pairing step at all.
+///
+/// **The most common way somebody first meets Rover is sitting at the machine running it**, and
+/// until now that path went through a phone camera: print a QR, pick up a handset, scan a screen
+/// you are already looking at. The link that QR encodes already works in a browser, already serves
+/// the bundle from this host, and already carries the credentials in its fragment — so the session
+/// is paired before first paint and there is nothing to type, scan or paste.
+///
+/// LAN only, and that is not a limitation to paper over: the hosted site is `https`, and a page on
+/// `https` cannot dial `ws://192.168.x.x`. Serving the bundle from the host is what makes the
+/// origin match. `mars pair` (tunnel) is the answer for a phone that is not on this wifi.
+pub fn open_main(session_arg: Option<String>) -> Result<()> {
+    let session = resolve_session(session_arg)?;
+    let url = lan_pair_url(&session)?;
+
+    // Printed BEFORE the open, and printed whether or not it succeeds. A browser that does not
+    // come up must still leave the person holding the link, rather than a command that appeared
+    // to do nothing.
+    println!("  \x1b[38;5;208mRover\x1b[0m — opening  ·  session \x1b[1m{session}\x1b[0m");
+    println!("  {url}");
+
+    match open_in_browser(&url) {
+        Ok(()) => {
+            println!();
+            println!("  Paired on open — no QR, no paste. This link is single-use.");
+            println!("  On your phone instead:  mars pair");
+        }
+        Err(e) => {
+            println!();
+            println!("  Could not open a browser here ({e}).");
+            println!("  Paste the link above into one on this machine — it is already paired.");
+        }
+    }
+    Ok(())
+}
+
+/// Hand a URL to the desktop's own browser. Not a shell — the URL carries a single-use token, and
+/// a token spliced into a shell line is a token in somebody's history.
+fn open_in_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    let status = cmd
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("exit {}", status.code().unwrap_or(-1))
+    }
+}
+
+pub fn qr_main(session_arg: Option<String>) -> Result<()> {
+    let session = resolve_session(session_arg)?;
+    let url = lan_pair_url(&session)?;
 
     print_wordmark();
     println!();
+    // LED BY WHERE YOU ARE, NOT BY THE MECHANISM.
+    //
+    // This screen used to open with a QR, which answers "how" before anyone has decided "which".
+    // The QR only serves one of the three cases — a phone on this wifi — and it is the case a
+    // person sitting at this machine is least likely to be in. Three routes, each named by the
+    // situation it belongs to, and the mechanism second.
+    println!("  \x1b[38;5;208mRover\x1b[0m — your sessions, on a screen  ·  session \x1b[1m{session}\x1b[0m");
+    println!();
+    println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
+    println!("  \x1b[1mOn your phone\x1b[0m        scan the code below     same wifi as this machine");
+    println!("  \x1b[1mAnother computer\x1b[0m     paste the link below    any network, via the tunnel");
+    println!();
     print_qr(&url);
     println!();
-    println!("  \x1b[38;5;208mRover\x1b[0m — scan to pair  ·  session \x1b[1m{session}\x1b[0m");
-    println!("  same wifi · link is single-use · run `mars serve` to accept the connection");
     println!("  {url}");
+    println!("  single-use  ·  `mars serve` accepts the connection");
     Ok(())
 }
 
