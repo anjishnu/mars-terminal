@@ -76,6 +76,10 @@ pub enum ClientFrame {
     /// checked a board field and then typed would leave a gap between the two in which the pane
     /// could change. Check and act belong in the same place.
     AssignBrief { pane: usize, brief: String },
+    /// Mint an empty brief and set the planner in a pane drafting it. Same argument as
+    /// `AssignBrief` for why the daemon does this rather than the bridge: the scope check needs a
+    /// pid. The title travels because it is the one thing only the person pressing knows.
+    DraftBrief { pane: usize, title: String },
     /// Pane-targeted raw input from a Rover subscriber (answering a `[y/N]`) — written
     /// straight to that pane's terminal, WITHOUT taking over the session.
     PaneInput { pane: usize, data: String },
@@ -599,6 +603,9 @@ enum SrvEvent {
     OpenFile(String),
     /// Hand a brief to the agent in a pane — refused unless that agent carries the worker scope.
     AssignBrief { pane: usize, brief: String },
+    /// Mint a brief and set a planner drafting it — refused unless that agent carries the planner
+    /// scope.
+    DraftBrief { pane: usize, title: String },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
     Subscribe { stream: crate::sys::control::Stream },
@@ -965,6 +972,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // a pane that was not started as a worker is told why rather than handed a brief.
                 match app.assign_brief_to_pane(pane, &brief) {
                     Ok(()) => {}
+                    Err(why) => app.write_to_pane(pane, &format!("\r# mars: {why}\r")),
+                }
+            }
+            Ok(SrvEvent::DraftBrief { pane, title }) => {
+                // Same gate, other role. The refusal is written into the pane rather than dropped
+                // for the same reason: a press whose failure is invisible reads as a broken app.
+                match app.draft_brief_on_pane(pane, &title) {
+                    Ok(_id) => {}
                     Err(why) => app.write_to_pane(pane, &format!("\r# mars: {why}\r")),
                 }
             }
@@ -1405,6 +1420,11 @@ fn client_connection(
                     }
                     Ok(ClientFrame::AssignBrief { pane, brief }) => {
                         if tx.send(SrvEvent::AssignBrief { pane, brief }).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(ClientFrame::DraftBrief { pane, title }) => {
+                        if tx.send(SrvEvent::DraftBrief { pane, title }).is_err() {
                             break;
                         }
                     }

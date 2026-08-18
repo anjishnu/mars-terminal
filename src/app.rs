@@ -2155,17 +2155,7 @@ impl App {
                 crate::briefs::state_of(&dir).label()
             ));
         }
-        let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
-            Some(PaneContent::Terminal(t)) => *t,
-            _ => return Err("that workspace is a document, not a terminal".into()),
-        };
-        let pid = self
-            .terms
-            .get(&tid)
-            .and_then(|t| t.foreground_pid())
-            .ok_or("nothing is running in that workspace — start it as a worker first")?;
-        let argv = crate::briefs::argv_of(pid)
-            .ok_or("could not read what is running in that workspace")?;
+        let (tid, argv) = self.live_agent_in(pane_id, "worker")?;
         if !crate::briefs::worker_argv_ok(&argv) {
             return Err(
                 "that agent was not started as a worker, so it has no tool scope. \
@@ -2178,6 +2168,70 @@ impl App {
             t.send_bytes(msg.as_bytes());
         }
         Ok(())
+    }
+
+    /// The terminal id and the live argv of whatever is running in a pane.
+    ///
+    /// Shared by assign and draft so the two roles cannot come to disagree about what "there is an
+    /// agent here" means — the failure that would follow is a scope check passing against a pane
+    /// with nothing in it.
+    fn live_agent_in(
+        &self,
+        pane_id: crate::pane::PaneId,
+        role: &str,
+    ) -> Result<(TermId, String), String> {
+        let tid = match self.panes.get(&pane_id).map(|p| &p.content) {
+            Some(PaneContent::Terminal(t)) => *t,
+            _ => return Err("that workspace is a document, not a terminal".into()),
+        };
+        let pid = self
+            .terms
+            .get(&tid)
+            .and_then(|t| t.foreground_pid())
+            .ok_or_else(|| format!("nothing is running in that workspace — start it as a {role} first"))?;
+        let argv = crate::briefs::argv_of(pid)
+            .ok_or("could not read what is running in that workspace")?;
+        Ok((tid, argv))
+    }
+
+    /// Mint an empty brief and set a planner working on it. The entry point from a conversation.
+    ///
+    /// **The daemon mints, the planner fills.** The alternative — telling an agent to "write a
+    /// brief" and letting it choose the path — produces a file nothing downstream can find, with
+    /// an id derived from a title that may yet change, in whatever section order the agent felt
+    /// like. Minting here means the id, the location and the section skeleton are the same for
+    /// every brief on this machine before the planner has read a single line.
+    ///
+    /// Returns the id so the caller can say which brief this press created; a press whose only
+    /// feedback is text appearing in a pane is a press you cannot follow up on from a phone.
+    pub fn draft_brief_on_pane(
+        &mut self,
+        pane_id: crate::pane::PaneId,
+        title: &str,
+    ) -> Result<String, String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("a brief needs a title — say what the work is".into());
+        }
+        let home = crate::sys::paths::home_dir().ok_or("no home directory")?;
+        let (tid, argv) = self.live_agent_in(pane_id, "planner")?;
+        // Scope FIRST, then mint. The other order leaves an empty brief in the queue every time
+        // somebody presses at a pane that turns out not to hold a planner, and a queue full of
+        // empty briefs is indistinguishable from a queue of real ones at a glance.
+        if !crate::briefs::planner_argv_ok(&argv) {
+            return Err(
+                "that agent was not started as a planner, so it cannot write the brief. \
+                 Start one with the planner command and press again"
+                    .into(),
+            );
+        }
+        let ts = crate::worklog::now_secs();
+        let (id, _path) = crate::briefs::create(title, ts).map_err(|e| e.to_string())?;
+        let msg = crate::briefs::draft_assignment(&id, &home).ok_or("bad brief id")?;
+        if let Some(t) = self.terms.get_mut(&tid) {
+            t.send_bytes(msg.as_bytes());
+        }
+        Ok(id)
     }
 
     pub fn write_to_pane(&mut self, pane_id: crate::pane::PaneId, data: &str) {

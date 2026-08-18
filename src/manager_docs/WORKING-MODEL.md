@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 1 -->
+<!-- mars-doc-version: 2 -->
 # How we work here
 
 You are a worker. You have been handed one brief and nothing else. This file is the whole protocol;
@@ -45,11 +45,29 @@ git checkout -b <brief-id>
 ```
 
 That name is not decoration: it makes `git log <branch>` answer *what did this brief actually do*
-without reading anything else. Do not work on `main`. Do not push. Do not merge — a human verifies
-and merges, and that is a separate decision from the one that assigned you.
+without reading anything else. Do not work on `main`.
 
 Build the thing **end to end**. A brief that is half-built is harder to judge than one that was not
 started, because the reviewer has to work out which half.
+
+**Then push the branch and open a PR. Do not merge.**
+
+```
+git push -u origin <brief-id>
+gh pr create --title "<brief title>" --body "<see below>" --base main --head <brief-id>
+```
+
+The PR body is the same four things every time — the brief id, what you built, the acceptance
+table from `completed.md`, and the verify commands with their real exit codes. Put the brief's path
+on the first line so a reviewer can open what you were told alongside what you did.
+
+Merging is a second decision and it is not yours. The PR exists so the person who approved the
+brief can read the diff on a phone without a machine in front of them; leaving the work on a local
+branch means the only way to review it is to be at this desk.
+
+If there is no `origin`, or `gh` is not authenticated, **that is not a blocker.** Commit to the
+branch, say so under `## What I did not do, and why`, and finish. A missing remote is the human's
+to fix and it does not make the work less done.
 
 ## The two files you write
 
@@ -88,6 +106,7 @@ can change its own specification can satisfy the changed version instead of the 
 outcome: done | partial | blocked | rejected
 brief: <brief-id>
 branch: <brief-id>
+pr: <url, or null with the reason in the body>
 commits: [2114cb1]
 files: [src/rover/ui/MissionSurface.tsx]
 acceptance:
@@ -140,7 +159,7 @@ outcome without opening anything.
 | Don't | Why |
 |---|---|
 | edit `brief.md` or this file | you would be changing what was approved, or the rules you are judged against |
-| work on `main`, push, or merge | a human verifies and merges; that is a second decision |
+| work on `main`, or merge | a human verifies and merges; that is a second decision |
 | widen the brief | anything outside `## Acceptance` goes in `## Notes for later` |
 | wait when blocked | write the question, print `BLOCKED:`, stop |
 | start work you noticed yourself | notes go in `completed.md`; a human decides what becomes work |

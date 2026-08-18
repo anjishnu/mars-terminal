@@ -1820,6 +1820,28 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 });
             }
         }
+        // Same, for the planner scope — the one role allowed to write a brief.
+        Some("brief.planner") => {
+            if let Some(pane) = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()) {
+                let _ = session::write_frame(writer, &ClientFrame::PaneInput {
+                    pane, data: crate::briefs::planner_start_command(),
+                });
+            }
+        }
+        // Kick off ideation: mint an empty brief and set the planner in this pane filling it in.
+        // The title is the whole payload because it is the only thing the host cannot derive —
+        // everything else about the brief (its id, its path, its sections) is minted daemon-side.
+        Some("brief.draft") => {
+            if let (Some(pane), Some(title)) = (
+                v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()),
+                v.get("title").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()),
+            ) {
+                crate::manager::record_client_event("act", &v, crate::worklog::now_secs());
+                let _ = session::write_frame(writer, &ClientFrame::DraftBrief {
+                    pane, title: title.chars().take(160).collect(),
+                });
+            }
+        }
         Some("fs.read") => {
             let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("");
             let _ = tx.send(fs_read_json(path));

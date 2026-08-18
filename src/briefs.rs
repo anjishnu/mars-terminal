@@ -38,6 +38,20 @@ pub const WORKER_DENY: &[&str] = &[
     "**/briefs/WORKING-MODEL.md",
 ];
 
+/// The one entry that separates a planner from a worker.
+///
+/// A planner's entire job is to write `brief.md`; a worker is forbidden from touching it. Rather
+/// than maintain a second list that can silently drift out of agreement with the first, the
+/// planner's scope is the worker's with this line removed — so every executable-without-being-run
+/// file stays protected in both roles by construction, and the diff between the roles is one
+/// string that is visible right here.
+pub const BRIEF_DENY: &str = "**/briefs/*/brief.md";
+
+/// What a planner may not edit: everything a worker may not, except the brief itself.
+pub fn planner_deny() -> Vec<&'static str> {
+    WORKER_DENY.iter().copied().filter(|p| *p != BRIEF_DENY).collect()
+}
+
 /// `~/.mars/briefs`. Machine-scoped, not session-scoped: a change to make does not belong to the
 /// session where the condition happened to be noticed.
 pub fn dir() -> Option<PathBuf> {
@@ -197,6 +211,29 @@ pub fn list() -> Vec<Brief> {
     out
 }
 
+/// Mint a brief and write the template. **The only path that creates one**, so the CLI and the
+/// phone cannot mint ids two different ways or seed two different templates.
+///
+/// Returns the id and the path. Fails rather than overwrites: an id collides only when two briefs
+/// were minted in the same second with the same title, and silently clobbering the first is worse
+/// than making the second press again.
+pub fn create(title: &str, ts: u64) -> std::io::Result<(String, PathBuf)> {
+    let id = mint_id(title, ts);
+    let root = dir().ok_or_else(|| std::io::Error::other("no home directory"))?;
+    let bdir = root.join(&id);
+    std::fs::create_dir_all(&bdir)?;
+    let path = bdir.join("brief.md");
+    if path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists", path.display()),
+        ));
+    }
+    std::fs::write(&path, template(&id, title, ts))?;
+    let _ = scaffold();
+    Ok((id, path))
+}
+
 /// What Rover types into the worker's pane.
 ///
 /// **Two file locations, and nothing else.** Today's assign flow composes a paragraph — goal,
@@ -217,13 +254,63 @@ pub fn assignment(id: &str, home: &Path) -> Option<String> {
     // would like it to do — a wasted round trip, and on a phone a wasted round trip is a round
     // trip you may not be there for. The old flow closed this with "start the work immediately";
     // dropping it while shortening the message would have been a quiet regression.
+    //
+    // ENDS IN `\r`, AND THAT IS LOAD-BEARING. Enter is a carriage return; `\n` is Ctrl-J, which
+    // an agent TUI takes as "insert a newline in the composer". Ending with `\n` typed the whole
+    // assignment into the pane and left it sitting there unsent — no error, no refusal, a worker
+    // that simply never started, and nothing on the board to say so. Found by driving a real
+    // pane; every check that existed passed against the string, because the string was right.
+    // The internal separators stay `\n` deliberately: they are the line breaks the reader sees.
     Some(format!(
         "First read {} — that is how we work here.\n\
          Then read {} — that is what to build.\n\
-         Start building.\n",
+         Start building.\r",
         briefs.join("WORKING-MODEL.md").display(),
         briefs.join(id).join("brief.md").display(),
     ))
+}
+
+/// What Rover types into the PLANNER's pane. Same shape as `assignment` for the same reason: the
+/// rules are versioned in a doc, and the message is addresses plus an imperative.
+///
+/// The second address is a file that already exists — the daemon minted it and wrote the template
+/// before typing this. A planner told to "create a brief somewhere" picks its own path, its own
+/// id and its own section order, and then nothing downstream can find or read it.
+pub fn draft_assignment(id: &str, home: &Path) -> Option<String> {
+    if !safe_id(id) {
+        return None;
+    }
+    let briefs = home.join(".mars").join("briefs");
+    Some(format!(
+        "First read {} — that is how we plan here.\n\
+         Then fill in {} — it is scaffolded and empty.\n\
+         Start planning.\r",
+        briefs.join("PLANNING-MODEL.md").display(),
+        briefs.join(id).join("brief.md").display(),
+    ))
+}
+
+/// The command that starts a pane as a planner.
+pub fn planner_start_command() -> String {
+    let deny = planner_deny().iter().map(|p| format!("'Edit({p})'")).collect::<Vec<_>>().join(" ");
+    format!("claude --permission-mode acceptEdits --disallowedTools {deny}\n")
+}
+
+/// Is the agent in this pane scoped as a planner? Same derivation-from-live-argv argument as
+/// `worker_argv_ok`, and deliberately strict in the other direction too: a planner scope must NOT
+/// deny the brief, or the agent cannot do the one thing it was started for and will spend the run
+/// asking why its edits are refused.
+pub fn planner_argv_ok(argv: &str) -> bool {
+    if !argv.contains("claude") {
+        return false;
+    }
+    if !argv.contains("--permission-mode acceptEdits") {
+        return false;
+    }
+    if argv.contains(BRIEF_DENY) {
+        return false;
+    }
+    planner_deny().iter().all(|p| argv.contains(p))
 }
 
 /// Is the agent running in this pane scoped as a worker?
@@ -272,19 +359,24 @@ pub fn argv_of(pid: i32) -> Option<String> {
 pub fn scaffold() -> std::io::Result<()> {
     let Some(root) = dir() else { return Ok(()) };
     std::fs::create_dir_all(&root)?;
-    let path = root.join("WORKING-MODEL.md");
-    let built_in = WORKING_MODEL;
-    let replace = match std::fs::read_to_string(&path) {
+    seed_doc(&root.join("WORKING-MODEL.md"), WORKING_MODEL)?;
+    seed_doc(&root.join("PLANNING-MODEL.md"), PLANNING_MODEL)?;
+    Ok(())
+}
+
+fn seed_doc(path: &Path, built_in: &str) -> std::io::Result<()> {
+    let replace = match std::fs::read_to_string(path) {
         Err(_) => true,
         Ok(on_disk) => on_disk != built_in && doc_version(&on_disk) < doc_version(built_in),
     };
     if replace {
-        std::fs::write(&path, built_in)?;
+        std::fs::write(path, built_in)?;
     }
     Ok(())
 }
 
 pub const WORKING_MODEL: &str = include_str!("manager_docs/WORKING-MODEL.md");
+pub const PLANNING_MODEL: &str = include_str!("manager_docs/PLANNING-MODEL.md");
 
 /// The `<!-- mars-doc-version: N -->` marker, or 0. Absent reads as oldest, so a hand-written file
 /// with no marker is replaced by anything we ship rather than pinning the host forever.

@@ -546,7 +546,51 @@ fn main() -> Result<()> {
                          scope — read from the process itself, not from a marker."
                     );
                 }
-                other => anyhow::bail!("unknown: mars brief {other}   (try: ls | new | show | worker)"),
+                // The planner scope differs from the worker's by exactly one entry — the brief,
+                // which is the file a planner exists to write and a worker is forbidden to touch.
+                "planner" => {
+                    println!(
+                        "Run this in the pane you want to plan in, then draft a brief into it:\n\n  {}",
+                        briefs::planner_start_command().trim_end()
+                    );
+                    println!(
+                        "\nIt is the worker scope with {} removed — one list, so the executable-\n\
+                         without-being-run files stay protected in both roles.",
+                        briefs::BRIEF_DENY
+                    );
+                }
+                // Assign and draft both need a live pane, so both are a frame to a running daemon
+                // rather than work done here. The scope gate lives in the daemon, where the pid
+                // is; duplicating it here would be a second copy of the one check that must never
+                // disagree with itself.
+                "assign" | "draft" => {
+                    let a = args.next().unwrap_or_default();
+                    let session = args.next().unwrap_or_default();
+                    let pane: usize = args.next().unwrap_or_default().parse().unwrap_or(0);
+                    if a.is_empty() || session.is_empty() {
+                        anyhow::bail!(
+                            "usage: mars brief {sub} <{}> <session> <pane>",
+                            if sub == "assign" { "brief-id" } else { "\"title\"" }
+                        );
+                    }
+                    let path = session::socket_path(&session)?;
+                    let Ok(stream) = sys::control::connect(&path) else {
+                        anyhow::bail!("no live session at {}", path.display())
+                    };
+                    let mut w = stream.try_clone()?;
+                    let frame = if sub == "assign" {
+                        session::ClientFrame::AssignBrief { pane, brief: a.clone() }
+                    } else {
+                        session::ClientFrame::DraftBrief { pane, title: a.clone() }
+                    };
+                    session::write_frame(&mut w, &frame)?;
+                    // The daemon writes any refusal into the pane, not back down this socket —
+                    // the person who needs to read it is the one looking at the workspace.
+                    println!("sent to {session} pane {pane}. Refusals appear in the pane itself.");
+                }
+                other => anyhow::bail!(
+                    "unknown: mars brief {other}   (try: ls | new | show | worker | planner | draft | assign)"
+                ),
             }
             return Ok(());
         }
@@ -7700,22 +7744,28 @@ fn selfcheck() -> Result<()> {
             // The worker's standing orders ride in the same lock and carry the same hazard — an
             // edit without a bump leaves every host on its old copy, silently — but they are not a
             // manager doc, so they are checked beside GUARDED_DOCS rather than counted with it.
-            {
+            const BRIEF_DOCS: &[(&str, &str)] = &[
+                ("briefs/WORKING-MODEL.md", crate::briefs::WORKING_MODEL),
+                ("briefs/PLANNING-MODEL.md", crate::briefs::PLANNING_MODEL),
+            ];
+            for (rel, built_in) in BRIEF_DOCS {
                 let (_, want_ver, want_hash) = recorded
                     .iter()
-                    .find(|(r, _, _)| *r == "briefs/WORKING-MODEL.md")
-                    .expect("WORKING-MODEL.md is absent from versions.lock — run tools/doc-lock.py");
-                let ver = crate::briefs::doc_version(crate::briefs::WORKING_MODEL).to_string();
-                let hash = manager::version_of_pub(crate::briefs::WORKING_MODEL);
+                    .find(|(r, _, _)| r == rel)
+                    .unwrap_or_else(|| panic!("{rel} is absent from versions.lock — run tools/doc-lock.py"));
+                let ver = crate::briefs::doc_version(built_in).to_string();
+                let hash = manager::version_of_pub(built_in);
                 assert!(
                     !(&hash != want_hash && &ver == want_ver),
-                    "WORKING-MODEL.md was edited without bumping its mars-doc-version (still {ver}). \
+                    "{rel} was edited without bumping its mars-doc-version (still {ver}). \
                      Bump it, then run tools/doc-lock.py"
                 );
-                assert_eq!(&hash, want_hash, "WORKING-MODEL.md changed — run tools/doc-lock.py");
+                assert_eq!(&hash, want_hash, "{rel} changed — run tools/doc-lock.py");
             }
-            let recorded: Vec<_> =
-                recorded.into_iter().filter(|(r, _, _)| *r != "briefs/WORKING-MODEL.md").collect();
+            let recorded: Vec<_> = recorded
+                .into_iter()
+                .filter(|(r, _, _)| !BRIEF_DOCS.iter().any(|(rel, _)| rel == r))
+                .collect();
             assert_eq!(
                 recorded.len(),
                 manager::GUARDED_DOCS.len(),
@@ -8283,6 +8333,14 @@ fn selfcheck() -> Result<()> {
             "first, then, go — an agent handed paths with no imperative asks what to do next");
         assert!(msg.lines().count() == 3 && msg.len() < 320,
             "an assignment is two addresses and a go, not a thousand-line prompt ({} bytes)", msg.len());
+        // IT MUST END IN A CARRIAGE RETURN, and this check is here because the version that did
+        // not passed every other check in this block. Enter is `\r`; `\n` is Ctrl-J, which an
+        // agent TUI takes as "newline in the composer". Ending with `\n` typed the whole
+        // assignment into a real pane and left it sitting there unsent — no error anywhere, a
+        // worker that never started, and nothing on the board to say so. The string was right;
+        // the bytes were not.
+        assert!(msg.ends_with('\r'), "an assignment that does not end in Enter is never submitted");
+        assert!(!msg.ends_with("\n"), "`\\n` is Ctrl-J — it inserts a newline, it does not send");
         // The guard against the paragraph growing back. Every rule a worker follows belongs in
         // WORKING-MODEL.md, where it is versioned; a rule that leaks into the typed message is a
         // rule with one home, rewritten by whoever next edits the composer, invisible to whoever
@@ -8319,10 +8377,62 @@ fn selfcheck() -> Result<()> {
         // If the orders name a deny-list entry, it has to be one we actually pass.
         assert!(briefs::WORKER_DENY.contains(&"**/briefs/*/brief.md"));
 
+        // ── THE PLANNER, and the one line that separates it from a worker ──────────────────
+        //
+        // Two roles, one deny-list. The planner's is the worker's with the brief removed, because
+        // a second hand-maintained list drifts and the drift is invisible: both commands still
+        // look long and careful, and the thing that stops being protected is a file that executes
+        // without being run.
+        let plan_cmd = briefs::planner_start_command();
+        assert!(briefs::planner_argv_ok(&plan_cmd), "the planner command must pass our own check");
+        assert!(!briefs::worker_argv_ok(&plan_cmd),
+            "a planner is not a worker — it may write the brief, and a worker may not");
+        assert!(!briefs::planner_argv_ok(&good),
+            "a worker is not a planner — denied the brief, it cannot do the one thing it was started for");
+        assert!(plan_cmd.contains("'Edit(build.rs)'") && plan_cmd.contains("'Edit(.claude/**)'"),
+            "the executable-without-being-run files stay denied in BOTH roles: {plan_cmd}");
+        assert!(!plan_cmd.contains(briefs::BRIEF_DENY), "a planner writes the brief");
+        assert_eq!(briefs::planner_deny().len(), briefs::WORKER_DENY.len() - 1,
+            "the roles differ by exactly one entry, or the lists have started to drift");
+        // A partial planner scope fails the same way a partial worker scope does.
+        assert!(!briefs::planner_argv_ok(&plan_cmd.replace("'Edit(Makefile)' ", "")),
+            "every entry, not merely some");
+
+        // The draft instruction has the same shape as the assignment, and points at a file that
+        // ALREADY EXISTS. A planner told to create a brief somewhere picks its own path, its own
+        // id and its own section order, and nothing downstream can then find or read it.
+        let dmsg = briefs::draft_assignment("brief-1-x", home).unwrap();
+        assert_eq!(dmsg, briefs::draft_assignment("brief-1-x", home).unwrap(), "same bytes every time");
+        assert!(dmsg.contains("/home/x/.mars/briefs/PLANNING-MODEL.md"), "the planning model: {dmsg}");
+        assert!(dmsg.contains("/home/x/.mars/briefs/brief-1-x/brief.md"), "the brief to fill: {dmsg}");
+        assert!(dmsg.starts_with("First read ") && dmsg.trim_end().ends_with("Start planning."),
+            "first, then, go — the same shape as an assignment, so neither drifts alone");
+        assert!(dmsg.lines().count() == 3 && dmsg.len() < 320, "two addresses and a go");
+        assert!(dmsg.ends_with('\r'), "a draft that does not end in Enter is never submitted");
+        assert_ne!(dmsg, briefs::assignment("brief-1-x", home).unwrap(),
+            "planning and building are different instructions and must not collapse into one");
+        assert!(briefs::draft_assignment("../../etc/passwd", home).is_none());
+
+        assert!(briefs::doc_version(briefs::PLANNING_MODEL) >= 1, "PLANNING-MODEL.md needs a version");
+        for must in ["already chosen", "Needs a human", "Acceptance", "DRAFTED:"] {
+            assert!(briefs::PLANNING_MODEL.contains(must), "the planning orders must say {must:?}");
+        }
+        // The rule the whole fork format rests on, stated in the doc the planner actually reads.
+        assert!(briefs::PLANNING_MODEL.contains("They do not **answer** a question"),
+            "a brief that asks the reader a question has handed back the work it existed to do");
+        // And the worker's orders now carry the PR, or the branch never leaves this machine.
+        for must in ["gh pr create", "Do not merge", "git push -u origin"] {
+            assert!(briefs::WORKING_MODEL.contains(must), "the orders must say {must:?}");
+        }
+        assert!(!briefs::WORKING_MODEL.contains("Do not push."),
+            "v1 forbade the push; v2 requires it — both cannot be in the file");
+
         let _ = std::fs::remove_dir_all(&tmp);
         println!("[selfcheck] briefs: state is which files exist, never liveness ... PASS");
         println!("[selfcheck] briefs: an assignment is two paths, byte-identical ... PASS");
         println!("[selfcheck] briefs: a partial worker deny-list is not a worker ... PASS");
+        println!("[selfcheck] briefs: planner and worker differ by exactly one deny entry ... PASS");
+        println!("[selfcheck] briefs: drafting points at a brief that already exists ... PASS");
     }
 
     // ── THE TWO WAYS A BOARD LIES ABOUT CHANGING ─────────────────────────────────────────────
