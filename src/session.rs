@@ -1387,6 +1387,25 @@ fn client_connection(
             let _ = send_exit(&stream, &format!("opening '{path}'"));
             return;
         }
+        // Assign and draft arrive two ways and BOTH have to be handshakes here.
+        //
+        // From the bridge they ride mid-stream on a connection that opened with `Subscribe`, and
+        // that path works. From `mars brief assign` at the desk they are the first and only frame
+        // on the connection — and the first frame is a handshake, so an unlisted one is read,
+        // matched against nothing, and dropped. The CLI printed "sent" over a frame the daemon
+        // discarded: no error at either end, a worker that never heard anything, and a person who
+        // believes they assigned work. Listed here, and the caller is told what happened rather
+        // than assuming.
+        Ok(ClientFrame::AssignBrief { pane, brief }) => {
+            let _ = tx.send(SrvEvent::AssignBrief { pane: *pane, brief: brief.clone() });
+            let _ = send_exit(&stream, &format!("{brief} sent to pane {pane}"));
+            return;
+        }
+        Ok(ClientFrame::DraftBrief { pane, title }) => {
+            let _ = tx.send(SrvEvent::DraftBrief { pane: *pane, title: title.clone() });
+            let _ = send_exit(&stream, &format!("drafting {title:?} in pane {pane}"));
+            return;
+        }
         Ok(ClientFrame::Subscribe) => {
             // Non-takeover read channel: register for board/briefing pushes
             // WITHOUT sending an Attach, so the owning desktop client keeps the

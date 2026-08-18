@@ -525,10 +525,19 @@ fn main() -> Result<()> {
                         anyhow::bail!("no brief at {}", dir.display());
                     }
                     println!("state: {}\n", briefs::state_of(&dir).label());
-                    println!("Assigning types exactly this into the pane:\n");
-                    for line in msg.lines() {
-                        println!("  {line}");
+                    println!("Assigning types exactly this into the pane, as ONE line ending in\n\
+                              Enter — wrapped here only for reading:\n");
+                    let mut col = 0;
+                    print!("  ");
+                    for word in msg.trim_end().split(' ') {
+                        if col + word.chars().count() > 84 {
+                            print!("\n  ");
+                            col = 0;
+                        }
+                        print!("{word} ");
+                        col += word.chars().count() + 1;
                     }
+                    println!();
                     println!();
                     println!(
                         "That is the whole message. Every rule a worker follows lives in\n\
@@ -584,9 +593,28 @@ fn main() -> Result<()> {
                         session::ClientFrame::DraftBrief { pane, title: a.clone() }
                     };
                     session::write_frame(&mut w, &frame)?;
-                    // The daemon writes any refusal into the pane, not back down this socket —
-                    // the person who needs to read it is the one looking at the workspace.
-                    println!("sent to {session} pane {pane}. Refusals appear in the pane itself.");
+                    // WAIT FOR THE DAEMON TO SAY IT TOOK IT. The first version printed "sent" the
+                    // instant the bytes left, which was true and useless: the frame was landing on
+                    // a handshake that did not list it and being dropped, and the only evidence
+                    // was a worker that never started. Reading the acknowledgement back turns a
+                    // discarded frame into a visible failure.
+                    use std::io::BufRead;
+                    let rd = stream.try_clone()?;
+                    rd.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+                    let mut line = String::new();
+                    if std::io::BufReader::new(rd).read_line(&mut line).unwrap_or(0) == 0 {
+                        anyhow::bail!(
+                            "{session} accepted the connection but never acknowledged the frame — \
+                             it is probably running an older binary. `mars reboot {session}` first"
+                        );
+                    }
+                    let ack = serde_json::from_str::<serde_json::Value>(line.trim())
+                        .ok()
+                        .and_then(|v| v["Exit"]["message"].as_str().map(str::to_string))
+                        .unwrap_or_else(|| line.trim().to_string());
+                    // The daemon writes any REFUSAL into the pane, not back down this socket — the
+                    // person who needs to read it is the one looking at the workspace.
+                    println!("{ack}. Any refusal appears in the pane itself.");
                 }
                 other => anyhow::bail!(
                     "unknown: mars brief {other}   (try: ls | new | show | worker | planner | draft | assign)"
@@ -8331,16 +8359,22 @@ fn selfcheck() -> Result<()> {
         assert!(msg.contains("/home/x/.mars/briefs/brief-1-x/brief.md"), "the brief: {msg}");
         assert!(msg.starts_with("First read ") && msg.trim_end().ends_with("Start building."),
             "first, then, go — an agent handed paths with no imperative asks what to do next");
-        assert!(msg.lines().count() == 3 && msg.len() < 320,
+        assert!(msg.len() < 400,
             "an assignment is two addresses and a go, not a thousand-line prompt ({} bytes)", msg.len());
-        // IT MUST END IN A CARRIAGE RETURN, and this check is here because the version that did
-        // not passed every other check in this block. Enter is `\r`; `\n` is Ctrl-J, which an
-        // agent TUI takes as "newline in the composer". Ending with `\n` typed the whole
-        // assignment into a real pane and left it sitting there unsent — no error anywhere, a
-        // worker that never started, and nothing on the board to say so. The string was right;
-        // the bytes were not.
+        // THE BYTES THAT MAKE IT SEND, and this pair is here because two versions that failed it
+        // passed every other check in this block.
+        //
+        // Enter is `\r`; `\n` is Ctrl-J, which an agent TUI reads as "newline in the composer".
+        // And a multi-line chunk arriving in one pty write is taken for a PASTE, inside which
+        // even `\r` is literal — so the newlines have to go too, or the Enter has to be a second
+        // write timed to outlast a heuristic, which is a race, not a fix. Both failing versions
+        // typed the whole assignment into a real pane and left it sitting there unsent: no error,
+        // a worker that never started, nothing on the board to say so. The string was right and
+        // the bytes were not, which is exactly what a string-shaped test cannot see.
         assert!(msg.ends_with('\r'), "an assignment that does not end in Enter is never submitted");
-        assert!(!msg.ends_with("\n"), "`\\n` is Ctrl-J — it inserts a newline, it does not send");
+        assert!(!msg.contains('\n'),
+            "a newline makes the pty write look like a paste, and a paste swallows the Enter");
+        assert_eq!(msg.lines().count(), 1, "one line, or it is pasted rather than sent");
         // The guard against the paragraph growing back. Every rule a worker follows belongs in
         // WORKING-MODEL.md, where it is versioned; a rule that leaks into the typed message is a
         // rule with one home, rewritten by whoever next edits the composer, invisible to whoever
@@ -8374,8 +8408,14 @@ fn selfcheck() -> Result<()> {
         for must in ["Blocked is terminal", "in_process.md", "completed.md", "Notes for later"] {
             assert!(briefs::WORKING_MODEL.contains(must), "the orders must say {must:?}");
         }
-        // If the orders name a deny-list entry, it has to be one we actually pass.
+        // If the orders name a deny-list entry, it has to be one we actually pass. The orders
+        // forbid the manager directory and another role's standing orders in prose; prose is not
+        // a mechanism, so both are on the list.
         assert!(briefs::WORKER_DENY.contains(&"**/briefs/*/brief.md"));
+        assert!(briefs::WORKER_DENY.iter().any(|p| p.contains(".mars/manager")),
+            "the orders forbid the manager directory and nothing enforced it");
+        assert!(briefs::WORKER_DENY.contains(&"**/briefs/PLANNING-MODEL.md"),
+            "a worker could rewrite the planner's standing orders");
 
         // ── THE PLANNER, and the one line that separates it from a worker ──────────────────
         //
@@ -8391,12 +8431,47 @@ fn selfcheck() -> Result<()> {
             "a worker is not a planner — denied the brief, it cannot do the one thing it was started for");
         assert!(plan_cmd.contains("'Edit(build.rs)'") && plan_cmd.contains("'Edit(.claude/**)'"),
             "the executable-without-being-run files stay denied in BOTH roles: {plan_cmd}");
-        assert!(!plan_cmd.contains(briefs::BRIEF_DENY), "a planner writes the brief");
+        assert!(!plan_cmd.contains(&format!("'Edit({})'", briefs::BRIEF_DENY)),
+            "a planner writes the brief");
         assert_eq!(briefs::planner_deny().len(), briefs::WORKER_DENY.len() - 1,
             "the roles differ by exactly one entry, or the lists have started to drift");
         // A partial planner scope fails the same way a partial worker scope does.
         assert!(!briefs::planner_argv_ok(&plan_cmd.replace("'Edit(Makefile)' ", "")),
             "every entry, not merely some");
+
+        // ── EDIT IS NOT THE ONLY WAY TO CHANGE A FILE ──────────────────────────────────────
+        //
+        // The deny-list named only `Edit` until a live run watched an agent replace a whole file
+        // with `Write`, which the `Edit` rule never sees. Every pattern here guards something that
+        // executes without being run, so one uncovered verb is not a smaller deny-list.
+        for cmd in [&good, &plan_cmd] {
+            for p in briefs::WORKER_DENY.iter().filter(|p| **p != briefs::BRIEF_DENY) {
+                assert!(cmd.contains(&format!("'Edit({p})'")), "{p} not Edit-denied");
+                assert!(cmd.contains(&format!("'Write({p})'")), "{p} is Write-open — Edit is not the only verb");
+            }
+        }
+        assert!(!briefs::worker_argv_ok(&good.replace("'Write(build.rs)' ", "")),
+            "a worker that can Write build.rs is not scoped, however long its command looks");
+
+        // ── WHAT THE ORDERS DEMAND, THE SCOPE MUST PERMIT ──────────────────────────────────
+        //
+        // A rule mandating a command the scope gates is not a rule, it is a stall — and a silent
+        // one: the agent sits at the prompt with nobody there, and nothing on the board says so.
+        // Measured on the first live run, which stopped at `git checkout` inside a minute.
+        for verb in ["git checkout", "git push", "gh pr create"] {
+            assert!(briefs::WORKING_MODEL.contains(verb), "the orders stopped requiring {verb:?}");
+            assert!(briefs::WORKER_ALLOW.iter().any(|a| a.contains(verb)),
+                "the orders require {verb:?} and the worker scope does not permit it");
+        }
+        assert!(!briefs::worker_argv_ok(&good.replace("'Bash(git push:*)' ", "")),
+            "a worker that cannot push cannot finish, and finds out alone at 3am");
+        assert!(!briefs::planner_argv_ok(&plan_cmd.replace("'Write(**/briefs/*/brief.md)' ", "")),
+            "a planner that cannot write the brief stalls on its first action");
+        // History rewriting stays gated: the allow-list is what the orders need, not convenience.
+        for never in ["git rebase", "git reset", "git push --force"] {
+            assert!(!briefs::WORKER_ALLOW.iter().any(|a| a.contains(never)),
+                "{never:?} is pre-approved — the allow-list has stopped being the orders");
+        }
 
         // The draft instruction has the same shape as the assignment, and points at a file that
         // ALREADY EXISTS. A planner told to create a brief somewhere picks its own path, its own
@@ -8407,8 +8482,9 @@ fn selfcheck() -> Result<()> {
         assert!(dmsg.contains("/home/x/.mars/briefs/brief-1-x/brief.md"), "the brief to fill: {dmsg}");
         assert!(dmsg.starts_with("First read ") && dmsg.trim_end().ends_with("Start planning."),
             "first, then, go — the same shape as an assignment, so neither drifts alone");
-        assert!(dmsg.lines().count() == 3 && dmsg.len() < 320, "two addresses and a go");
+        assert!(dmsg.lines().count() == 1 && dmsg.len() < 400, "two addresses and a go, on one line");
         assert!(dmsg.ends_with('\r'), "a draft that does not end in Enter is never submitted");
+        assert!(!dmsg.contains('\n'), "same paste hazard as an assignment");
         assert_ne!(dmsg, briefs::assignment("brief-1-x", home).unwrap(),
             "planning and building are different instructions and must not collapse into one");
         assert!(briefs::draft_assignment("../../etc/passwd", home).is_none());

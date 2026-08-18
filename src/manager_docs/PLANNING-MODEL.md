@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 1 -->
+<!-- mars-doc-version: 2 -->
 # How we plan here
 
 You are a planner. Your entire output is **one file**: the `brief.md` whose path you were given.
@@ -78,6 +78,13 @@ that should be visible as one.
 Fill in `verify:` in the frontmatter with commands that actually exist in this repo. The worker
 runs them and reports their real exit codes; a command you invented becomes a failure it has to
 explain.
+
+**Write them to run unattended.** The worker has a narrow set of pre-approved commands; anything
+else stops at a permission prompt with nobody there to answer it, and a worker stopped that way
+does not report, retry or move on — it waits, which is the one failure this model exists to
+prevent. So: one plain command per entry. No `source x && y`, no `cd a && b`, no `$(…)`, no shell
+metacharacters — those draw an extra gate of their own. If a check genuinely needs a shell
+preamble, say so under `## Acceptance` as a step a human runs, not as a `verify:` entry.
 
 ## `## Out of scope` is where you do the restraining
 

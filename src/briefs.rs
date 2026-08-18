@@ -36,6 +36,11 @@ pub const WORKER_DENY: &[&str] = &[
     ".claude/**",
     "**/briefs/*/brief.md",
     "**/briefs/WORKING-MODEL.md",
+    // The orders name these two as out of bounds, so the scope enforces them rather than trusting
+    // an agent to remember a sentence. PLANNING-MODEL is another role's standing orders; the
+    // manager directory is the memory every other part of this system reasons from.
+    "**/briefs/PLANNING-MODEL.md",
+    "**/.mars/manager/**",
 ];
 
 /// The one entry that separates a planner from a worker.
@@ -255,15 +260,24 @@ pub fn assignment(id: &str, home: &Path) -> Option<String> {
     // trip you may not be there for. The old flow closed this with "start the work immediately";
     // dropping it while shortening the message would have been a quiet regression.
     //
-    // ENDS IN `\r`, AND THAT IS LOAD-BEARING. Enter is a carriage return; `\n` is Ctrl-J, which
-    // an agent TUI takes as "insert a newline in the composer". Ending with `\n` typed the whole
-    // assignment into the pane and left it sitting there unsent — no error, no refusal, a worker
-    // that simply never started, and nothing on the board to say so. Found by driving a real
-    // pane; every check that existed passed against the string, because the string was right.
-    // The internal separators stay `\n` deliberately: they are the line breaks the reader sees.
+    // ONE LINE, ENDING IN `\r`, AND BOTH HALVES ARE LOAD-BEARING.
+    //
+    // Enter is a carriage return; `\n` is Ctrl-J, which an agent TUI reads as "newline in the
+    // composer". But fixing only the terminator was not enough: the whole message reaches the pty
+    // in a single write, and a multi-line chunk arriving at once is taken for a PASTE — inside
+    // which even `\r` is a literal newline. Both versions typed the assignment into the pane and
+    // left it sitting there unsent. No error, no refusal, a worker that never started, and
+    // nothing on the board to say so; every check passed, because the string was right and the
+    // bytes were not.
+    //
+    // The fix that keeps the line breaks is to send the Enter as a second write, later — and
+    // "later" would have to outlast the reader's paste heuristic on a loaded machine, which is a
+    // race dressed up as a fix. With no newline there is nothing to mistake for a paste, so the
+    // return is unambiguous. The reader is an agent; the line breaks were only ever for us, and
+    // `mars brief show` still wraps it for a human.
     Some(format!(
-        "First read {} — that is how we work here.\n\
-         Then read {} — that is what to build.\n\
+        "First read {} — that is how we work here. \
+         Then read {} — that is what to build. \
          Start building.\r",
         briefs.join("WORKING-MODEL.md").display(),
         briefs.join(id).join("brief.md").display(),
@@ -281,9 +295,10 @@ pub fn draft_assignment(id: &str, home: &Path) -> Option<String> {
         return None;
     }
     let briefs = home.join(".mars").join("briefs");
+    // One line ending in `\r`, for the reason spelled out in `assignment`.
     Some(format!(
-        "First read {} — that is how we plan here.\n\
-         Then fill in {} — it is scaffolded and empty.\n\
+        "First read {} — that is how we plan here. \
+         Then fill in {} — it is scaffolded and empty. \
          Start planning.\r",
         briefs.join("PLANNING-MODEL.md").display(),
         briefs.join(id).join("brief.md").display(),
@@ -292,8 +307,11 @@ pub fn draft_assignment(id: &str, home: &Path) -> Option<String> {
 
 /// The command that starts a pane as a planner.
 pub fn planner_start_command() -> String {
-    let deny = planner_deny().iter().map(|p| format!("'Edit({p})'")).collect::<Vec<_>>().join(" ");
-    format!("claude --permission-mode acceptEdits --disallowedTools {deny}\n")
+    format!(
+        "claude --permission-mode acceptEdits --allowedTools {} --disallowedTools {}\n",
+        allow_flags(PLANNER_ALLOW),
+        deny_flags(&planner_deny()),
+    )
 }
 
 /// Is the agent in this pane scoped as a planner? Same derivation-from-live-argv argument as
@@ -307,10 +325,39 @@ pub fn planner_argv_ok(argv: &str) -> bool {
     if !argv.contains("--permission-mode acceptEdits") {
         return false;
     }
-    if argv.contains(BRIEF_DENY) {
+    // Denied the brief in EITHER verb, it cannot do the one thing it was started for. Matched on
+    // the full flag, not the bare pattern: the pattern also appears inside `PLANNER_ALLOW`, where
+    // its presence means the opposite.
+    let (allow, deny) = (allow_section(argv), deny_section(argv));
+    if deny.contains(BRIEF_DENY) {
         return false;
     }
-    planner_deny().iter().all(|p| argv.contains(p))
+    if !planner_deny().iter().all(|p| deny.contains(&format!("Edit({p})")) && deny.contains(&format!("Write({p})"))) {
+        return false;
+    }
+    PLANNER_ALLOW.iter().all(|p| allow.contains(p))
+}
+
+/// The two halves of the scope, read separately.
+///
+/// A check that searches the whole argv cannot tell a permission from a prohibition — and once
+/// both lists mention the same path, as the planner's do, "is the brief denied?" answered `true`
+/// against the flag that ALLOWS it. Split at the flags and each question is asked where its
+/// answer lives.
+fn allow_section(argv: &str) -> &str {
+    let Some(a) = argv.find("--allowedTools") else { return "" };
+    match argv.find("--disallowedTools") {
+        Some(d) if d > a => &argv[a..d],
+        _ => &argv[a..],
+    }
+}
+
+fn deny_section(argv: &str) -> &str {
+    let Some(d) = argv.find("--disallowedTools") else { return "" };
+    match argv.find("--allowedTools") {
+        Some(a) if a > d => &argv[d..a],
+        _ => &argv[d..],
+    }
 }
 
 /// Is the agent running in this pane scoped as a worker?
@@ -329,15 +376,73 @@ pub fn worker_argv_ok(argv: &str) -> bool {
         return false;
     }
     // Every entry, not merely some: a partial deny-list is the failure this check exists to catch,
-    // and it is invisible at a glance because the command still looks long and careful.
-    WORKER_DENY.iter().all(|p| argv.contains(p))
+    // and it is invisible at a glance because the command still looks long and careful. Both verbs
+    // per pattern, because `Edit` alone leaves `Write` open on every file here.
+    let (allow, deny) = (allow_section(argv), deny_section(argv));
+    if !WORKER_DENY.iter().all(|p| deny.contains(&format!("Edit({p})")) && deny.contains(&format!("Write({p})"))) {
+        return false;
+    }
+    // AND every permission the orders require. A worker missing these is not a safer worker — it
+    // is one that stalls at its first git command, silently, which is worse than a loud refusal
+    // because nothing anywhere says it happened.
+    WORKER_ALLOW.iter().all(|p| allow.contains(p))
+}
+
+/// Every pattern denied for BOTH ways of changing a file.
+///
+/// The list named only `Edit` until a live run watched an agent replace a whole file with `Write`
+/// — a tool the `Edit` rule never sees. Everything this list protects is a file that executes
+/// without being run, so a hole in it is not a smaller deny-list, it is none at all.
+fn deny_flags(patterns: &[&str]) -> String {
+    patterns
+        .iter()
+        .flat_map(|p| [format!("'Edit({p})'"), format!("'Write({p})'")])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What the standing orders REQUIRE a worker to do, pre-approved.
+///
+/// **A rule that mandates a command the scope then gates is not a rule, it is a stall.** Under
+/// `acceptEdits` edits flow and everything else prompts — so a worker told to branch, push and
+/// open a PR stops dead at its first `git checkout`, waiting for a human who by construction is
+/// not there. Measured on the first live run: it stalled inside a minute and would have sat there
+/// all night. Whatever WORKING-MODEL orders, this list must permit; they are edited together.
+///
+/// Narrow on purpose. `git push` and `gh pr create` are here because the orders demand them;
+/// `git rebase`, `git reset` and anything that rewrites history are not, and still gate.
+pub const WORKER_ALLOW: &[&str] = &[
+    "Bash(git status:*)",
+    "Bash(git diff:*)",
+    "Bash(git log:*)",
+    "Bash(git branch:*)",
+    "Bash(git checkout:*)",
+    "Bash(git add:*)",
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(gh pr create:*)",
+    // The two reports. `Write`, not `Edit`: both files are created rather than changed, and a
+    // creation is the case `acceptEdits` does not cover.
+    "Write(**/briefs/*/in_process.md)",
+    "Write(**/briefs/*/completed.md)",
+];
+
+/// The planner's one required write. It exists for the same reason as `WORKER_ALLOW`: the planner
+/// stalled asking permission to write the very file it was started to write.
+pub const PLANNER_ALLOW: &[&str] = &["Write(**/briefs/*/brief.md)"];
+
+fn allow_flags(patterns: &[&str]) -> String {
+    patterns.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(" ")
 }
 
 /// The command that starts a pane as a worker. One composer, host-side, so the phone never builds
 /// a shell line for a host whose version it does not know.
 pub fn worker_start_command() -> String {
-    let deny = WORKER_DENY.iter().map(|p| format!("'Edit({p})'")).collect::<Vec<_>>().join(" ");
-    format!("claude --permission-mode acceptEdits --disallowedTools {deny}\n")
+    format!(
+        "claude --permission-mode acceptEdits --allowedTools {} --disallowedTools {}\n",
+        allow_flags(WORKER_ALLOW),
+        deny_flags(WORKER_DENY),
+    )
 }
 
 /// The full argv of a running process, for `worker_argv_ok`. `ps -o args=` rather than `comm=`,
