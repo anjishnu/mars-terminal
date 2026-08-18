@@ -260,25 +260,12 @@ pub fn assignment(id: &str, home: &Path) -> Option<String> {
     // trip you may not be there for. The old flow closed this with "start the work immediately";
     // dropping it while shortening the message would have been a quiet regression.
     //
-    // ONE LINE, ENDING IN `\r`, AND BOTH HALVES ARE LOAD-BEARING.
-    //
-    // Enter is a carriage return; `\n` is Ctrl-J, which an agent TUI reads as "newline in the
-    // composer". But fixing only the terminator was not enough: the whole message reaches the pty
-    // in a single write, and a multi-line chunk arriving at once is taken for a PASTE — inside
-    // which even `\r` is a literal newline. Both versions typed the assignment into the pane and
-    // left it sitting there unsent. No error, no refusal, a worker that never started, and
-    // nothing on the board to say so; every check passed, because the string was right and the
-    // bytes were not.
-    //
-    // The fix that keeps the line breaks is to send the Enter as a second write, later — and
-    // "later" would have to outlast the reader's paste heuristic on a loaded machine, which is a
-    // race dressed up as a fix. With no newline there is nothing to mistake for a paste, so the
-    // return is unambiguous. The reader is an agent; the line breaks were only ever for us, and
-    // `mars brief show` still wraps it for a human.
+    // ONE LINE. `typed_bytes` frames it; between them they are the only combination that sends —
+    // see its comment for the four shapes that did not.
     Some(format!(
         "First read {} — that is how we work here. \
          Then read {} — that is what to build. \
-         Start building.\r",
+         Start building.",
         briefs.join("WORKING-MODEL.md").display(),
         briefs.join(id).join("brief.md").display(),
     ))
@@ -295,11 +282,10 @@ pub fn draft_assignment(id: &str, home: &Path) -> Option<String> {
         return None;
     }
     let briefs = home.join(".mars").join("briefs");
-    // One line ending in `\r`, for the reason spelled out in `assignment`.
     Some(format!(
         "First read {} — that is how we plan here. \
          Then fill in {} — it is scaffolded and empty. \
-         Start planning.\r",
+         Start planning.",
         briefs.join("PLANNING-MODEL.md").display(),
         briefs.join(id).join("brief.md").display(),
     ))
@@ -358,6 +344,34 @@ fn deny_section(argv: &str) -> &str {
         Some(a) if a > d => &argv[d..a],
         _ => &argv[d..],
     }
+}
+
+/// Turn a message into the bytes that actually SEND it to an agent TUI.
+///
+/// Every shape here was tried against a live pane, and every failure passed every test that
+/// existed at the time — the tests read the string, and the defect was in the bytes.
+///
+/// | shape | result |
+/// |---|---|
+/// | multi-line, ends `\n` | not sent — `\n` is Ctrl-J, "insert a newline" |
+/// | multi-line, ends `\r` | not sent — one large write reads as a paste, and the return with it |
+/// | one line, ends `\r` | not sent — still one large write (measured: 209 bytes) |
+/// | multi-line, bracketed, ends `\r` | not sent — a multi-line paste waits for its own Enter |
+/// | **one line, bracketed, ends `\r`** | **sent** |
+///
+/// Every failure looked identical from outside: the message typed into the pane, no error, no
+/// refusal, an agent that never started, and nothing on the board to say so.
+///
+/// So both halves are load-bearing and neither is decoration. `ESC[200~ … ESC[201~` says "this is
+/// a paste" outright, which ends it at a known byte and leaves the `\r` after it unambiguously
+/// Enter — in the same write, with no timing assumption. And the body stays one line, because a
+/// multi-line paste is a block the composer holds for review. The alternative was a second write
+/// delayed long enough to outlast a heuristic on a loaded machine, which is a race wearing a
+/// fix's clothes.
+///
+/// The line breaks were only ever for us; `mars brief show` still wraps it for a human.
+pub fn typed_bytes(text: &str) -> String {
+    format!("\x1b[200~{}\x1b[201~\r", text.trim_end())
 }
 
 /// Is the agent running in this pane scoped as a worker?

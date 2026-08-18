@@ -2165,7 +2165,7 @@ impl App {
         }
         let msg = crate::briefs::assignment(brief, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
-            t.send_bytes(msg.as_bytes());
+            t.send_bytes(crate::briefs::typed_bytes(&msg).as_bytes());
         }
         Ok(())
     }
@@ -2229,7 +2229,7 @@ impl App {
         let (id, _path) = crate::briefs::create(title, ts).map_err(|e| e.to_string())?;
         let msg = crate::briefs::draft_assignment(&id, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
-            t.send_bytes(msg.as_bytes());
+            t.send_bytes(crate::briefs::typed_bytes(&msg).as_bytes());
         }
         Ok(id)
     }

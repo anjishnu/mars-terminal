@@ -525,11 +525,11 @@ fn main() -> Result<()> {
                         anyhow::bail!("no brief at {}", dir.display());
                     }
                     println!("state: {}\n", briefs::state_of(&dir).label());
-                    println!("Assigning types exactly this into the pane, as ONE line ending in\n\
-                              Enter — wrapped here only for reading:\n");
+                    println!("Assigning types exactly this into the pane — ONE line, wrapped here\n\
+                              only for reading:\n");
                     let mut col = 0;
                     print!("  ");
-                    for word in msg.trim_end().split(' ') {
+                    for word in msg.split(' ') {
                         if col + word.chars().count() > 84 {
                             print!("\n  ");
                             col = 0;
@@ -537,7 +537,11 @@ fn main() -> Result<()> {
                         print!("{word} ");
                         col += word.chars().count() + 1;
                     }
-                    println!();
+                    println!(
+                        "\n\n(sent as a bracketed paste ending in Enter. Both halves matter: without\n\
+                         the framing, or with a line break in it, the message sits in the composer\n\
+                         unsent and the worker never starts.)"
+                    );
                     println!();
                     println!(
                         "That is the whole message. Every rule a worker follows lives in\n\
@@ -8359,22 +8363,24 @@ fn selfcheck() -> Result<()> {
         assert!(msg.contains("/home/x/.mars/briefs/brief-1-x/brief.md"), "the brief: {msg}");
         assert!(msg.starts_with("First read ") && msg.trim_end().ends_with("Start building."),
             "first, then, go — an agent handed paths with no imperative asks what to do next");
-        assert!(msg.len() < 400,
+        assert!(msg.lines().count() == 1 && msg.len() < 400,
             "an assignment is two addresses and a go, not a thousand-line prompt ({} bytes)", msg.len());
-        // THE BYTES THAT MAKE IT SEND, and this pair is here because two versions that failed it
-        // passed every other check in this block.
-        //
-        // Enter is `\r`; `\n` is Ctrl-J, which an agent TUI reads as "newline in the composer".
-        // And a multi-line chunk arriving in one pty write is taken for a PASTE, inside which
-        // even `\r` is literal — so the newlines have to go too, or the Enter has to be a second
-        // write timed to outlast a heuristic, which is a race, not a fix. Both failing versions
-        // typed the whole assignment into a real pane and left it sitting there unsent: no error,
-        // a worker that never started, nothing on the board to say so. The string was right and
-        // the bytes were not, which is exactly what a string-shaped test cannot see.
-        assert!(msg.ends_with('\r'), "an assignment that does not end in Enter is never submitted");
+        // THE BYTES THAT MAKE IT SEND. Three shapes failed here before this check existed, and
+        // every one passed every other assertion in this block — the string was right and the
+        // bytes were not, which is precisely what a string-shaped test cannot see. Ending in `\n`
+        // (Ctrl-J: insert a newline), ending in `\r` (one big write, read as a paste, return
+        // swallowed), and collapsing to a single line (still one big write). Each looked the same
+        // from outside: typed into the pane, never sent, no error, nothing on the board.
+        let bytes = briefs::typed_bytes(&msg);
+        assert!(bytes.starts_with("\x1b[200~"), "the paste must be opened explicitly");
+        assert!(bytes.ends_with("\x1b[201~\r"),
+            "the return has to fall OUTSIDE the paste, or it is literal text like everything in it");
+        assert!(bytes.contains(&msg), "the message must survive the framing intact");
         assert!(!msg.contains('\n'),
-            "a newline makes the pty write look like a paste, and a paste swallows the Enter");
-        assert_eq!(msg.lines().count(), 1, "one line, or it is pasted rather than sent");
+            "a multi-line paste is held for review — the composer wants its own Enter, and never gets one");
+        // Idempotence matters: two workers must be told the same bytes, or "what was this worker
+        // told" stops being answerable.
+        assert_eq!(bytes, briefs::typed_bytes(&msg), "same bytes every time");
         // The guard against the paragraph growing back. Every rule a worker follows belongs in
         // WORKING-MODEL.md, where it is versioned; a rule that leaks into the typed message is a
         // rule with one home, rewritten by whoever next edits the composer, invisible to whoever
@@ -8482,9 +8488,10 @@ fn selfcheck() -> Result<()> {
         assert!(dmsg.contains("/home/x/.mars/briefs/brief-1-x/brief.md"), "the brief to fill: {dmsg}");
         assert!(dmsg.starts_with("First read ") && dmsg.trim_end().ends_with("Start planning."),
             "first, then, go — the same shape as an assignment, so neither drifts alone");
-        assert!(dmsg.lines().count() == 1 && dmsg.len() < 400, "two addresses and a go, on one line");
-        assert!(dmsg.ends_with('\r'), "a draft that does not end in Enter is never submitted");
-        assert!(!dmsg.contains('\n'), "same paste hazard as an assignment");
+        assert!(dmsg.lines().count() == 1 && !dmsg.contains('\n') && dmsg.len() < 400,
+            "two addresses and a go, on one line");
+        assert!(briefs::typed_bytes(&dmsg).ends_with("\x1b[201~\r"),
+            "a draft reaches the pane the same way an assignment does, or only one of them sends");
         assert_ne!(dmsg, briefs::assignment("brief-1-x", home).unwrap(),
             "planning and building are different instructions and must not collapse into one");
         assert!(briefs::draft_assignment("../../etc/passwd", home).is_none());
