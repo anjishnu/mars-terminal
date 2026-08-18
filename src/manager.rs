@@ -1329,6 +1329,22 @@ pub fn compose_batch(
         "opened": iso(opened_ts), "opened_ts": opened_ts,
         "updated": iso(ts), "updated_ts": ts,
         "sessions": entries,
+        // D4. The size of each memory file, in front of the agent at the top of the run rather
+        // than in a doc it read three steps ago. A bound stated in prose is a rule the model has
+        // to remember while doing everything else; a number beside the file is one it can see.
+        "memory": memory_sizes(repo).into_iter().map(|(name, words)| serde_json::json!({
+            "file": format!("memory/{name}"),
+            "words": words,
+            "bound": MEMORY_WORD_BOUND,
+            "over": words > MEMORY_WORD_BOUND,
+        })).collect::<Vec<_>>(),
+        // D6. THE SCORE, WHERE ITS SUBJECT WILL SEE IT.
+        //
+        // `score_runs` has written 789 judgements to `memory/runs.jsonl` and the agent has never
+        // read one — `AGENTS.md` does not mention the file. A 46% fault rate was therefore true,
+        // recorded and displayed for days without being able to change anything. A scorer whose
+        // subject cannot read it is telemetry, not a control loop.
+        "your_recent_runs": recent_runs(repo, 5),
     });
     std::fs::write(&path, serde_json::to_string_pretty(&body)?)?;
     Ok(Some(path))
@@ -1751,6 +1767,19 @@ fn score_runs(repo: &Path, ts: u64) {
                     }
                 }
             }
+            // D4. A memory file past its bound is a defect in the run that is about to read it,
+            // so it is scored like any other. Prose said "a few hundred words" and nothing
+            // measured it; this turns invisible drift into a number in the tally.
+            for (name, words) in memory_sizes(repo) {
+                if words > MEMORY_WORD_BOUND {
+                    faults.push(serde_json::json!({
+                        "kind": "memory-oversize",
+                        "path": format!("memory/{name}"),
+                        "words": words,
+                        "bound": MEMORY_WORD_BOUND,
+                    }));
+                }
+            }
             let no_receipt = receipt.get("wrote").is_none();
             if no_receipt {
                 faults.push(serde_json::json!({ "kind": "no-receipt" }));
@@ -2044,6 +2073,70 @@ fn seed(path: &Path, body: &str) -> Result<()> {
 
 /// Seed a repo's standing orders, for a test that needs the real upgrade path rather than a
 /// pristine one built from the built-ins.
+/// The last few scored runs, newest last — the agent's own record of how it did.
+///
+/// Trimmed to what is actionable: which batch, whether it passed, and the fault kinds. The full
+/// row carries timings and byte counts that would cost context without changing a decision.
+pub fn recent_runs(repo: &Path, n: usize) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(repo.join("memory/runs.jsonl")).unwrap_or_default();
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    rows.iter()
+        .rev()
+        .take(n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|v| serde_json::json!({
+            "batch": v["batch"],
+            "ok": v["ok"],
+            "faults": v["faults"].as_array().map(|a| a.iter()
+                .filter_map(|f| f["kind"].as_str().map(String::from))
+                .collect::<Vec<_>>()).unwrap_or_default(),
+        }))
+        .collect()
+}
+
+/// The agent's own checklist, as shipped. Exposed so a selfcheck can assert that an instruction
+/// exists — or, more usefully, that a dead one no longer does.
+pub const AGENTS_MD: &str = include_str!("manager_docs/AGENTS.md");
+
+/// What "a few hundred words" means, as a number something can check.
+///
+/// `docs/memory.md` states the bound in prose — "a few hundred words per file… if it cannot be
+/// read at the start of every run, it will not be, and your reflection becomes write-only". Prose
+/// is a rule an LLM has to remember while doing everything else, and nothing measured the file.
+/// Measured now: 5,096 words in `beliefs.md` and 28,052 in `projects.md`, against a bound of a few
+/// hundred, re-read at the top of every run.
+///
+/// Generous on purpose. The point is to catch a file that has stopped being readable, not to
+/// police a good one.
+pub const MEMORY_WORD_BOUND: usize = 800;
+
+/// Every memory file, with its size and whether it is still within its bound.
+///
+/// Computed by reading the directory rather than from a list, so a file the agent invents is
+/// measured too — an unbounded memory nobody named is the same problem as an unbounded one
+/// somebody did.
+pub fn memory_sizes(repo: &Path) -> Vec<(String, usize)> {
+    let dir = repo.join("memory");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<(String, usize)> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md"))
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            let words = std::fs::read_to_string(&p).ok()?.split_whitespace().count();
+            Some((name, words))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
 /// Where a run's receipt actually is.
 ///
 /// Two spellings because the contract was ambiguous: the documented name, and the one a literal

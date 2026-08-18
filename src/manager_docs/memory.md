@@ -1,4 +1,4 @@
-<!-- mars-doc-version: 6 -->
+<!-- mars-doc-version: 7 -->
 # Memory
 
 Two files. You read them first, every run, and revise them last.
@@ -38,8 +38,16 @@ briefing that contradicts the real one.
 - **Revise, never append.** A belief that turned out wrong is corrected in place, not stacked
   under its replacement. Append-only memory contradicts itself within a week, and then it stops
   being read — which is worse than having none.
-- **Bounded.** A few hundred words per file. If it cannot be read at the start of every run, it
-  will not be, and your reflection becomes write-only.
+- **Bounded — 800 words per file, and it is measured.** Not a target you aim at: the batch reports
+  each file's size, and a file over the bound is a scored fault on every run until it is fixed.
+  If it cannot be read at the start of every run, it will not be, and your reflection becomes
+  write-only. This bound was prose for a long time and prose is a rule you have to remember while
+  doing everything else — by the time it was measured, `projects.md` held 28,052 words and was
+  being re-read at the top of every run.
+- **Split by lifecycle, not by topic.** `Purpose:` is durable; `State:` and `Next:` are today. In
+  one file the durable half gets re-read at the cost of the volatile half, and the volatile half
+  never gets pruned because the durable half looks load-bearing. When a file goes over, that split
+  is usually the fix — not deleting history you will want.
 - **Date what you confirm.** `_confirmed <date>_` per project, so a stale belief is visibly stale
   rather than quietly wrong.
 - **Only write what you could cite.** Beliefs are not a licence to speculate about intent. If you

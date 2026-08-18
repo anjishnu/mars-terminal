@@ -6809,7 +6809,79 @@ fn selfcheck() -> Result<()> {
             let _ = std::fs::remove_file(repo.join("runs").join(format!("{batch}.json")));
         }
 
+        // ── D4/D5/D6: THE THINGS THAT WERE TRUE, RECORDED, AND UNREADABLE ────────────────
+        {
+            // A bound stated only in prose is a rule the model must remember while doing
+            // everything else. Nothing measured it, and `projects.md` reached 28,052 words
+            // against "a few hundred" — re-read at the top of all 789 runs.
+            std::fs::create_dir_all(repo.join("memory"))?;
+            let fat = repo.join("memory/oversize-fixture.md");
+            std::fs::write(&fat, "word ".repeat(manager::MEMORY_WORD_BOUND + 50))?;
+            let sizes = manager::memory_sizes(&repo);
+            let found = sizes.iter().find(|(n, _)| n == "oversize-fixture.md")
+                .expect("memory_sizes did not see a .md file in memory/");
+            assert!(found.1 > manager::MEMORY_WORD_BOUND, "word count is wrong: {found:?}");
+            assert!(sizes.windows(2).all(|w| w[0].1 >= w[1].1), "not ordered biggest-first: {sizes:?}");
+
+            let over = score("batch-fat.json", serde_json::json!({
+                "wrote": [], "skipped": [{"session": "0", "why": "nothing moved"}],
+                "cursor": { "0": "b.json" },
+            }), 7_000_000, false);
+            assert!(kinds(&over).iter().any(|k| k == "memory-oversize"),
+                "a memory file past its bound did not score as a fault: {over}");
+            let _ = std::fs::remove_file(&fat);
+            // ...and it clears when the file does, or the fault is a permanent alarm.
+            let clean = score("batch-thin.json", serde_json::json!({
+                "wrote": [], "skipped": [{"session": "0", "why": "nothing moved"}],
+                "cursor": { "0": "b.json" },
+            }), 7_000_000, false);
+            assert!(!kinds(&clean).iter().any(|k| k == "memory-oversize"),
+                "the oversize fault outlived the oversize file: {clean}");
+
+            // D6. A scorer whose subject cannot read it is telemetry, not a control loop. 789
+            // judgements were written and AGENTS.md never mentioned the file.
+            let recent = manager::recent_runs(&repo, 5);
+            assert!(!recent.is_empty(), "recent_runs found nothing to feed back");
+            let last = recent.last().unwrap();
+            assert!(last["batch"].is_string() && last["ok"].is_boolean() && last["faults"].is_array(),
+                "a run summary must say which batch, whether it passed, and what faulted: {last}");
+            assert!(recent.len() <= 5, "recent_runs ignored its limit");
+            assert!(manager::AGENTS_MD.contains("your_recent_runs"),
+                "the batch carries the score and the agent is never told to read it");
+            assert!(manager::AGENTS_MD.contains("\"over\": true"),
+                "the batch reports memory sizes and the agent is never told what to do about one");
+
+            // D5. An instruction that can never fire teaches the model the checklist is
+            // approximate. No `conv/` directory has ever existed and no workspace carries a
+            // `chat` key, so step 8 was dead text in a prompt read 789 times.
+            assert!(!manager::AGENTS_MD.contains("conv/<pane-id>.md"),
+                "step 8 still asks for a file that cannot exist");
+            let steps: Vec<usize> = manager::AGENTS_MD.lines()
+                .filter_map(|l| l.split_once(". **").and_then(|(n, _)| n.trim().parse().ok()))
+                .collect();
+            assert_eq!(steps, (1..=12).collect::<Vec<usize>>(),
+                "the checklist skips or repeats a number: {steps:?}");
+
+            // D7. THE RUN'S PRODUCT IS A JUDGEMENT, NOT A DOCUMENT. The board is already
+            // summarised by arithmetic, every tick, whether the agent runs or not — so a briefing
+            // that restates it costs a read and buys nothing, and writing one to justify having
+            // woken up is the padding the whole design exists to prevent.
+            for must in [
+                // Fragments, because the doc wraps — a check that assumes a line break is a check
+                // that fails the next time somebody reflows the paragraph.
+                "is there anything the engineer",
+                "the rows do not already say",
+                "\"No\" is the expected answer",
+                "only if the one question came back yes",
+            ] {
+                assert!(manager::AGENTS_MD.contains(must),
+                    "the run has no gate on whether it is worth writing: {must:?}");
+            }
+        }
+
         println!("[selfcheck] manager: run scoring audits the receipt, not a file list ... PASS");
+        println!("[selfcheck] manager: an unbounded memory file is a scored fault, not a sentence ... PASS");
+        println!("[selfcheck] manager: the agent is shown its own score, and the checklist has no dead step ... PASS");
         println!("[selfcheck] manager: a session's id and name are both accepted, neither guessed ... PASS");
         println!("[selfcheck] manager: a misnamed receipt is found and named, not read as absent ... PASS");
 
