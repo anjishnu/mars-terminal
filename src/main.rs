@@ -6875,16 +6875,25 @@ fn selfcheck() -> Result<()> {
                 "wrote": [], "skipped": [{"session": "0", "why": "nothing moved"}],
                 "cursor": { "0": "b.json" },
             }), 7_000_000, false);
-            assert!(kinds(&over).iter().any(|k| k == "memory-oversize"),
-                "a memory file past its bound did not score as a fault: {over}");
+            let conds: Vec<String> = over["conditions"].as_array().map(|a| a.iter()
+                .filter_map(|c| c["kind"].as_str().map(String::from)).collect()).unwrap_or_default();
+            assert!(conds.iter().any(|k| k == "memory-oversize"),
+                "an oversize memory file was not reported at all: {over}");
+            // ...but it must NOT sink the run. A standing condition of the repo is not something
+            // this run did, and an alarm that cannot clear on the run's own merits makes `ok`
+            // permanently false — the same failure as scoring a reasoned skip as silence.
+            assert!(over["ok"].as_bool().unwrap_or(false),
+                "an oversize memory file scored the run as a failure: {over}");
+            assert!(!kinds(&over).iter().any(|k| k == "memory-oversize"),
+                "a standing condition is filed as a fault: {over}");
             let _ = std::fs::remove_file(&fat);
             // ...and it clears when the file does, or the fault is a permanent alarm.
             let clean = score("batch-thin.json", serde_json::json!({
                 "wrote": [], "skipped": [{"session": "0", "why": "nothing moved"}],
                 "cursor": { "0": "b.json" },
             }), 7_000_000, false);
-            assert!(!kinds(&clean).iter().any(|k| k == "memory-oversize"),
-                "the oversize fault outlived the oversize file: {clean}");
+            assert!(clean["conditions"].as_array().is_some_and(|a| a.is_empty()),
+                "the oversize condition outlived the oversize file: {clean}");
 
             // D6. A scorer whose subject cannot read it is telemetry, not a control loop. 789
             // judgements were written and AGENTS.md never mentioned the file.

@@ -1781,19 +1781,23 @@ fn score_runs(repo: &Path, ts: u64) {
                     }
                 }
             }
-            // D4. A memory file past its bound is a defect in the run that is about to read it,
-            // so it is scored like any other. Prose said "a few hundred words" and nothing
-            // measured it; this turns invisible drift into a number in the tally.
-            for (name, words) in memory_sizes(repo) {
-                if words > MEMORY_WORD_BOUND {
-                    faults.push(serde_json::json!({
-                        "kind": "memory-oversize",
-                        "path": format!("memory/{name}"),
-                        "words": words,
-                        "bound": MEMORY_WORD_BOUND,
-                    }));
-                }
-            }
+            // D4. A memory file past its bound is real and worth seeing — but it is a STANDING
+            // CONDITION of the repo, not something this run did.
+            //
+            // Filed as a fault it would sink `ok` on every run until somebody trimmed a file, so
+            // an agent that did everything right would score as a failure — which is precisely the
+            // bug just fixed one screen up, arriving from the other direction. An alarm that
+            // cannot clear on the run's own merits stops meaning anything, and takes `ok` with it.
+            let conditions: Vec<serde_json::Value> = memory_sizes(repo)
+                .into_iter()
+                .filter(|(_, words)| *words > MEMORY_WORD_BOUND)
+                .map(|(name, words)| serde_json::json!({
+                    "kind": "memory-oversize",
+                    "path": format!("memory/{name}"),
+                    "words": words,
+                    "bound": MEMORY_WORD_BOUND,
+                }))
+                .collect();
             let no_receipt = receipt.get("wrote").is_none();
             if no_receipt {
                 faults.push(serde_json::json!({ "kind": "no-receipt" }));
@@ -1816,6 +1820,9 @@ fn score_runs(repo: &Path, ts: u64) {
                     "sessions": sessions.len(), "claimed": claimed.len(),
                     "skipped": receipt["skipped"].as_array().map(|a| a.len()).unwrap_or(0),
                     "faults": faults, "ok": faults.is_empty(),
+                    // Separate key, deliberately: `ok` is about the run's conduct, and this is
+                    // about the repo it ran in. Both are true; only one is the agent's doing.
+                    "conditions": conditions,
                 })
             ));
         }
