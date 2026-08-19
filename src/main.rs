@@ -9038,6 +9038,61 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] briefs: drafting points at a brief that already exists ... PASS");
     }
 
+    // ── THE WEB TERMINAL'S KEYBOARD ──────────────────────────────────────────────────────────
+    //
+    // A browser sends the bytes a terminal would; MARS reads crossterm events. A decoder that
+    // guesses wrong does not produce a no-op — it produces somebody else's command, in a live
+    // session, from a browser tab.
+    {
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let d = |s: &[u8]| session::decode_keys(s);
+        let one = |s: &[u8]| { let v = d(s); assert_eq!(v.len(), 1, "expected one key from {s:?}: {v:?}"); v[0] };
+
+        assert_eq!(one(b"a").code, K::Char('a'));
+        assert_eq!(one(b"\r").code, K::Enter);
+        assert_eq!(one(b"\t").code, K::Tab);
+        assert_eq!(one(b"\x7f").code, K::Backspace);
+        assert_eq!(one(b"\x1b").code, K::Esc, "a lone ESC is Escape, not the start of nothing");
+
+        // C-SPACE IS NUL. Mission control is bound to it, so a decoder that only handled the
+        // printable range would leave the browser unable to open the one thing MARS opens with.
+        let cs = one(b"\x00");
+        assert_eq!((cs.code, cs.modifiers), (K::Char(' '), M::CONTROL));
+        // The chords the splash screen advertises.
+        for (byte, ch) in [(0x18u8, 'x'), (0x14, 't'), (0x15, 'u'), (0x07, 'g'), (0x06, 'f')] {
+            let k = one(&[byte]);
+            assert_eq!((k.code, k.modifiers), (K::Char(ch), M::CONTROL), "C-{ch} did not decode");
+        }
+
+        // Arrows and navigation, in both CSI and SS3 forms — a real terminal sends either.
+        for (seq, code) in [
+            (&b"\x1b[A"[..], K::Up), (b"\x1b[B", K::Down), (b"\x1b[C", K::Right), (b"\x1b[D", K::Left),
+            (b"\x1bOA", K::Up), (b"\x1b[H", K::Home), (b"\x1b[F", K::End),
+            (b"\x1b[3~", K::Delete), (b"\x1b[5~", K::PageUp), (b"\x1b[6~", K::PageDown),
+        ] {
+            assert_eq!(one(seq).code, code, "{seq:?} did not decode");
+        }
+
+        // A run arrives as a run: xterm coalesces, and a decoder that read one key per frame
+        // would drop the rest of a fast typist's word.
+        let word = d(b"hi\r");
+        assert_eq!(word.len(), 3);
+        assert_eq!((word[0].code, word[2].code), (K::Char('h'), K::Enter));
+
+        // UTF-8 survives, so a pasted em-dash or an accented name is not mangled into bytes.
+        let uni = d("é—".as_bytes());
+        assert_eq!(uni.iter().map(|k| match k.code { K::Char(c) => c, _ => '?' }).collect::<String>(), "é—");
+
+        // AN UNRECOGNISED SEQUENCE IS DROPPED, NOT GUESSED. A mouse report or a bracketed-paste
+        // marker leaking through as `[`, `2`, `0`, `0`, `~` would type five characters nobody
+        // pressed into whatever has focus.
+        assert!(d(b"\x1b[200~").is_empty(), "bracketed paste leaked through as text");
+        assert!(d(b"\x1b[<0;1;1M").is_empty(), "a mouse report leaked through as text");
+        assert_eq!(d(b"\x1b[200~ok").iter().filter(|k| matches!(k.code, K::Char(_))).count(), 2,
+            "the paste marker was skipped but its payload must still arrive");
+        println!("[selfcheck] mirror: browser bytes decode to the chords MARS binds ... PASS");
+    }
+
     // ── THE TWO WAYS A BOARD LIES ABOUT CHANGING ─────────────────────────────────────────────
     //
     // Both directions, because they are the same defect and they cost opposite things. Over-detect

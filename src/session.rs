@@ -83,6 +83,12 @@ pub enum ClientFrame {
     /// A mirror renders the same frames to another screen and owns nothing: no ownership, no
     /// eviction, no `Exit` to anybody.
     Mirror { cols: u16, rows: u16 },
+    /// Keystrokes from a mirror, as the bytes a terminal would send.
+    ///
+    /// A mirror types without owning: no gen, no ownership check, no eviction. That is not a new
+    /// privilege — anything that can reach this socket could already `Attach` and take the session
+    /// outright — it is the same authority by a path that does not throw anyone off.
+    MirrorKeys { data: String },
     /// Mint an empty brief and set the planner in a pane drafting it. Same argument as
     /// `AssignBrief` for why the daemon does this rather than the bridge: the scope check needs a
     /// pid. The title travels because it is the one thing only the person pressing knows.
@@ -223,6 +229,77 @@ pub fn install_panic_restore() {
 }
 
 // ── Socket paths ─────────────────────────────────────────────────────────────
+
+/// Terminal input bytes → the key events MARS's TUI actually reads.
+///
+/// A browser hands us what a terminal would send; `apply_input` wants crossterm events. Between
+/// them sits this, and it is deliberately small: the chords MARS binds, and nothing speculative.
+/// A sequence we do not recognise is DROPPED rather than guessed at — a wrong key in a terminal
+/// is not a no-op, it is somebody else's command.
+///
+/// `C-Space` is `NUL`, not a space with a modifier, which is why mission control would never open
+/// from a browser if this only handled the printable range.
+pub fn decode_keys(bytes: &[u8]) -> Vec<KeyEvent> {
+    use crossterm::event::{KeyCode as K, KeyModifiers as M};
+    let mut out = Vec::new();
+    let mut i = 0;
+    let plain = |c: K| KeyEvent::new(c, M::NONE);
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            // ESC — alone it is Escape; followed by `[` or `O` it is a sequence.
+            0x1b => {
+                let rest = &bytes[i + 1..];
+                let (code, used) = match rest.first() {
+                    Some(b'[') | Some(b'O') => match rest.get(1) {
+                        Some(b'A') => (Some(K::Up), 3),
+                        Some(b'B') => (Some(K::Down), 3),
+                        Some(b'C') => (Some(K::Right), 3),
+                        Some(b'D') => (Some(K::Left), 3),
+                        Some(b'H') => (Some(K::Home), 3),
+                        Some(b'F') => (Some(K::End), 3),
+                        Some(b'3') if rest.get(2) == Some(&b'~') => (Some(K::Delete), 4),
+                        Some(b'5') if rest.get(2) == Some(&b'~') => (Some(K::PageUp), 4),
+                        Some(b'6') if rest.get(2) == Some(&b'~') => (Some(K::PageDown), 4),
+                        // An unrecognised CSI: skip to its final byte rather than emitting its
+                        // digits as if somebody had typed them.
+                        _ => {
+                            let end = rest.iter().position(|c| c.is_ascii_alphabetic() || *c == b'~');
+                            (None, end.map(|e| e + 2).unwrap_or(rest.len() + 1))
+                        }
+                    },
+                    _ => (Some(K::Esc), 1),
+                };
+                if let Some(c) = code {
+                    out.push(plain(c));
+                }
+                i += used;
+            }
+            0x00 => { out.push(KeyEvent::new(K::Char(' '), M::CONTROL)); i += 1; } // C-Space
+            b'\r' | b'\n' => { out.push(plain(K::Enter)); i += 1; }
+            b'\t' => { out.push(plain(K::Tab)); i += 1; }
+            0x7f | 0x08 => { out.push(plain(K::Backspace)); i += 1; }
+            // C-a … C-z, minus the three above that have their own meaning.
+            0x01..=0x1a => {
+                let ch = (b'a' + (b - 1)) as char;
+                out.push(KeyEvent::new(K::Char(ch), M::CONTROL));
+                i += 1;
+            }
+            _ => {
+                // UTF-8, so a pasted em-dash or an accented name arrives intact.
+                let len = if b < 0x80 { 1 } else if b >> 5 == 0b110 { 2 } else if b >> 4 == 0b1110 { 3 } else { 4 };
+                let end = (i + len).min(bytes.len());
+                if let Ok(s) = std::str::from_utf8(&bytes[i..end]) {
+                    for c in s.chars() {
+                        out.push(plain(K::Char(c)));
+                    }
+                }
+                i = end;
+            }
+        }
+    }
+    out
+}
 
 /// Mention Rover exactly once, ever, on this machine.
 ///
@@ -646,6 +723,7 @@ enum SrvEvent {
     /// A second render target joined. Carries its own stream and size: one `Terminal` has one
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
     Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16 },
+    MirrorKeys { data: String },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
     Subscribe { stream: crate::sys::control::Stream },
@@ -1022,6 +1100,23 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         app.needs_redraw = true; // a fresh target needs a full frame
                     }
                     Err(e) => debug_log(&format!("srv: mirror terminal: {e}")),
+                }
+            }
+            Ok(SrvEvent::MirrorKeys { data }) => {
+                // Applied exactly like a client's keys, minus the ownership gate — a mirror types
+                // without owning. Anything that reaches this socket could already `Attach` and
+                // take the session outright, so this is the same authority by a path that throws
+                // nobody off.
+                for key in decode_keys(data.as_bytes()) {
+                    let ev = InputEvent::Key(key);
+                    let visible = ev.forces_redraw();
+                    if visible {
+                        app.mobile_reflow = None;
+                    }
+                    let _ = app.apply_input(ev);
+                    if visible {
+                        app.needs_redraw = true;
+                    }
                 }
             }
             Ok(SrvEvent::PaneInput { pane, data }) => {
@@ -1482,11 +1577,20 @@ fn client_connection(
             if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows }).is_err() {
                 return;
             }
-            // Held open: dropping the connection here would close the socket the daemon is
-            // drawing to.
-            let mut sink = String::new();
-            while reader.read_line(&mut sink).unwrap_or(0) > 0 {
-                sink.clear();
+            // Held open — dropping here would close the socket the daemon is drawing to — and
+            // read, because this is also the channel the browser types on.
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                if let Ok(ClientFrame::MirrorKeys { data }) = serde_json::from_str(line.trim()) {
+                    if tx.send(SrvEvent::MirrorKeys { data }).is_err() {
+                        break;
+                    }
+                }
             }
             return;
         }

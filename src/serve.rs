@@ -1467,6 +1467,12 @@ fn agent_provenance(cfg: &crate::agent::AgentConfig) -> String {
 
 /// Handle an inbound Rover message. `ask`/`summarize` are proxied to the host LLM (async,
 /// result pushed back over `tx`); raw keystrokes/paste go to the pane.
+/// The mirror's own write half, so a keystroke reaches the connection its frames come from.
+///
+/// One per bridge process: a browser drives one session at a time, and a second desk tab replaces
+/// the first rather than typing into it by accident.
+static MIRROR_IN: std::sync::Mutex<Option<crate::sys::control::Stream>> = std::sync::Mutex::new(None);
+
 fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket: &std::path::Path, txt: &str) {
     let v: serde_json::Value = match serde_json::from_str(txt) {
         Ok(v) => v,
@@ -2026,6 +2032,12 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows }).is_err() {
                 return;
             }
+            // Kept so `mirror.key` can write to the same connection the frames come from — a
+            // keystroke on a different socket would reach a daemon that has no idea which mirror
+            // it belongs to.
+            if let Ok(w2) = sock.try_clone() {
+                *MIRROR_IN.lock().unwrap() = Some(w2);
+            }
             let out = tx.clone();
             std::thread::spawn(move || {
                 let mut lines = BufReader::new(sock);
@@ -2046,6 +2058,17 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 }
                 let _ = out.send(serde_json::json!({"t": "mirror.gone", "why": "the session ended"}).to_string());
             });
+        }
+        // Typing into the web terminal. Straight through: the daemon decodes the bytes, because
+        // the mapping from a terminal's bytes to MARS's chords is MARS's business and a second
+        // copy of it in the phone bundle is a second copy that drifts.
+        Some("mirror.key") => {
+            let data = v.get("data").and_then(|x| x.as_str()).unwrap_or("");
+            if !data.is_empty() {
+                if let Some(w) = MIRROR_IN.lock().unwrap().as_mut() {
+                    let _ = session::write_frame(w, &ClientFrame::MirrorKeys { data: data.to_string() });
+                }
+            }
         }
         // Same, for the planner scope — the one role allowed to write a brief.
         Some("brief.planner") => {
