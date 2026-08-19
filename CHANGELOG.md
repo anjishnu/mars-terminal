@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.7.1
+
+A second render target stops fighting the first. The web terminal shipped in 0.7.0 could
+draw MARS into a browser; what it also did, silently, was resize the session twice a frame
+for as long as the tab was open. This release makes the session own its own size, and makes
+everything watching it a viewport that copies rather than a client that decides.
+
+### Fixed
+- **A browser tab no longer garbles the session.** `ui::render` writes the size of every
+  pane's PTY, which was safe while there was one render target and "the size I am drawing
+  at" and "the size the session is" were the same fact. A mirror made them two facts and
+  left one variable, so the two targets resized the panes against each other on every
+  frame. A shell prompt shrugs that off; a full-screen TUI re-lays-out on each SIGWINCH and
+  emits diffs against a width that already moved, which is why agent panes turned to
+  confetti while shells only looked slightly wrong. The session now renders once into a
+  grid that belongs to no target — tmux's arrangement — and the owner's terminal decides
+  the size. A mirror is told the real size so it can fit the whole screen rather than show
+  the top-left corner of one.
+- **Resizing a browser stopped reporting the session as ended.** Re-mirroring drops the
+  previous connection, whose reader dutifully announced `mirror.gone` to a page that had
+  merely been resized. Only the current mirror reports a death now.
+- **Dead render targets are collected.** `FrameWriter::flush` swallowed write errors and
+  returned `Ok`, so closed browser tabs stayed in the mirror list forever and were drawn
+  to on every frame.
+- **The conversation window stopped spending itself on harness noise.** Claude Code files
+  `<system-reminder>` injections as ordinary user messages, so three of the six rows in an
+  agent pane's window could be reminders and slash commands. Filtered, and the filter
+  discriminates: a message that merely begins with a slash is still a message.
+
+### Added
+- **`mars pair --desk` prints a link that can leave the machine.** It only ever emitted
+  loopback, so there was no `/desk` URL that worked from a phone. `pair_link` takes the
+  route now rather than hardcoding `/rover`.
+- **`ClientFrame::NewAgent`** — open a terminal and start a coding agent in it. Distinct
+  from `NewTerminal` because the two promise different things: a terminal is ready when it
+  exists, an agent pane is not ready until a line has been written into a shell that is
+  actually reading, and the host owns that wait.
+
+### Note
+`SESSION_PROTOCOL_VERSION` carries the crate version, so a 0.7.1 client will not attach to
+a 0.7.0 daemon. Run `mars upgrade --yes` after installing.
+
 ## 0.7.0
 
 Mars grows a second head. A long agent run doesn't need you at the keyboard — it needs
