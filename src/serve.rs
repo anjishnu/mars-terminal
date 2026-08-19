@@ -2002,6 +2002,51 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 }).to_string());
             });
         }
+        // THE WEB TERMINAL. A second daemon connection, opened as a Mirror, whose rendered
+        // frames are pumped to this browser.
+        //
+        // A separate connection on purpose: the first one is a `Subscribe` and a socket speaks one
+        // role for its lifetime. And a mirror must be able to come and go — a closed browser tab
+        // should cost its own connection and nothing else, least of all the board this phone is
+        // watching over the other one.
+        //
+        // Nothing is transcoded. `FrameWriter` already emits `ServerFrame::Output { b64 }`, which
+        // is the same frame a real client receives, so the bytes reaching xterm.js are the bytes
+        // MARS drew.
+        Some("mirror") => {
+            let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(120).clamp(20, 400) as u16;
+            let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(32).clamp(8, 200) as u16;
+            let Ok(sock) = crate::sys::control::connect(socket) else {
+                let _ = tx.send(serde_json::json!({
+                    "t": "mirror.gone", "why": "could not reach the session",
+                }).to_string());
+                return;
+            };
+            let mut w = match sock.try_clone() { Ok(w) => w, Err(_) => return };
+            if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows }).is_err() {
+                return;
+            }
+            let out = tx.clone();
+            std::thread::spawn(move || {
+                let mut lines = BufReader::new(sock);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match lines.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    if let Ok(ServerFrame::Output { b64 }) = serde_json::from_str(line.trim()) {
+                        // Same envelope the pane path uses, under its own name so a desk shell and
+                        // a pane view can be open at once without reading each other's bytes.
+                        if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
+                            break;
+                        }
+                    }
+                }
+                let _ = out.send(serde_json::json!({"t": "mirror.gone", "why": "the session ended"}).to_string());
+            });
+        }
         // Same, for the planner scope — the one role allowed to write a brief.
         Some("brief.planner") => {
             if let Some(pane) = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()) {
