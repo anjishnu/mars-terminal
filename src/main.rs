@@ -3211,7 +3211,37 @@ fn selfcheck() -> Result<()> {
                      keyboard is looking at; wire: {wire}"
                 );
 
-                // 4. And the board channel is untouched — three roles on one socket type, and
+                // 4. TYPING IN THE MIRROR MOVES THE GRID TO IT — and only typing does.
+                //
+                //    The assertion above proves an attach moves nothing. This proves the other
+                //    half: a target being worked in is the one the session is drawn for. Without
+                //    it a desk terminal 239 columns wide pinned a browser to a 3.6px cell for as
+                //    long as an idle window stayed attached, which is the bug this pair of
+                //    assertions exists to keep apart from the one above.
+                session::write_frame(&mut mw, &session::ClientFrame::MirrorKeys { data: "x".into() })?;
+                let mut moved: Option<(u16, u16)> = None;
+                let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(6);
+                while std::time::Instant::now() < deadline2 {
+                    let mut line = String::new();
+                    match mr.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    if let Ok(session::ServerFrame::GridSize { cols, rows, .. }) =
+                        serde_json::from_str(line.trim())
+                    {
+                        moved = Some((cols, rows));
+                        break;
+                    }
+                }
+                assert_eq!(
+                    moved,
+                    Some((64, 20)),
+                    "typing in a mirror did not move the grid to it: the session should be drawn \
+                     for the target being worked in, not for an attached window nobody is using"
+                );
+
+                // 5. And the board channel is untouched — three roles on one socket type, and
                 //    only one of them owns anything.
                 assert!(next_board(&mut sub_r, 5).is_some(),
                     "the subscriber stopped receiving boards once a mirror attached");

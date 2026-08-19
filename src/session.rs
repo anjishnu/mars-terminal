@@ -756,8 +756,8 @@ enum SrvEvent {
     DraftBrief { pane: usize, title: String },
     /// A second render target joined. Carries its own stream and size: one `Terminal` has one
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
-    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16 },
-    MirrorKeys { data: String },
+    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64 },
+    MirrorKeys { data: String, id: u64 },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
     Subscribe { stream: crate::sys::control::Stream },
@@ -922,8 +922,26 @@ fn make_grid(cols: u16, rows: u16) -> Result<Terminal<GridBackend>> {
     Ok(term)
 }
 
+/// Which render target most recently received a keystroke.
+///
+/// THE POINT IS INPUT, NOT ATTACHMENT. Opening a browser tab still moves nothing — that property
+/// is selfchecked and it is why the mirror exists. But a session has one PTY and therefore one
+/// size, and when the person is demonstrably working in a target, that target is the one whose
+/// shape the programs inside should be laid out for. tmux calls this `window-size latest` and has
+/// lived with it for twenty years.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastInput {
+    Owner,
+    Mirror(u64),
+}
+
+/// Mirror identities. A vector index is a derived id — it changes when an earlier mirror is
+/// pruned — so the target that was typed into would silently become a different one.
+static MIRROR_IDS: AtomicU64 = AtomicU64::new(1);
+
 /// A second render target. Owns nothing — not the session, and not its size.
 struct MirrorTarget {
+    id: u64,
     term: Terminal<CrosstermBackend<FrameWriter>>,
     /// A private handle on the same socket, for the frames that are not rendered bytes.
     sock: crate::sys::control::Stream,
@@ -936,21 +954,43 @@ struct MirrorTarget {
 
 /// The one size the session draws itself at.
 ///
-/// THE OWNER'S TERMINAL WINS. A mirror is a second pair of eyes and takes nothing, and the size
-/// is the most consequential thing it could take: the PTYs are resized to it, so every
-/// full-screen program in the session re-lays-out to suit a browser tab that the person at the
-/// keyboard cannot see.
+/// THE TARGET YOU ARE TYPING IN DECIDES. A session has one PTY and therefore one size, so this is
+/// a choice about whose shape the programs inside are laid out for, and the honest answer is
+/// "whoever is actually working".
 ///
-/// tmux's default is the other way — `window-size smallest`, everyone shrinks to fit the
-/// smallest client — and that is right for tmux, where every client is an equal owner. It is
-/// wrong here for the reason the mirror exists at all: opening a browser tab must not change
-/// what the person at the desk is looking at. A mirror that is a different size gets a viewport
-/// onto the grid instead (see `blit`), and is told the real size so it can fit it.
+/// It was the owner unconditionally, and that is wrong in a way that only shows up at real sizes.
+/// A desk terminal 239 columns wide, mirrored into a 980px browser column, has to be scaled to a
+/// 3.6px cell to fit — illegible — and because the fit is by the binding axis it leaves half the
+/// height empty. The desk client that pins it is usually an idle window nobody is sitting at. So
+/// the rule that protected the person at the keyboard was, most of the time, protecting nobody
+/// and ruining the surface actually in use.
 ///
-/// With nobody at the desk the newest mirror decides. A browser-only session still has to be
-/// drawn at SOME size, and the only size anyone has asked for is theirs.
-fn grid_size(client: Option<(u16, u16)>, mirrors: &[MirrorTarget]) -> Option<(u16, u16)> {
-    client.or_else(|| mirrors.last().map(|m| (m.cols, m.rows)))
+/// OPENING A TAB STILL MOVES NOTHING. The trigger is a keystroke, not an attach, so the property
+/// the mirror exists for survives: a browser that is watching takes nothing, and the selfcheck
+/// that asserts it still passes. What changes is that a browser being TYPED IN stops being
+/// letterboxed into unreadability.
+///
+/// `MARS_GRID_SIZE=owner` restores the old rule for anyone who wants the desk to be immovable —
+/// tmux's `manual` in spirit. Anything else, including unset, is `latest`.
+fn grid_size(
+    client: Option<(u16, u16)>,
+    mirrors: &[MirrorTarget],
+    last: Option<LastInput>,
+) -> Option<(u16, u16)> {
+    let fallback = || client.or_else(|| mirrors.last().map(|m| (m.cols, m.rows)));
+    if std::env::var("MARS_GRID_SIZE").as_deref() == Ok("owner") {
+        return fallback();
+    }
+    match last {
+        // The mirror that was typed into, if it is still attached. A mirror that has since gone
+        // decides nothing — falling back is not a lost preference, it is the absence of a target.
+        Some(LastInput::Mirror(id)) => mirrors
+            .iter()
+            .find(|m| m.id == id)
+            .map(|m| (m.cols, m.rows))
+            .or_else(fallback),
+        Some(LastInput::Owner) | None => fallback(),
+    }
 }
 
 /// Copy the session grid onto one target: crop what does not fit, pad what is left over.
@@ -1104,6 +1144,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // nothing is drawn at all until some target exists to say what the size should be.
     let mut grid = make_grid(120, 32)?;
     let mut grid_dims = (120u16, 32u16);
+    // Who typed most recently. `None` until somebody does, which is why merely attaching moves
+    // nothing: with no input recorded the owner decides, exactly as before.
+    let mut last_input: Option<LastInput> = None;
     let mut latest_client_gen = 0;
     // Read-only mobile subscribers (the Rover phone bridge). Separate from the
     // owning client so a glance never takes over; board/briefing frames are
@@ -1182,7 +1225,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             // the session itself, twice a frame. See `GridBackend`.
             //
             // Everything below this line is a copy, and a copy cannot resize anything.
-            if let Some(want) = grid_size(client_size, &mirrors) {
+            if let Some(want) = grid_size(client_size, &mirrors, last_input) {
                 if want != grid_dims {
                     // Rebuilt rather than resized: a fresh `Terminal` has an empty previous
                     // buffer, so the next draw is a full repaint, which is exactly what a size
@@ -1297,6 +1340,8 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                             // takeover so the next render sizes panes back to the layout.
                             if visible {
                                 app.mobile_reflow = None;
+                                // …and the desk is where the work is, so the grid is its shape.
+                                last_input = Some(LastInput::Owner);
                             }
                             let _ = app.apply_input(ev);
                             if visible {
@@ -1336,7 +1381,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 push_mobile(&mut app, &mut subscribers);
                 last_mobile_push = Some(std::time::Instant::now());
             }
-            Ok(SrvEvent::Mirror { stream, cols, rows }) => {
+            Ok(SrvEvent::Mirror { stream, cols, rows, id }) => {
                 // NOTHING IS EVICTED. No `client` assignment, no `send_exit`, no `attached` flag.
                 // That is the whole property, and the selfcheck asserts it by watching the
                 // client's socket rather than by reading this code.
@@ -1348,6 +1393,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     Ok(mut m) => {
                         let _ = m.clear();
                         mirrors.push(MirrorTarget {
+                            id,
                             term: m,
                             sock,
                             cols,
@@ -1359,7 +1405,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     Err(e) => debug_log(&format!("srv: mirror terminal: {e}")),
                 }
             }
-            Ok(SrvEvent::MirrorKeys { data }) => {
+            Ok(SrvEvent::MirrorKeys { data, id }) => {
+                // Typing here makes this the target the session is drawn for. Attaching did not.
+                last_input = Some(LastInput::Mirror(id));
                 // Applied exactly like a client's keys, minus the ownership gate — a mirror types
                 // without owning. Anything that reaches this socket could already `Attach` and
                 // take the session outright, so this is the same authority by a path that throws
@@ -1838,9 +1886,10 @@ fn client_connection(
             // client ownership. The difference is what it receives: rendered frames, not board
             // JSON.
             let _ = stream.set_read_timeout(None);
+            let mid = MIRROR_IDS.fetch_add(1, Ordering::SeqCst);
             let Ok(render_stream) = stream.try_clone() else { return };
             let _ = render_stream.set_write_timeout(Some(Duration::from_secs(2)));
-            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows }).is_err() {
+            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows, id: mid }).is_err() {
                 return;
             }
             // Held open — dropping here would close the socket the daemon is drawing to — and
@@ -1853,7 +1902,7 @@ fn client_connection(
                     Ok(_) => {}
                 }
                 if let Ok(ClientFrame::MirrorKeys { data }) = serde_json::from_str(line.trim()) {
-                    if tx.send(SrvEvent::MirrorKeys { data }).is_err() {
+                    if tx.send(SrvEvent::MirrorKeys { data, id: mid }).is_err() {
                         break;
                     }
                 }
