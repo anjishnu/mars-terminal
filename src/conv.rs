@@ -52,6 +52,24 @@ pub fn transcript_for(chat: &str) -> Option<PathBuf> {
     })
 }
 
+/// How many bytes this conversation's transcript holds. `0` when there is no transcript.
+///
+/// The size, not the mtime. A pane asserts which conversation it holds when Mars typed
+/// `--resume <id>` into it, and the only thing that distinguishes "the resume took" from "it did
+/// not" is whether that transcript GREW afterwards. Clock-based tests all fail here, and one of
+/// them was tried: comparing the mtime against the daemon's start looks right and is not, because
+/// the dying agent from the previous daemon flushes its last lines a few seconds AFTER the new one
+/// starts. Measured on this machine: daemon up at 10:00:10, the dead conversation's final write at
+/// 10:00:16. Six seconds is enough to make a stopped thread look live.
+///
+/// A byte count has no such window. It either grew or it did not.
+pub fn transcript_len(chat: &str) -> u64 {
+    transcript_for(chat)
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
 fn cursor_path(session_dir: &Path, pane: &str) -> PathBuf {
     session_dir.join("conv").join(format!("{pane}.cursor.json"))
 }

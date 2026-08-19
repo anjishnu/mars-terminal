@@ -8447,6 +8447,29 @@ fn selfcheck() -> Result<()> {
                 let (_, again) = conv::gist_and_delta(&dir, "0", &id, 30).unwrap();
                 assert!(!again.is_empty(), "an unfolded delta is shown again, never dropped");
                 assert!(conv::transcript_for("no-such-conversation-id").is_none());
+
+                // AN ASSIGNMENT HAS TO BE FALSIFIABLE, AND THE TEST CANNOT BE A CLOCK.
+                //
+                // A pane asserts which conversation it holds when Mars typed `--resume <id>` into
+                // it, and that assertion outranked the process table. When the resume did not take
+                // — the agent came up in a fresh conversation, which is what a restart produced in
+                // practice — the pane went on naming a transcript that had stopped, and the
+                // timeline showed a real transcript of the wrong thread.
+                //
+                // The first test written for this compared the transcript's mtime against the
+                // daemon's start, and it does not work: the PREVIOUS daemon's dying agent flushes
+                // its last lines a few seconds after the new one starts. Measured here — daemon up
+                // at 10:00:10, the dead conversation's final write at 10:00:16 — which is enough to
+                // make a stopped thread pass. Growth in bytes has no such window.
+                let len = conv::transcript_len(&id);
+                assert!(len > 0, "a real transcript has a length");
+                assert!(conv::transcript_len(&id) > len.saturating_sub(1),
+                    "a mark shorter than the file must register as growth — this is the call site's
+                     shape, and it is what says the resume took");
+                assert!(!(conv::transcript_len(&id) > len),
+                    "a transcript that has not grown past its own mark must not hold the claim");
+                assert_eq!(conv::transcript_len("no-such-conversation-id"), 0,
+                    "a conversation with no transcript has no length, and so can never grow");
             }
             std::fs::remove_dir_all(&dir).ok();
         }

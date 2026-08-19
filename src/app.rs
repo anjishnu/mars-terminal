@@ -1220,13 +1220,33 @@ impl App {
                     // full.
                     if let Some(term) = self.terms.get(t) {
                         if term.foreground_command().as_deref() == Some("claude") {
-                            // ASSIGNED beats DISCOVERED. When Mars typed `--resume <id>` it knows
-                            // exactly which conversation this pane holds; discovery by pid is a
-                            // search that fails often — measured here, a live `claude` pane with
-                            // no `sessions/<pid>.json` and no roster entry at all.
-                            let id = term.assigned_chat.clone().or_else(|| {
-                                term.foreground_pid().and_then(crate::session::claude_session_of_pub)
-                            });
+                            // DISCOVERY IS EVIDENCE; ASSIGNMENT IS A CLAIM. Ask the live process
+                            // first, and fall back to what Mars typed only when the process will
+                            // not say — which is often, and is why the assignment exists at all.
+                            //
+                            // It was the other way round, and an assignment nothing could falsify
+                            // is not evidence. `restore_workspace` records the id it typed
+                            // `--resume` with; when that did not take — the agent came up in a
+                            // FRESH conversation instead, which is exactly what a restart produced
+                            // here — the pane went on naming a transcript that had stopped, and
+                            // outranked the process table saying otherwise. Every reader downstream
+                            // then showed a real transcript of the wrong thread, which from the
+                            // outside is indistinguishable from a pane that has stopped updating.
+                            //
+                            // The claim is also given an expiry, measured in BYTES rather than by
+                            // any clock. A resume that took makes the transcript grow; one that did
+                            // not leaves it exactly as long as it was. A clock test was written
+                            // first and was wrong: the previous daemon's dying agent flushes its
+                            // last lines seconds AFTER the new daemon starts, which is enough to
+                            // make a stopped thread look live. Growth has no such window.
+                            let id = term
+                                .foreground_pid()
+                                .and_then(crate::session::claude_session_of_pub)
+                                .or_else(|| {
+                                    term.assigned_chat.clone().filter(|c| {
+                                        crate::conv::transcript_len(c) > term.assigned_chat_len
+                                    })
+                                });
                             if let Some(id) = id {
                                 row["chat"] = serde_json::json!(id);
                             }
@@ -5516,6 +5536,11 @@ impl App {
             let pane = self.focused_pane_id();
             if let Some(PaneContent::Terminal(tid)) = self.panes.get(&pane).map(|p| p.content.clone()) {
                 if let Some(t) = self.terms.get_mut(&tid) {
+                    // Sampled BEFORE the line is typed, so anything the resumed agent writes counts
+                    // as growth. A resume that never takes leaves this untouched, and the claim
+                    // quietly expires instead of outranking the process table forever with the name
+                    // of a conversation that stopped.
+                    t.assigned_chat_len = crate::conv::transcript_len(id);
                     t.assigned_chat = Some(id.clone());
                 }
             }

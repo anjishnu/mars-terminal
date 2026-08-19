@@ -179,6 +179,9 @@ pub struct Term {
     /// `--resume <id>` itself, or because the captain bound one by hand from the phone. Preferred
     /// over discovery by pid, which searches two files that are often both silent.
     pub assigned_chat: Option<String>,
+    /// How long `assigned_chat`'s transcript was when the resume line was typed. The claim holds
+    /// only while the file is LONGER than this — growth is the evidence that the resume took.
+    pub assigned_chat_len: u64,
     /// The shell has exited; the pane shows a notice until the user closes it.
     pub exited: bool,
     /// Where the shell was spawned (the work journal's cwd). The shell may
@@ -387,6 +390,7 @@ pub fn spawn(
         // a file belongs to without cross-referencing anything.
         wid: new_wid(spawn_cwd.as_deref()),
         assigned_chat: None,
+        assigned_chat_len: 0,
         exited: false,
         spawn_cwd,
         parser,
