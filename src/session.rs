@@ -76,6 +76,13 @@ pub enum ClientFrame {
     /// checked a board field and then typed would leave a gap between the two in which the pane
     /// could change. Check and act belong in the same place.
     AssignBrief { pane: usize, brief: String },
+    /// Attach a MIRROR: a second render target that never takes the session.
+    ///
+    /// `Attach` evicts — it sends the previous client `Exit` and hands ownership over, which is
+    /// right for "I moved to another terminal" and catastrophic for "I opened a browser tab".
+    /// A mirror renders the same frames to another screen and owns nothing: no ownership, no
+    /// eviction, no `Exit` to anybody.
+    Mirror { cols: u16, rows: u16 },
     /// Mint an empty brief and set the planner in a pane drafting it. Same argument as
     /// `AssignBrief` for why the daemon does this rather than the bridge: the scope check needs a
     /// pid. The title travels because it is the one thing only the person pressing knows.
@@ -636,6 +643,9 @@ enum SrvEvent {
     /// Mint a brief and set a planner drafting it — refused unless that agent carries the planner
     /// scope.
     DraftBrief { pane: usize, title: String },
+    /// A second render target joined. Carries its own stream and size: one `Terminal` has one
+    /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
+    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16 },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
     Subscribe { stream: crate::sys::control::Stream },
@@ -814,6 +824,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
 
     let mut client: Option<(crate::sys::control::Stream, u64)> = None;
     let mut term: Option<Terminal<CrosstermBackend<FrameWriter>>> = None;
+    // Extra render targets — browsers, second screens. Never owners: nothing in here can evict
+    // the client, and losing one costs that target and nothing else.
+    let mut mirrors: Vec<Terminal<CrosstermBackend<FrameWriter>>> = Vec::new();
     let mut latest_client_gen = 0;
     // Read-only mobile subscribers (the Rover phone bridge). Separate from the
     // owning client so a glance never takes over; board/briefing frames are
@@ -898,6 +911,16 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     let _ = w.flush();
                 }
             }
+            // EVERY TARGET IN THE SAME PASS, which is what makes one `needs_redraw` enough.
+            //
+            // The flag is consumed by `mem::take` above, so a design that drew the client here and
+            // the mirrors on some later tick would have the first one to run clear the flag and
+            // starve the rest. Drawing them together sidesteps that entirely rather than
+            // replacing one flag with N.
+            //
+            // No OSC 52 here: a clipboard belongs to the person at the keyboard, and a mirror is
+            // a second pair of eyes, not a second pair of hands.
+            mirrors.retain_mut(|m| m.draw(|f| ui::render(f, &mut app)).is_ok());
         }
 
         match rx.recv_timeout(Duration::from_millis(app.tuning.poll_interval_ms)) {
@@ -987,6 +1010,19 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // Greet the new subscriber immediately with a full snapshot.
                 push_mobile(&mut app, &mut subscribers);
                 last_mobile_push = Some(std::time::Instant::now());
+            }
+            Ok(SrvEvent::Mirror { stream, cols, rows }) => {
+                // NOTHING IS EVICTED. No `client` assignment, no `send_exit`, no `attached` flag.
+                // That is the whole property, and the selfcheck asserts it by watching the
+                // client's socket rather than by reading this code.
+                match make_terminal(stream, cols, rows) {
+                    Ok(mut m) => {
+                        let _ = m.clear();
+                        mirrors.push(m);
+                        app.needs_redraw = true; // a fresh target needs a full frame
+                    }
+                    Err(e) => debug_log(&format!("srv: mirror terminal: {e}")),
+                }
             }
             Ok(SrvEvent::PaneInput { pane, data }) => {
                 // The phone answered a prompt — write it to that pane's terminal.
@@ -1434,6 +1470,24 @@ fn client_connection(
         Ok(ClientFrame::DraftBrief { pane, title }) => {
             let _ = tx.send(SrvEvent::DraftBrief { pane: *pane, title: title.clone() });
             let _ = send_exit(&stream, &format!("drafting {title:?} in pane {pane}"));
+            return;
+        }
+        Ok(ClientFrame::Mirror { cols, rows }) => {
+            // Non-takeover, exactly like `Subscribe` — it registers a stream and never touches
+            // client ownership. The difference is what it receives: rendered frames, not board
+            // JSON.
+            let _ = stream.set_read_timeout(None);
+            let Ok(render_stream) = stream.try_clone() else { return };
+            let _ = render_stream.set_write_timeout(Some(Duration::from_secs(2)));
+            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows }).is_err() {
+                return;
+            }
+            // Held open: dropping the connection here would close the socket the daemon is
+            // drawing to.
+            let mut sink = String::new();
+            while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+                sink.clear();
+            }
             return;
         }
         Ok(ClientFrame::Subscribe) => {

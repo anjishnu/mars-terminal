@@ -3119,6 +3119,56 @@ fn selfcheck() -> Result<()> {
             read_half.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
             let mut sub_r = BufReader::new(read_half);
 
+            // ── MIRROR, NEVER EVICT ────────────────────────────────────────────────────
+            //
+            // The executable form of the rule, written before the mirror work rather than after.
+            // `Attach` hands ownership over and sends the previous client `Exit` — right for "I
+            // moved to another terminal", catastrophic for "I opened a browser tab". A mirror must
+            // take that path nowhere.
+            //
+            // Asserted by watching the OWNER'S SOCKET, not by reading the mirror's code: the
+            // failure is something arriving at the client, so the client is where to look.
+            {
+                let mirror = crate::sys::control::connect(&bpath)?;
+                let mut mw = mirror.try_clone()?;
+                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 100, rows: 30 })?;
+                std::thread::sleep(std::time::Duration::from_millis(400));
+
+                // 1. The owner was not told to go away.
+                owner.text("aftermirror")?;
+                let (still_there, transcript) = owner.read_until("aftermirror", 5)?;
+                assert!(still_there,
+                    "the owner stopped receiving frames once a mirror attached — it was evicted");
+                let screen = transcript.unwrap_or_default();
+                assert!(!screen.contains("detached"),
+                    "the owner was sent a detach notice by a mirror:\n{screen}");
+
+                // 2. The mirror is actually being drawn to — a target that evicts nobody and
+                //    renders nothing is not a mirror, it is a leak.
+                let mread = mirror.try_clone()?;
+                mread.set_read_timeout(Some(std::time::Duration::from_millis(2500)))?;
+                let mut got = Vec::new();
+                {
+                    use std::io::Read;
+                    let mut buf = [0u8; 4096];
+                    let mut r = mread;
+                    for _ in 0..6 {
+                        match r.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => { got.extend_from_slice(&buf[..n]); if got.len() > 64 { break; } }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                assert!(!got.is_empty(), "a mirror attached and was never drawn to");
+
+                // 3. And the board channel is untouched — three roles on one socket type, and
+                //    only one of them owns anything.
+                assert!(next_board(&mut sub_r, 5).is_some(),
+                    "the subscriber stopped receiving boards once a mirror attached");
+            }
+            println!("[selfcheck] mirror: a second render target evicts nobody ... PASS");
+
             // Task 1: a structured board frame arrives, with the right shape and
             // verdict strings.
             let board = next_board(&mut sub_r, 5).expect("no board frame from subscription");
