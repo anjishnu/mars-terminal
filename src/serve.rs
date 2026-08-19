@@ -141,6 +141,36 @@ fn daemon_fingerprint(session: &str) -> String {
 /// one of them to drift into a link that looks right and pairs nothing.
 ///
 /// The fragment, never a query — it stays out of server logs and out of the Referer header.
+/// THE pairing link — the one `mars pair`, `mars pair --link` and `mars pair --open` all hand out.
+///
+/// Hosted app plus the tunnel over `wss`, which is the only shape that works from everywhere: this
+/// machine, a phone on any network, another computer. Pasted into the web view it connects.
+///
+/// One builder because there were four, and a URL whose fragment carries a single-use token is a
+/// bad thing to have four copies of. Two of them had already drifted: `--open` was handing out a
+/// loopback address the hosted app cannot dial, and `mars qr` a LAN address the bridge does not
+/// even listen on.
+pub fn pair_link(session: &str, tunnel_base: &str) -> Result<String> {
+    let endpoint = format!("{}/ws", tunnel_base.replacen("https://", "wss://", 1));
+    let token = ensure_token()?;
+    let fp = daemon_fingerprint(session);
+    Ok(format!(
+        "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
+    ))
+}
+
+/// The three routes in, named by where the reader is standing rather than by mechanism.
+///
+/// Printed wherever the link is, so the terminal says the same thing every time. It used to open
+/// with a QR — which answers "how" before anyone has decided "which", and serves the one case a
+/// person sitting at this machine is least likely to be in.
+pub fn print_routes() {
+    println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
+    println!("  \x1b[1mOn your phone\x1b[0m        scan the code below     camera at the QR");
+    println!("  \x1b[1mAnother computer\x1b[0m     paste the link below    any network");
+    println!();
+}
+
 pub fn lan_pair_url(session: &str) -> Result<String> {
     pair_url_for(session, &lan_ip())
 }
@@ -176,8 +206,23 @@ pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
 /// origin match. `mars pair` (tunnel) is the answer for a phone that is not on this wifi.
 pub fn open_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
-    // Loopback, not the LAN address: same machine, and the only address the bridge answers on.
-    let url = pair_url_for(&session, "127.0.0.1")?;
+    // THE SAME LINK `mars pair` PRINTS. Not a loopback variant, not a LAN one: one URL that
+    // connects wherever it is pasted, which is the whole contract. It needs the tunnel, so the
+    // bridge has to be up first.
+    if !bridge_listening() {
+        println!("  the bridge was not running — starting it");
+        supervise_main(Some(session.clone()))?;
+        if !wait_for_bridge(std::time::Duration::from_secs(20)) {
+            println!();
+            println!("  It did not come up within 20s. `mars pair --check` says what is missing.");
+            return Ok(());
+        }
+    }
+    let base = running_tunnel_url().ok_or_else(|| anyhow!(
+        "the bridge is up but its tunnel URL could not be read from ngrok \
+         (http://127.0.0.1:4040) — see ~/.mars/serve-agent.log"
+    ))?;
+    let url = pair_link(&session, &base)?;
 
     // Printed BEFORE the open, and printed whether or not it succeeds. A browser that does not
     // come up must still leave the person holding the link, rather than a command that appeared
@@ -185,26 +230,6 @@ pub fn open_main(session_arg: Option<String>) -> Result<()> {
     println!("  \x1b[38;5;208mRover\x1b[0m — opening  ·  session \x1b[1m{session}\x1b[0m");
     println!("  {url}");
 
-    // THE BRIDGE HAS TO BE SERVING, OR THIS OPENS A CONNECTION-REFUSED PAGE.
-    //
-    // `mars pair` starts the bridge as part of printing the QR; this verb returned before ever
-    // reaching that, so it opened a browser at a host that was answering nothing — a "zero-step"
-    // command whose one step was invisible and whose failure looked like a broken app. Caught by
-    // running it: the port was dead.
-    //
-    // Started under launchd rather than as a child of this shell, for the reason `supervise_main`
-    // gives: a bridge parented to the terminal that launched it dies with that terminal, which is
-    // how a successful reboot took the phone's route down with it.
-    if !bridge_listening() {
-        println!("  the bridge was not running — starting it");
-        supervise_main(Some(session.clone()))?;
-        if !wait_for_bridge(std::time::Duration::from_secs(12)) {
-            println!();
-            println!("  It did not come up within 12s. `mars pair --check` says what is missing;");
-            println!("  the link above works as soon as it does.");
-            return Ok(());
-        }
-    }
 
     match open_in_browser(&url) {
         Ok(()) => {
@@ -646,12 +671,8 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     };
 
     let (_tunnel, base) = start_tunnel(port)?;
+    let app_url = pair_link(&session, &base)?;
     let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
-    let token = ensure_token()?;
-    let fp = daemon_fingerprint(&session);
-    let app_url = format!(
-        "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    );
 
     // Prove the path before showing a QR. A QR that cannot work is worse than an error: it moves
     // the failure onto a device with no diagnostics.
@@ -919,12 +940,7 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
     if let Err(why) = tunnel_answers(&base) {
         println!("{}", tunnel_warning(&why));
     }
-    let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
-    let token = ensure_token()?;
-    let fp = daemon_fingerprint(session);
-    let app_url = format!(
-        "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    );
+    let app_url = pair_link(session, &base)?;
     print_wordmark();
     println!();
     print_qr(&app_url);
@@ -933,8 +949,9 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
         println!("  \x1b[38;5;208mRover\x1b[0m — QR reset · session \x1b[1m{session}\x1b[0m");
         println!("  connected phones drop within ~1s · scan this to reconnect");
     } else {
-        println!("  \x1b[38;5;208mRover\x1b[0m — bridge already live · session \x1b[1m{session}\x1b[0m");
-        println!("  scan to pair another phone · `mars serve --reset` rotates the QR + disconnects");
+        println!("  \x1b[38;5;208mRover\x1b[0m — your sessions, on a screen  ·  session \x1b[1m{session}\x1b[0m");
+        println!();
+        print_routes();
     }
     println!("  {app_url}");
     Ok(())
@@ -2706,11 +2723,6 @@ pub fn link_main(session_arg: Option<String>) -> Result<()> {
     if let Err(why) = tunnel_answers(&base) {
         eprintln!("{}", tunnel_warning(&why));
     }
-    let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
-    let token = ensure_token()?;
-    let fp = daemon_fingerprint(&session);
-    println!(
-        "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    );
+    println!("{}", pair_link(&session, &base)?);
     Ok(())
 }

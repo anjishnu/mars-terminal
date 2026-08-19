@@ -2,7 +2,7 @@
 name: manage-task-to-completion
 description: How to carry a piece of work from first observation to merged, across many runs. Use when tracking something that spans more than one turn — a recurring condition, a brief that has been assigned, a workspace that has been stuck, or when asked what happened to a piece of work. Covers what earns a brief, how to hold state between runs, recognising completion, and closing the loop.
 ---
-<!-- mars-doc-version: 1 -->
+<!-- mars-doc-version: 2 -->
 
 # Managing a task to completion
 
@@ -11,6 +11,21 @@ what you write down**, so managing a task to completion is mostly the discipline
 right fact in the right file at the right moment.
 
 You do not do the work. You notice it, describe it, hand it over, watch it, and close it out.
+
+## The thing to understand before anything else
+
+Writing something down is **necessary but not sufficient.** It has to be written where the next run
+will trip over it. Persistence here comes in two classes and they are not equally reliable:
+
+| | Files | Re-read | Survives by |
+|---|---|---|---|
+| **Class 1** | `memory/beliefs.md`, `memory/projects.md`, the batch | **automatically, every run** | existing |
+| **Class 2** | memos, `briefs/**`, `completed.md`, `runs.jsonl`, the timeline | **only if you go looking** | being *found again* |
+
+**A fact in class 2 that nothing in class 1 points at is a fact you have lost.** You will not go
+looking for it, because a run with no memory does not know it is missing anything.
+
+So the whole discipline is: **put the work in class 2, and put a pointer to it in class 1.**
 
 ## The loop, and where you sit in it
 
@@ -75,9 +90,22 @@ _confirmed 2026-08-18_
 **`Purpose:` is durable; `State:` and `Next:` are today.** Keeping them on separate lines is what
 stops this file becoming a stale second briefing. Revise in place — **never append.**
 
+### `Next:` is the bridge from class 1 to class 2
+
+Every read below is class 2 — you will never perform one spontaneously, because nothing tells you
+there is anything to check. **`Next:` is the only thing that makes them happen.** Write it as an
+instruction to a stranger who has never seen this task, because that is exactly who reads it:
+
+```
+Next:    check ~/.mars/briefs/f8-f9-scorer/completed.md — if present, verify the
+         doc-version bump landed on receipts.md, then expire memo `scorer-faults`.
+```
+
+Not *"follow up on the scorer work"*. That is a note to somebody who remembers.
+
 ### The tracking questions to answer every run
 
-For anything in flight, three reads and no more:
+For anything `Next:` points at, three reads and no more:
 
 1. **Does `~/.mars/briefs/<id>/completed.md` exist?** If yes, the work is done and the loop moves to
    verify. One read, no parsing terminal output.
@@ -86,6 +114,15 @@ For anything in flight, three reads and no more:
    what was approved.
 3. **Has the pane gone quiet?** `stalled` on an agent pane means the process is alive and silent,
    which is a *question*, never a confirmed failure. Say what you can see and what you cannot.
+
+### Once a day, read your own scores
+
+`memory/runs.jsonl` holds every run you have been scored on, and **nothing surfaces it to you** — it
+is class 2 with no natural trigger, so without a standing instruction you will never open it. Read
+the last few whenever `beliefs.md` has no note about it from today, and record what you find there
+so the next run knows it has been checked.
+
+A run of `ok: false` you never look at is a run you will repeat.
 
 ### Never reconstruct from the pane
 
@@ -113,6 +150,23 @@ disappears before the fix ships.
 - If `completed.md` has a **Notes for later** section, each note is a candidate memo. **A note the
   worker left and nobody promoted is a note that never existed.**
 - Say in the briefing what changed, once. Do not restate it every run afterwards.
+
+## Write the handoff before you run out of room
+
+**The last thing you write is the first thing the next run reads.** Treat `projects.md` as the
+handoff, not as the summary — and write it *before* you are finished rather than after, because a
+run that dies halfway should still leave a usable `Next:`.
+
+Order of writing, when a run is going long:
+
+1. `Next:` for anything in flight — **first**, because it is the only thing that survives losing the
+   rest.
+2. The briefing, which the human sees.
+3. Workspace notes and memos.
+4. `Purpose:` revisions, which change slowly and can wait a run.
+
+A half-finished run that left a good `Next:` costs nothing. A complete run that left
+*"continue the work"* has thrown the thread away.
 
 ## Writing nothing is a success
 
