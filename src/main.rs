@@ -774,6 +774,14 @@ fn main() -> Result<()> {
             if has("--open") {
                 return serve::open_main(session);
             }
+            // The full-screen web terminal, pointed at a local bridge over ws://.
+            if has("--desk") {
+                let web = rest.iter().position(|a| a == "--web")
+                    .and_then(|i| rest.get(i + 1))
+                    .filter(|w| !w.starts_with('-'))
+                    .cloned();
+                return serve::desk_main(session, web);
+            }
             // Pin the tunnel URL. Without it ngrok mints a fresh random host on every restart, so
             // every phone must re-scan — the most common way Rover "stops working". It lived only
             // in an env var, which a new shell and a launchd agent both lose; this writes it to

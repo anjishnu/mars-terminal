@@ -194,6 +194,36 @@ pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
     ))
 }
 
+/// `mars pair --desk` — the local link for the full-screen web terminal.
+///
+/// Aimed at a dev server rather than the hosted app, and at THIS bridge over plain `ws://`. Both
+/// are deliberate: `/desk` is not deployed yet, and a page served over http may open a ws socket
+/// to the same host, which is the combination that works today without a tunnel.
+///
+/// It exists because the alternative was telling somebody to write a session into localStorage by
+/// hand. A URL is a thing you can paste; a JSON blob typed into a console is not.
+pub fn desk_main(session_arg: Option<String>, web: Option<String>) -> Result<()> {
+    let session = resolve_session(session_arg)?;
+    let web = web.unwrap_or_else(|| "http://localhost:8080".into());
+    let port = default_port();
+    let token = ensure_token()?;
+    let fp = daemon_fingerprint(&session);
+    let endpoint = format!("ws://127.0.0.1:{port}/ws");
+
+    if !bridge_listening() {
+        println!("  No bridge on :{port}. Start one first:");
+        println!("    mars pair --supervise           (or: MARS_BRIDGE_PORT={port} mars pair {session})");
+        println!();
+    }
+    println!("  \x1b[38;5;208mmars\x1b[0m — the web terminal  ·  session \x1b[1m{session}\x1b[0m");
+    println!();
+    println!("  {web}/desk#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1");
+    println!();
+    println!("  Paste that into a browser. The session must be running on a binary that knows");
+    println!("  `Mirror` — if the screen stays black, `mars reboot {session}` is why.");
+    Ok(())
+}
+
 /// `mars pair --open` — the desktop case, with no pairing step at all.
 ///
 /// **The most common way somebody first meets Rover is sitting at the machine running it**, and
