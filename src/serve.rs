@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 use crate::session::{self, ClientFrame, ServerFrame};
 use tungstenite::{accept, Error as WsError, Message};
 
-const DEFAULT_PORT: u16 = crate::session::BRIDGE_PORT;
+// Not a const: `MARS_BRIDGE_PORT` lets a second bridge run beside a live one.
+fn default_port() -> u16 { crate::session::bridge_port() }
 
 /// Resolve the session to bridge: explicit arg → `$MARS_SESSION` → the first live one.
 fn resolve_session(arg: Option<String>) -> Result<String> {
@@ -184,7 +185,7 @@ pub fn lan_pair_url(session: &str) -> Result<String> {
 /// needs the bridge bound wider, which is a separate question from this one.
 pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
     let ip = host.to_string();
-    let port = DEFAULT_PORT;
+    let port = default_port();
     let token = mint_token()?;
     let fp = daemon_fingerprint(session);
     let endpoint = format!("ws://{ip}:{port}/ws");
@@ -252,7 +253,7 @@ pub fn open_main(session_arg: Option<String>) -> Result<()> {
 /// and a bridge that is up but mid-start would answer the socket before it answers a route.
 fn bridge_listening() -> bool {
     use std::net::{SocketAddr, TcpStream};
-    let addr: SocketAddr = ([127, 0, 0, 1], DEFAULT_PORT).into();
+    let addr: SocketAddr = ([127, 0, 0, 1], default_port()).into();
     TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
 }
 
@@ -657,7 +658,7 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     }
     // Remember it: this is what a later start reads when the name it was given has moved.
     remember_instance(&instance_id);
-    let port = DEFAULT_PORT;
+    let port = default_port();
     // Bind localhost; cloudflared fronts it with a public https/wss URL, so the phone
     // (loading the app from Lovable over https) can reach this bridge over wss without a
     // LAN/cert dance.
@@ -933,8 +934,9 @@ fn running_tunnel_url() -> Option<String> {
 /// persisted token, and render the QR. `reset` tailors the message (after a token rotation).
 fn reprint_running(session: &str, reset: bool) -> Result<()> {
     let base = running_tunnel_url().ok_or_else(|| anyhow!(
-        "a bridge is already running on :{DEFAULT_PORT}, but its tunnel URL couldn't be read from \
-         ngrok (http://127.0.0.1:4040). See the bridge's log (`~/.mars/serve-agent.log`)."
+        "a bridge is already running on :{}, but its tunnel URL couldn't be read from \
+         ngrok (http://127.0.0.1:4040). See the bridge's log (`~/.mars/serve-agent.log`).",
+        default_port()
     ))?;
     // Before the QR, not after: a code printed under a warning still gets scanned.
     if let Err(why) = tunnel_answers(&base) {
@@ -2086,6 +2088,15 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some("mirror") => {
             let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(120).clamp(20, 400) as u16;
             let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(32).clamp(8, 200) as u16;
+            // ONE MIRROR PER BROWSER, REPLACED RATHER THAN STACKED.
+            //
+            // A resize re-sends `mirror` at the new size, and the daemon's handshake is once per
+            // connection — so without this, every window drag would leave another live render
+            // target behind, each drawing a full frame at a size nobody is looking at.
+            //
+            // Dropping the old stream closes it; the daemon prunes the dead target on its next
+            // draw, which is the same path a closed tab takes.
+            drop(MIRROR_IN.lock().unwrap().take());
             let Ok(sock) = crate::sys::control::connect(socket) else {
                 let _ = tx.send(serde_json::json!({
                     "t": "mirror.gone", "why": "could not reach the session",

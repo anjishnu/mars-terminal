@@ -1966,6 +1966,19 @@ const MANAGER_DELTA_CAP: u64 = 200;
 /// is recorded rather than raced for.
 pub const BRIDGE_PORT: u16 = 8787;
 
+/// The port the bridge listens on, overridable by `MARS_BRIDGE_PORT`.
+///
+/// A constant meant one bridge per machine, which is right in normal use and wrong the moment you
+/// need to try a new build without stopping the one somebody is using. Overridable, so a second
+/// bridge can run beside a live one rather than replacing it.
+pub fn bridge_port() -> u16 {
+    std::env::var("MARS_BRIDGE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|p| *p > 1024)
+        .unwrap_or(BRIDGE_PORT)
+}
+
 fn mars_home() -> Option<PathBuf> {
     crate::sys::paths::home_dir().map(|h| h.join(".mars"))
 }
@@ -1990,7 +2003,7 @@ pub fn paired_session() -> Option<String> {
 /// question is whether a phone would be answered, and only the socket knows that.
 pub fn bridge_listening() -> bool {
     std::net::TcpStream::connect_timeout(
-        &([127, 0, 0, 1], BRIDGE_PORT).into(),
+        &([127, 0, 0, 1], bridge_port()).into(),
         Duration::from_millis(300),
     )
     .is_ok()
@@ -2049,7 +2062,7 @@ pub fn ensure_bridge(name: &str) {
 /// bridge by definition. The pid file stays as a fallback for a host with no `lsof`.
 fn bridge_pids() -> Vec<i32> {
     std::process::Command::new("lsof")
-        .args(["-ti", &format!("tcp:{BRIDGE_PORT}"), "-sTCP:LISTEN"])
+        .args(["-ti", &format!("tcp:{}", bridge_port()), "-sTCP:LISTEN"])
         .output()
         .ok()
         .map(|o| {
