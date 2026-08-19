@@ -1076,9 +1076,41 @@ fn handle_conn(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     }
 }
 
-/// Minimal static serving. In production the built Rover bundle is embedded (rust-embed)
-/// or served from Lovable; here we serve `$MARS_WEB_DIR/index.html` if set, else a notice.
+/// Serve the built Rover bundle from this host.
+///
+/// **This used to return `index.html` for every path**, which loads a page whose every script and
+/// stylesheet also arrives as that same HTML — so the app never started and the only visible
+/// result was the bridge's own placeholder. A single-file "static server" is not a smaller static
+/// server; it cannot serve an app at all.
+///
+/// Serving it here is the point of the LAN route: the hosted app is https and cannot dial
+/// `ws://192.168.x.x`, so the copy that CAN talk to this bridge is the one this bridge hands out.
+///
+/// Unknown paths fall back to `index.html` because the router is client-side — `/desk` and
+/// `/connect` are routes in the bundle, not files on disk.
 fn serve_static(mut stream: TcpStream) -> Result<()> {
+    let path = read_request_path(&stream).unwrap_or_else(|| "/".into());
+    if let Some(dir) = std::env::var("MARS_WEB_DIR").ok().map(std::path::PathBuf::from) {
+        // Take only the last segment chain and refuse `..`: this serves a directory to whoever
+        // reaches the port, and a path that can climb out of it serves the whole disk.
+        let rel = path.trim_start_matches('/').split('?').next().unwrap_or("");
+        let safe = !rel.split('/').any(|seg| seg == ".." || seg == ".");
+        let file = dir.join(rel);
+        if safe && !rel.is_empty() && file.is_file() {
+            if let Ok(bytes) = std::fs::read(&file) {
+                let ctype = content_type(rel);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n{BRIDGE_HEADER}: {}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    env!("CARGO_PKG_VERSION"), bytes.len(),
+                );
+                stream.write_all(head.as_bytes())?;
+                stream.write_all(&bytes)?;
+                stream.flush()?;
+                return Ok(());
+            }
+        }
+    }
     let body = std::env::var("MARS_WEB_DIR")
         .ok()
         .and_then(|dir| std::fs::read_to_string(std::path::Path::new(&dir).join("index.html")).ok())
@@ -1102,6 +1134,38 @@ fn serve_static(mut stream: TcpStream) -> Result<()> {
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+/// The path off the request line, without consuming the stream a websocket upgrade still needs.
+fn read_request_path(stream: &TcpStream) -> Option<String> {
+    let mut peek = [0u8; 2048];
+    let n = stream.peek(&mut peek).ok()?;
+    let head = String::from_utf8_lossy(&peek[..n]);
+    let line = head.lines().next()?;
+    let mut parts = line.split_whitespace();
+    let _method = parts.next()?;
+    Some(parts.next()?.to_string())
+}
+
+/// Enough of a MIME table to start an app. A `.js` served as `text/html` is refused by the module
+/// loader, which is the same silent failure as serving no file at all.
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "json" | "webmanifest" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "map" => "application/json; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Bridge one WebSocket to the daemon socket: daemon `Output` → WS `{t:"output"}`, and
