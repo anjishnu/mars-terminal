@@ -142,7 +142,18 @@ fn daemon_fingerprint(session: &str) -> String {
 ///
 /// The fragment, never a query — it stays out of server logs and out of the Referer header.
 pub fn lan_pair_url(session: &str) -> Result<String> {
-    let ip = lan_ip();
+    pair_url_for(session, &lan_ip())
+}
+
+/// The same link, aimed at a chosen host.
+///
+/// **The desktop case must use loopback, and this is not a preference.** The bridge binds
+/// `127.0.0.1` only — verified with `lsof`: `TCP 127.0.0.1:8787 (LISTEN)`. The LAN address answers
+/// nothing, so `mars pair --open` was opening a browser onto a refused connection while reporting
+/// "Paired on open". The QR keeps the LAN address because a phone cannot use loopback; that path
+/// needs the bridge bound wider, which is a separate question from this one.
+pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
+    let ip = host.to_string();
     let port = DEFAULT_PORT;
     let token = mint_token()?;
     let fp = daemon_fingerprint(session);
@@ -165,13 +176,35 @@ pub fn lan_pair_url(session: &str) -> Result<String> {
 /// origin match. `mars pair` (tunnel) is the answer for a phone that is not on this wifi.
 pub fn open_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
-    let url = lan_pair_url(&session)?;
+    // Loopback, not the LAN address: same machine, and the only address the bridge answers on.
+    let url = pair_url_for(&session, "127.0.0.1")?;
 
     // Printed BEFORE the open, and printed whether or not it succeeds. A browser that does not
     // come up must still leave the person holding the link, rather than a command that appeared
     // to do nothing.
     println!("  \x1b[38;5;208mRover\x1b[0m — opening  ·  session \x1b[1m{session}\x1b[0m");
     println!("  {url}");
+
+    // THE BRIDGE HAS TO BE SERVING, OR THIS OPENS A CONNECTION-REFUSED PAGE.
+    //
+    // `mars pair` starts the bridge as part of printing the QR; this verb returned before ever
+    // reaching that, so it opened a browser at a host that was answering nothing — a "zero-step"
+    // command whose one step was invisible and whose failure looked like a broken app. Caught by
+    // running it: the port was dead.
+    //
+    // Started under launchd rather than as a child of this shell, for the reason `supervise_main`
+    // gives: a bridge parented to the terminal that launched it dies with that terminal, which is
+    // how a successful reboot took the phone's route down with it.
+    if !bridge_listening() {
+        println!("  the bridge was not running — starting it");
+        supervise_main(Some(session.clone()))?;
+        if !wait_for_bridge(std::time::Duration::from_secs(12)) {
+            println!();
+            println!("  It did not come up within 12s. `mars pair --check` says what is missing;");
+            println!("  the link above works as soon as it does.");
+            return Ok(());
+        }
+    }
 
     match open_in_browser(&url) {
         Ok(()) => {
@@ -188,7 +221,30 @@ pub fn open_main(session_arg: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Hand a URL to the desktop's own browser. Not a shell — the URL carries a single-use token, and
+/// Is anything answering on the bridge's port?
+///
+/// A TCP connect, not an HTTP request: the question is whether the port is being served at all,
+/// and a bridge that is up but mid-start would answer the socket before it answers a route.
+fn bridge_listening() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    let addr: SocketAddr = ([127, 0, 0, 1], DEFAULT_PORT).into();
+    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(400)).is_ok()
+}
+
+/// Poll until the bridge answers, or give up. Polled rather than slept, so a fast start opens
+/// immediately and a slow one is still waited for.
+fn wait_for_bridge(limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if bridge_listening() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
+/// Hand a URL to the desktop's own browser./// Hand a URL to the desktop's own browser. Not a shell — the URL carries a single-use token, and
 /// a token spliced into a shell line is a token in somebody's history.
 fn open_in_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
