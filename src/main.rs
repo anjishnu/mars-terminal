@@ -2886,6 +2886,10 @@ fn selfcheck() -> Result<()> {
                             Ok(session::ServerFrame::PaneOutput { .. }) => {}
                             Ok(session::ServerFrame::PaneHistory { .. }) => {}
                             Ok(session::ServerFrame::PaneLines { .. }) => {}
+                            // Mirror-only. The probe screen is a fixed grid, so there is nothing
+                            // to resize — but a selfcheck that mirrors will see this frame, and
+                            // dropping it must not be mistaken for dropping a rendered frame.
+                            Ok(session::ServerFrame::GridSize { .. }) => {}
                             Err(_) => {}
                         },
                         Err(_) => {} // timeout tick — keep waiting until deadline
@@ -3137,9 +3141,14 @@ fn selfcheck() -> Result<()> {
             // Asserted by watching the OWNER'S SOCKET, not by reading the mirror's code: the
             // failure is something arriving at the client, so the client is where to look.
             {
+                // A DIFFERENT SIZE FROM THE OWNER'S, deliberately. A mirror that happens to match
+                // proves nothing: the bug this guards was invisible for exactly as long as every
+                // target was the same size, and appeared the moment one was not.
+                //
+                // The owner is 100x30 (see `TestClient::connect`).
                 let mirror = crate::sys::control::connect(&bpath)?;
                 let mut mw = mirror.try_clone()?;
-                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 100, rows: 30 })?;
+                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 64, rows: 20 })?;
                 std::thread::sleep(std::time::Duration::from_millis(400));
 
                 // 1. The owner was not told to go away.
@@ -3153,29 +3162,61 @@ fn selfcheck() -> Result<()> {
 
                 // 2. The mirror is actually being drawn to — a target that evicts nobody and
                 //    renders nothing is not a mirror, it is a leak.
+                //
+                // 3. AND IT DID NOT TAKE THE SESSION'S SIZE. This is the one that matters and the
+                //    one that was missing. `ui::render` writes the PTY size of every pane, so a
+                //    second render at a second size does not draw a second picture — it resizes
+                //    the session, twice per frame, against the first one. The session announces
+                //    the size it is actually drawn at; here that must still be the OWNER'S 100x30
+                //    and not this mirror's 64x20.
+                //
+                //    It discriminates: make the newest target win and this reads 64x20.
                 let mread = mirror.try_clone()?;
                 mread.set_read_timeout(Some(std::time::Duration::from_millis(2500)))?;
-                let mut got = Vec::new();
-                {
-                    use std::io::Read;
-                    let mut buf = [0u8; 4096];
-                    let mut r = mread;
-                    for _ in 0..6 {
-                        match r.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => { got.extend_from_slice(&buf[..n]); if got.len() > 64 { break; } }
-                            Err(_) => break,
+                let mut mr = BufReader::new(mread);
+                let mut drawn = false;
+                let mut announced: Option<(u16, u16)> = None;
+                let mut frames = 0usize;
+                // READ TO A DEADLINE, NOT TO A FRAME COUNT. Registering a mirror clears it, and
+                // crossterm ships a clear as some forty little cursor-moves, each its own Output
+                // frame. A budget of "the next N frames" therefore measures how chatty the clear
+                // is rather than whether the daemon said anything — which is how a working
+                // implementation first read as a broken one here.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::time::Instant::now() < deadline {
+                    let mut line = String::new();
+                    match mr.read_line(&mut line) {
+                        Ok(0) => break,
+                        Err(_) => break, // read timeout: nothing more is coming
+                        Ok(_) => frames += 1,
+                    }
+                    match serde_json::from_str::<session::ServerFrame>(line.trim()) {
+                        Ok(session::ServerFrame::Output { .. }) => drawn = true,
+                        Ok(session::ServerFrame::GridSize { cols, rows, .. }) => {
+                            announced = Some((cols, rows))
                         }
+                        _ => {}
+                    }
+                    if drawn && announced.is_some() {
+                        break;
                     }
                 }
-                assert!(!got.is_empty(), "a mirror attached and was never drawn to");
+                let wire = format!("{frames} frames, drawn={drawn}, announced={announced:?}");
+                assert!(drawn, "a mirror attached and was never drawn to; wire: {wire}");
+                assert_eq!(
+                    announced,
+                    Some((100, 30)),
+                    "a mirror took the session's size: the grid should still be the owner's \
+                     100x30, so every PTY in the session keeps the width the person at the \
+                     keyboard is looking at; wire: {wire}"
+                );
 
-                // 3. And the board channel is untouched — three roles on one socket type, and
+                // 4. And the board channel is untouched — three roles on one socket type, and
                 //    only one of them owns anything.
                 assert!(next_board(&mut sub_r, 5).is_some(),
                     "the subscriber stopped receiving boards once a mirror attached");
             }
-            println!("[selfcheck] mirror: a second render target evicts nobody ... PASS");
+            println!("[selfcheck] mirror: a second render target evicts nobody, and takes no size ... PASS");
 
             // Task 1: a structured board frame arrives, with the right shape and
             // verdict strings.
@@ -7176,6 +7217,29 @@ fn selfcheck() -> Result<()> {
             // a blank line, and a timeline of blank lines is worse than one without reasoning.
             let redacted = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"","signature":"abc"}]}}"#;
             assert!(timeline::rows_from_str(redacted, 0).is_empty());
+
+            // HARNESS INJECTIONS ARE NOT THE HUMAN TALKING. Claude Code files a
+            // `<system-reminder>` as an ordinary `user` message, so nothing but this filter
+            // separates it from something somebody typed. Measured on a live agent pane, three of
+            // the six rows in the conversation window were reminders and a slash command — the
+            // window is a budget, and machinery in it is spent instead of the last real exchange.
+            for noise in [
+                r#"{"type":"user","message":{"content":"<system-reminder>\nThe user named this session \"x\".\n</system-reminder>"}}"#,
+                r#"{"type":"user","message":{"content":"/compact"}}"#,
+                r#"{"type":"user","message":{"content":"/model sonnet"}}"#,
+            ] {
+                assert!(timeline::rows_from_str(noise, 0).is_empty(),
+                    "machinery reached the conversation window: {noise}");
+            }
+            // ...and it discriminates. Prose that merely STARTS with a slash, or says the word,
+            // is prose — a filter that eats real instructions is worse than the noise it removes.
+            for real in [
+                r#"{"type":"user","message":{"content":"/Users/me/thing.rs is the wrong path"}}"#,
+                r#"{"type":"user","message":{"content":"/compact the log file before shipping it"}}"#,
+            ] {
+                assert_eq!(timeline::rows_from_str(real, 0).len(), 1,
+                    "a real instruction was filtered as machinery: {real}");
+            }
 
             // A multi-line command is summarised as ONE line. Truncating at the first newline
             // showed the `cd` and hid the heredoc that was the actual work.

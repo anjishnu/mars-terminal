@@ -5561,6 +5561,29 @@ impl App {
         self.startup_cwd = None;
     }
 
+    /// Open a terminal and start a coding agent in it — the whole of "give me an agentic pane".
+    ///
+    /// The line is MARKER-GATED, not typed. `nudge_manager` already records what the alternative
+    /// costs: a command written into a terminal that is not reading yet "would be typed into a
+    /// terminal that is not reading yet and silently vanish", and a pane that silently swallowed
+    /// its own launch looks exactly like a bare shell somebody opened on purpose. The prompt-glyph
+    /// heuristic is not enough either — it fires on a prompt that is drawn but not yet reading.
+    ///
+    /// Plain `claude`, with no `--continue`: this is a NEW pane and `--continue` reopens the most
+    /// recent conversation in the directory, which would hand somebody who asked for a fresh agent
+    /// a thread they did not ask to reopen — and, worse, a second copy of a thread that is live in
+    /// another pane. `restore_workspace` resumes by id precisely because that guess is unsafe.
+    pub fn open_agent_pane(&mut self) {
+        self.open_terminal();
+        let id = self.focused_pane_id();
+        let Some(PaneContent::Terminal(tid)) = self.panes.get(&id).map(|p| p.content.clone()) else {
+            return;
+        };
+        if let Some(t) = self.terms.get_mut(&tid) {
+            t.send_bytes_marker_gated(b"claude\r");
+        }
+    }
+
     pub fn open_terminal(&mut self) {
         // If this pane is already a terminal, just re-attach.
         if let PaneContent::Terminal(_) = self.focused_pane().content {

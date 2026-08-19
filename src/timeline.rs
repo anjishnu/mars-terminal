@@ -244,7 +244,37 @@ fn result_text(content: &Value) -> String {
 /// Claude Code wraps some turns in machinery the human never typed.
 fn is_machinery(text: &str) -> bool {
     let t = text.trim_start();
-    t.starts_with("<local-command") || t.starts_with("<command-") || t.starts_with("Caveat: The messages below")
+    // `<system-reminder>` is the one that actually cost us. Claude Code files harness injections —
+    // session-name hints, tool nudges, memory recalls — as ordinary `user` messages, so they reach
+    // here indistinguishable from something the person typed. Measured on a live pane: three of the
+    // six rows in the conversation window were reminders and a slash command, which is why the
+    // "what is this agent doing" summary read as noise. A window is a budget, and machinery in it
+    // is not merely untidy — it is spent instead of the last real exchange.
+    //
+    // A SLASH COMMAND IS ALSO NOT PROSE. `/compact`, `/clear` and friends are recorded as user
+    // messages but they are addressed to the harness, not to the agent; showing one as the human's
+    // latest word says the conversation stopped there when it did not.
+    t.starts_with("<local-command")
+        || t.starts_with("<command-")
+        || t.starts_with("<system-reminder")
+        || t.starts_with("Caveat: The messages below")
+        || is_slash_command(t)
+}
+
+/// A bare slash command — `/compact`, `/clear`, `/model sonnet`. Deliberately narrow: only a
+/// leading `/` followed by a word, so a message that merely BEGINS with a path (`/Users/... is
+/// wrong`) or asks about a command mid-sentence is left alone. Prose that opens with a slash and
+/// then keeps going is prose.
+fn is_slash_command(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix('/') else { return false };
+    let mut lines = rest.lines();
+    let Some(first) = lines.next() else { return false };
+    if lines.next().is_some() {
+        return false; // multi-line: somebody is talking, not invoking
+    }
+    let mut words = first.split_whitespace();
+    let Some(verb) = words.next() else { return false };
+    verb.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && words.count() <= 2
 }
 
 /// Parse a whole transcript body into rows. Separate from the file read so the selfcheck can drive

@@ -17,9 +17,11 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use crossterm::event::{Event, KeyEvent, MouseEvent};
 use ratatui::{
-    backend::CrosstermBackend,
-    layout::Rect,
-    Terminal, TerminalOptions, Viewport,
+    backend::{Backend, CrosstermBackend, WindowSize},
+    buffer::{Buffer, Cell},
+    layout::{Position, Rect, Size},
+    style::{Color, Style},
+    Frame, Terminal, TerminalOptions, Viewport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +127,13 @@ pub enum ClientFrame {
     /// additive (never takes over the desktop client). It appears as a new workspace on the
     /// board and is watchable like any other pane.
     NewTerminal,
+    /// Open a terminal AND start a coding agent in it.
+    ///
+    /// Distinct from `NewTerminal` rather than a flag on it because the two promise different
+    /// things: a terminal is ready the moment it exists, while an agent pane is not ready until a
+    /// line has been written into a shell that is actually reading. The host owns that wait
+    /// (`open_agent_pane`), so no caller can get it wrong by typing the line itself.
+    NewAgent,
     /// Rename the WORKSPACE (tab) that owns `pane` — the phone's drawer renaming the workspace
     /// it is standing in. Distinct from `Rename`, which renames the whole session and ends the
     /// connection; this one is additive and the new name returns on the next board push.
@@ -135,6 +144,22 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     /// One rendered frame's ANSI bytes (base64).
     Output { b64: String },
+    /// The size the session is actually being drawn at, sent to a mirror whose own size is not
+    /// it. Without this a smaller mirror has no way to know it is seeing the top-left corner of
+    /// a bigger screen — the frame it receives is a perfectly valid frame of the wrong grid. With
+    /// it, a browser can fit the whole session into its window instead.
+    GridSize {
+        cols: u16,
+        rows: u16,
+        /// Whether somebody is attached at the desk, i.e. whether this size is SOMEBODY ELSE'S.
+        ///
+        /// Without it a mirror cannot tell "the session adopted the size I asked for" from "the
+        /// session declined and this is the desk's", and the two want opposite behaviour: the
+        /// first means a window resize should propose a new size, the second means it must not.
+        /// Guessing by comparing sizes gets it wrong exactly when they coincide.
+        #[serde(default)]
+        desk: bool,
+    },
     /// Raw PTY output of a specific watched pane (base64), for a Rover subscriber running the
     /// xterm.js renderer — the seed frame and the subsequent byte deltas. Carries the pane id
     /// so the phone routes it to the right terminal (unlike `Output`, which is the attach TTY).
@@ -660,8 +685,14 @@ pub fn list_sessions() -> Result<Vec<(String, bool, bool)>> {
 // ── Server ───────────────────────────────────────────────────────────────────
 
 /// Render sink: buffers ratatui's ANSI writes, ships one Output frame per
-/// flush (i.e. per drawn frame). IO errors mark the client dead instead of
-/// erroring the draw — the reader thread reports the disconnect.
+/// flush (i.e. per drawn frame). A write failure marks the target dead, and the NEXT draw is
+/// the one that fails.
+///
+/// Failing the next draw rather than the current one keeps the frame that discovered the death
+/// intact, and it is what lets `mirrors.retain_mut` actually retain. Before this, `flush`
+/// swallowed the error and returned `Ok`, so a mirror whose browser tab had closed stayed in the
+/// vector forever, drawn to on every frame — and once the session's size came to depend on which
+/// mirrors are attached, a ghost could decide it.
 struct FrameWriter {
     stream: crate::sys::control::Stream,
     buf: Vec<u8>,
@@ -678,6 +709,9 @@ impl FrameWriter {
 
 impl Write for FrameWriter {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        if self.dead {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "render target gone"));
+        }
         self.buf.extend_from_slice(b);
         Ok(b.len())
     }
@@ -734,6 +768,8 @@ enum SrvEvent {
     WatchPane { pane: Option<usize>, cols: Option<u16>, rows: Option<u16>, raw: bool },
     /// A subscriber asked to open a new terminal tab (the phone's "New terminal").
     NewTerminal,
+    /// Open a terminal and start a coding agent in it. See `ClientFrame::NewAgent`.
+    NewAgent,
     /// A subscriber renamed the workspace owning this pane (the phone's drawer).
     RenameWorkspace { pane: usize, to: String },
     /// A subscriber asked for a pane's scrollback (paging up in the xterm.js renderer).
@@ -790,6 +826,160 @@ fn make_terminal(
         TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)) },
     )?;
     Ok(term)
+}
+
+// ── The session grid: one size, one render, many targets ─────────────────────
+//
+// `ui::render` is not a pure read of the App. It WRITES the size of every pane's PTY (`ui.rs`,
+// "Keep terminal PTYs sized to their panes' inner area"), because for four years there was one
+// render target and "the size I am drawing at" and "the size the session is" were the same fact.
+//
+// A mirror made them two facts. Rendering the same App into two `Viewport::Fixed` terminals of
+// different sizes did not draw two pictures — it resized the session twice per frame, in opposite
+// directions, forever. A shell prompt shrugs that off by redrawing one line. A full-screen TUI
+// does not: it re-lays-out on every SIGWINCH and emits differential updates against a width that
+// has already changed underneath it, which is why the Claude Code panes turned to confetti while
+// the bash panes only looked slightly wrong.
+//
+// The fix is tmux's arrangement, and it is older than this bug by twenty years: the SESSION has a
+// size. It renders itself once, into a grid that belongs to no target. Everyone watching is a
+// viewport onto that grid — they copy from it, and copying cannot resize anything.
+
+/// A ratatui backend that is nothing but a grid in memory.
+///
+/// This is the session's own screen. It has no socket, no TTY and no viewer, which is the point:
+/// it can be the one authoritative size without that size being some particular watcher's.
+struct GridBackend {
+    buf: Buffer,
+    cursor: Position,
+    cursor_visible: bool,
+}
+
+impl GridBackend {
+    fn new(cols: u16, rows: u16) -> Self {
+        GridBackend {
+            buf: Buffer::empty(Rect::new(0, 0, cols, rows)),
+            cursor: Position::ORIGIN,
+            cursor_visible: false,
+        }
+    }
+
+    /// Where a viewer should put its cursor, or `None` when the frame hid it.
+    fn cursor(&self) -> Option<Position> {
+        self.cursor_visible.then_some(self.cursor)
+    }
+}
+
+impl Backend for GridBackend {
+    /// ratatui hands over only the cells that CHANGED since the last frame, so this buffer has to
+    /// persist between draws — it is the accumulated screen, exactly as a real terminal's is.
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        for (x, y, cell) in content {
+            if let Some(dst) = self.buf.cell_mut(Position::new(x, y)) {
+                *dst = cell.clone();
+            }
+        }
+        Ok(())
+    }
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.cursor_visible = false;
+        Ok(())
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.cursor_visible = true;
+        Ok(())
+    }
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        Ok(self.cursor)
+    }
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.cursor = position.into();
+        Ok(())
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.buf.reset();
+        Ok(())
+    }
+    fn size(&self) -> io::Result<Size> {
+        Ok(self.buf.area.as_size())
+    }
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        Ok(WindowSize { columns_rows: self.buf.area.as_size(), pixels: Size::default() })
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn make_grid(cols: u16, rows: u16) -> Result<Terminal<GridBackend>> {
+    let term = Terminal::with_options(
+        GridBackend::new(cols, rows),
+        TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, cols, rows)) },
+    )?;
+    Ok(term)
+}
+
+/// A second render target. Owns nothing — not the session, and not its size.
+struct MirrorTarget {
+    term: Terminal<CrosstermBackend<FrameWriter>>,
+    /// A private handle on the same socket, for the frames that are not rendered bytes.
+    sock: crate::sys::control::Stream,
+    cols: u16,
+    rows: u16,
+    /// The grid size last announced to this mirror, so an unchanged size is not re-sent every
+    /// frame. `None` until the first announcement, which is therefore always made.
+    announced: Option<(u16, u16)>,
+}
+
+/// The one size the session draws itself at.
+///
+/// THE OWNER'S TERMINAL WINS. A mirror is a second pair of eyes and takes nothing, and the size
+/// is the most consequential thing it could take: the PTYs are resized to it, so every
+/// full-screen program in the session re-lays-out to suit a browser tab that the person at the
+/// keyboard cannot see.
+///
+/// tmux's default is the other way — `window-size smallest`, everyone shrinks to fit the
+/// smallest client — and that is right for tmux, where every client is an equal owner. It is
+/// wrong here for the reason the mirror exists at all: opening a browser tab must not change
+/// what the person at the desk is looking at. A mirror that is a different size gets a viewport
+/// onto the grid instead (see `blit`), and is told the real size so it can fit it.
+///
+/// With nobody at the desk the newest mirror decides. A browser-only session still has to be
+/// drawn at SOME size, and the only size anyone has asked for is theirs.
+fn grid_size(client: Option<(u16, u16)>, mirrors: &[MirrorTarget]) -> Option<(u16, u16)> {
+    client.or_else(|| mirrors.last().map(|m| (m.cols, m.rows)))
+}
+
+/// Copy the session grid onto one target: crop what does not fit, pad what is left over.
+///
+/// The pad is tmux's `·`, and it is deliberately visible. A target that is not the session's size
+/// should look unmistakably like one, because the alternative — blank space that could equally be
+/// the app's own background — is a rendering bug you cannot tell from a design.
+fn blit(frame: &mut Frame, src: &Buffer, cursor: Option<Position>) {
+    let area = frame.area();
+    let mut pad = Cell::new("·");
+    pad.set_style(Style::new().fg(Color::DarkGray));
+    let dst = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let at = Position::new(x, y);
+            let Some(cell) = dst.cell_mut(at) else { continue };
+            *cell = match src.cell(at) {
+                Some(s) => s.clone(),
+                None => pad.clone(),
+            };
+        }
+    }
+    // A cropped-away cursor is left unplaced rather than clamped to the edge: a cursor sitting
+    // somewhere it is not is worse than no cursor at all.
+    if let Some(p) = cursor {
+        if area.contains(p) {
+            frame.set_cursor_position(p);
+        }
+    }
 }
 
 /// The daemon: owns the App, keeps running with or without a client.
@@ -902,9 +1092,18 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
 
     let mut client: Option<(crate::sys::control::Stream, u64)> = None;
     let mut term: Option<Terminal<CrosstermBackend<FrameWriter>>> = None;
+    // The owner's viewport, tracked separately from its `Terminal` because it is an input to
+    // `grid_size` and asking a ratatui terminal its size is not what decides this.
+    let mut client_size: Option<(u16, u16)> = None;
     // Extra render targets — browsers, second screens. Never owners: nothing in here can evict
     // the client, and losing one costs that target and nothing else.
-    let mut mirrors: Vec<Terminal<CrosstermBackend<FrameWriter>>> = Vec::new();
+    let mut mirrors: Vec<MirrorTarget> = Vec::new();
+    // The session's own screen. Rendered once per tick at one size and copied to every target;
+    // see `GridBackend` for why a second direct render was catastrophic rather than merely
+    // wasteful. Starts at a placeholder size that is replaced before the first draw, because
+    // nothing is drawn at all until some target exists to say what the size should be.
+    let mut grid = make_grid(120, 32)?;
+    let mut grid_dims = (120u16, 32u16);
     let mut latest_client_gen = 0;
     // Read-only mobile subscribers (the Rover phone bridge). Separate from the
     // owning client so a glance never takes over; board/briefing frames are
@@ -976,29 +1175,70 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
         // the socket (and thus over SSH), so an idle no-op draw is a wasted packet
         // that contends with the user's own keystrokes.
         if std::mem::take(&mut app.needs_redraw) {
-            if let Some(t) = term.as_mut() {
-                if let Err(e) = t.draw(|f| ui::render(f, &mut app)) {
-                    debug_log(&format!("srv: draw error: {e}"));
+            // ONE RENDER, AT ONE SIZE, THEN COPIES.
+            //
+            // `ui::render` resizes the panes' PTYs to whatever it is drawing at, so calling it
+            // once per target did not produce one picture per target — it fought over the size of
+            // the session itself, twice a frame. See `GridBackend`.
+            //
+            // Everything below this line is a copy, and a copy cannot resize anything.
+            if let Some(want) = grid_size(client_size, &mirrors) {
+                if want != grid_dims {
+                    // Rebuilt rather than resized: a fresh `Terminal` has an empty previous
+                    // buffer, so the next draw is a full repaint, which is exactly what a size
+                    // change needs.
+                    grid = make_grid(want.0, want.1)?;
+                    grid_dims = want;
                 }
-                // A copy queues an OSC 52 escape: append it raw after the
-                // frame so it reaches the client's real terminal (and through
-                // ssh, the clipboard of the machine the user is sitting at).
-                if let Some(osc) = app.take_osc() {
-                    let w = t.backend_mut(); // CrosstermBackend forwards Write to the FrameWriter
-                    let _ = w.write_all(osc.as_bytes());
-                    let _ = w.flush();
+                if let Err(e) = grid.draw(|f| ui::render(f, &mut app)) {
+                    debug_log(&format!("srv: grid draw error: {e}"));
                 }
+                let src = grid.backend();
+                let cursor = src.cursor();
+
+                if let Some(t) = term.as_mut() {
+                    if let Err(e) = t.draw(|f| blit(f, &src.buf, cursor)) {
+                        debug_log(&format!("srv: draw error: {e}"));
+                    }
+                    // A copy queues an OSC 52 escape: append it raw after the
+                    // frame so it reaches the client's real terminal (and through
+                    // ssh, the clipboard of the machine the user is sitting at).
+                    if let Some(osc) = app.take_osc() {
+                        let w = t.backend_mut(); // CrosstermBackend forwards Write to the FrameWriter
+                        let _ = w.write_all(osc.as_bytes());
+                        // Disambiguated: `Backend` is in scope now and also has a `flush`. The
+                        // one we want is the writer's, which is what ships the Output frame.
+                        let _ = std::io::Write::flush(w);
+                    }
+                }
+                // EVERY TARGET IN THE SAME PASS, which is what makes one `needs_redraw` enough.
+                //
+                // The flag is consumed by `mem::take` above, so a design that drew the client here
+                // and the mirrors on some later tick would have the first one to run clear the
+                // flag and starve the rest. Drawing them together sidesteps that entirely rather
+                // than replacing one flag with N.
+                //
+                // No OSC 52 here: a clipboard belongs to the person at the keyboard, and a mirror
+                // is a second pair of eyes, not a second pair of hands.
+                mirrors.retain_mut(|m| {
+                    // Tell it the truth about its own view BEFORE the frame it applies to: a
+                    // mirror that is not the grid's size is seeing a crop, and it cannot work
+                    // that out from bytes that are a valid frame of a screen it has never been
+                    // told the size of.
+                    if m.announced != Some(grid_dims) {
+                        let frame = ServerFrame::GridSize {
+                            cols: grid_dims.0,
+                            rows: grid_dims.1,
+                            desk: client_size.is_some(),
+                        };
+                        if write_frame(&mut m.sock, &frame).is_err() {
+                            return false;
+                        }
+                        m.announced = Some(grid_dims);
+                    }
+                    m.term.draw(|f| blit(f, &src.buf, cursor)).is_ok()
+                });
             }
-            // EVERY TARGET IN THE SAME PASS, which is what makes one `needs_redraw` enough.
-            //
-            // The flag is consumed by `mem::take` above, so a design that drew the client here and
-            // the mirrors on some later tick would have the first one to run clear the flag and
-            // starve the rest. Drawing them together sidesteps that entirely rather than
-            // replacing one flag with N.
-            //
-            // No OSC 52 here: a clipboard belongs to the person at the keyboard, and a mirror is
-            // a second pair of eyes, not a second pair of hands.
-            mirrors.retain_mut(|m| m.draw(|f| ui::render(f, &mut app)).is_ok());
         }
 
         match rx.recv_timeout(Duration::from_millis(app.tuning.poll_interval_ms)) {
@@ -1026,6 +1266,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 }
                 client = Some((stream.try_clone()?, gen));
                 term = Some(make_terminal(stream, cols, rows)?);
+                // The owner is the session's size, so a new one changes it — and a mirror that
+                // was deciding the size in an empty room stops deciding it here.
+                client_size = Some((cols, rows));
                 attached.store(true, Ordering::SeqCst);
                 app.needs_redraw = true; // fresh client → full repaint
                 app.on_attach(); // W7: "where was I?" briefing from the detach diff
@@ -1041,6 +1284,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         InputEvent::Resize(cols, rows) => {
                             if let Some((s, _)) = client.as_ref() {
                                 term = Some(make_terminal(s.try_clone()?, cols, rows)?);
+                                client_size = Some((cols, rows));
                                 if let Some(t) = term.as_mut() {
                                     let _ = t.clear();
                                 }
@@ -1066,6 +1310,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 if client.as_ref().map(|(_, g)| *g == gen).unwrap_or(false) {
                     client = None;
                     term = None; // keep running headless
+                    // Nobody at the desk: whatever mirror is still watching decides the size
+                    // now, and will be told so on its next frame.
+                    client_size = None;
                     attached.store(false, Ordering::SeqCst);
                     app.on_detach(); // W7: snapshot for the reattach briefing
                     app.autosave(); // the window may have been closed for good
@@ -1093,10 +1340,20 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // NOTHING IS EVICTED. No `client` assignment, no `send_exit`, no `attached` flag.
                 // That is the whole property, and the selfcheck asserts it by watching the
                 // client's socket rather than by reading this code.
+                let Ok(sock) = stream.try_clone() else {
+                    debug_log("srv: mirror: could not clone socket");
+                    continue;
+                };
                 match make_terminal(stream, cols, rows) {
                     Ok(mut m) => {
                         let _ = m.clear();
-                        mirrors.push(m);
+                        mirrors.push(MirrorTarget {
+                            term: m,
+                            sock,
+                            cols,
+                            rows,
+                            announced: None, // so the first frame always carries the grid size
+                        });
                         app.needs_redraw = true; // a fresh target needs a full frame
                     }
                     Err(e) => debug_log(&format!("srv: mirror terminal: {e}")),
@@ -1218,6 +1475,15 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         .is_ok()
                     });
                 }
+            }
+            Ok(SrvEvent::NewAgent) => {
+                // Same additive shape as NewTerminal, one promise further: the tab is born and the
+                // agent is launched into it once the shell is reading. The desk client's ownership
+                // is untouched, and the pane surfaces on the next board push like any other — with
+                // a `chat` on it as soon as the agent files one.
+                app.new_tab();
+                app.open_agent_pane();
+                app.needs_redraw = true;
             }
             Ok(SrvEvent::NewTerminal) => {
                 // Phone tapped "New terminal": open a terminal in a new tab (additive — the
@@ -1640,6 +1906,11 @@ fn client_connection(
                             break;
                         }
                     }
+                    Ok(ClientFrame::NewAgent) => {
+                        if tx.send(SrvEvent::NewAgent).is_err() {
+                            return;
+                        }
+                    }
                     Ok(ClientFrame::NewTerminal) => {
                         if tx.send(SrvEvent::NewTerminal).is_err() {
                             break;
@@ -1856,6 +2127,7 @@ pub fn client_main(name: &str) -> Result<()> {
                         Ok(ServerFrame::PaneOutput { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::PaneHistory { .. }) => {} // subscriber-only, never on an attach
                         Ok(ServerFrame::PaneLines { .. }) => {} // subscriber-only, never on an attach
+                        Ok(ServerFrame::GridSize { .. }) => {} // mirror-only: a real client IS the size
                         Err(_) => {}
                     },
                 }

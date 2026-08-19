@@ -151,12 +151,12 @@ fn daemon_fingerprint(session: &str) -> String {
 /// bad thing to have four copies of. Two of them had already drifted: `--open` was handing out a
 /// loopback address the hosted app cannot dial, and `mars qr` a LAN address the bridge does not
 /// even listen on.
-pub fn pair_link(session: &str, tunnel_base: &str) -> Result<String> {
+pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String> {
     let endpoint = format!("{}/ws", tunnel_base.replacen("https://", "wss://", 1));
     let token = ensure_token()?;
     let fp = daemon_fingerprint(session);
     Ok(format!(
-        "https://mars-terminal.lovable.app/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
+        "https://mars-terminal.lovable.app/{route}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
     ))
 }
 
@@ -219,8 +219,31 @@ pub fn desk_main(session_arg: Option<String>, web: Option<String>) -> Result<()>
     println!();
     println!("  {web}/desk#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1");
     println!();
-    println!("  Paste that into a browser. The session must be running on a binary that knows");
-    println!("  `Mirror` — if the screen stays black, `mars reboot {session}` is why.");
+    println!("  Paste that into a browser ON THIS MACHINE. The session must be running on a binary");
+    println!("  that knows `Mirror` — if the screen stays black, `mars reboot {session}` is why.");
+
+    // AND THE ONE THAT CAN LEAVE THE MACHINE.
+    //
+    // The line above is loopback, which is right for the browser on this desk and useless
+    // everywhere else — a phone cannot reach `127.0.0.1`, and the hosted app is https and cannot
+    // dial `ws://` at all. `--desk` was the fifth builder of this URL and the only one that never
+    // learned the tunnel, so "open the web terminal on my phone" had no answer that worked.
+    match running_tunnel_url() {
+        Some(base) => {
+            if let Err(why) = tunnel_answers(&base) {
+                eprintln!("{}", tunnel_warning(&why));
+            }
+            println!();
+            println!("  From anywhere else — phone, another laptop — over the tunnel:");
+            println!();
+            println!("  {}", pair_link(&session, &base, "desk")?);
+        }
+        None => {
+            println!();
+            println!("  No tunnel is running, so there is no link that works off this machine.");
+            println!("  `mars pair {session}` brings one up; `mars pair --link` prints the phone's.");
+        }
+    }
     Ok(())
 }
 
@@ -253,7 +276,7 @@ pub fn open_main(session_arg: Option<String>) -> Result<()> {
         "the bridge is up but its tunnel URL could not be read from ngrok \
          (http://127.0.0.1:4040) — see ~/.mars/serve-agent.log"
     ))?;
-    let url = pair_link(&session, &base)?;
+    let url = pair_link(&session, &base, "rover")?;
 
     // Printed BEFORE the open, and printed whether or not it succeeds. A browser that does not
     // come up must still leave the person holding the link, rather than a command that appeared
@@ -702,7 +725,7 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     };
 
     let (_tunnel, base) = start_tunnel(port)?;
-    let app_url = pair_link(&session, &base)?;
+    let app_url = pair_link(&session, &base, "rover")?;
     let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
 
     // Prove the path before showing a QR. A QR that cannot work is worse than an error: it moves
@@ -972,7 +995,7 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
     if let Err(why) = tunnel_answers(&base) {
         println!("{}", tunnel_warning(&why));
     }
-    let app_url = pair_link(session, &base)?;
+    let app_url = pair_link(session, &base, "rover")?;
     print_wordmark();
     println!();
     print_qr(&app_url);
@@ -1568,6 +1591,15 @@ fn agent_provenance(cfg: &crate::agent::AgentConfig) -> String {
 /// One per bridge process: a browser drives one session at a time, and a second desk tab replaces
 /// the first rather than typing into it by accident.
 static MIRROR_IN: std::sync::Mutex<Option<crate::sys::control::Stream>> = std::sync::Mutex::new(None);
+/// Which mirror connection is the live one. Bumped on every `mirror` request.
+///
+/// A REPLACED MIRROR IS NOT A DEAD SESSION. Re-mirroring drops the previous stream, whose reader
+/// thread then falls out of its loop and — before this — announced `mirror.gone`, "the session
+/// ended", to a browser that had merely resized. The page dutifully showed the death notice for
+/// the connection it had itself just replaced, cleared it when the new frames arrived, and did the
+/// whole thing again on the next resize. What looked like a flapping session was the page being
+/// told, correctly, about the end of something it no longer cared about.
+static MIRROR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket: &std::path::Path, txt: &str) {
     let v: serde_json::Value = match serde_json::from_str(txt) {
@@ -1871,6 +1903,13 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some("new_terminal") => {
             let _ = session::write_frame(writer, &ClientFrame::NewTerminal);
         }
+        // The same, with a coding agent started in it. The HOST decides when the shell is ready to
+        // be written to — a bridge that sent `new_terminal` and then typed `claude` would be
+        // guessing at that from the wrong side of the socket, and a launch line that lands before
+        // the shell reads is swallowed in silence.
+        Some("new_agent") => {
+            let _ = session::write_frame(writer, &ClientFrame::NewAgent);
+        }
         // Rename ONE workspace, addressed by the pane the phone is standing in. Unlike
         // `rename` (the session) this rides the subscribe writer: the daemon closes the stream
         // that sends `Rename`, but a workspace rename leaves the connection open, so the live
@@ -2126,6 +2165,7 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             //
             // Dropping the old stream closes it; the daemon prunes the dead target on its next
             // draw, which is the same path a closed tab takes.
+            let gen = MIRROR_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             drop(MIRROR_IN.lock().unwrap().take());
             let Ok(sock) = crate::sys::control::connect(socket) else {
                 let _ = tx.send(serde_json::json!({
@@ -2153,15 +2193,32 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
-                    if let Ok(ServerFrame::Output { b64 }) = serde_json::from_str(line.trim()) {
+                    match serde_json::from_str(line.trim()) {
                         // Same envelope the pane path uses, under its own name so a desk shell and
                         // a pane view can be open at once without reading each other's bytes.
-                        if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
-                            break;
+                        Ok(ServerFrame::Output { b64 }) => {
+                            if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
+                                break;
+                            }
                         }
+                        // The size the session is ACTUALLY drawn at, which is not necessarily the
+                        // size this browser asked for — the person at the desk decides that, and a
+                        // tab opening must not move it. Forwarded so the browser can fit the whole
+                        // grid into its window instead of showing the top-left corner of it and
+                        // looking, correctly but uselessly, like a rendering bug.
+                        Ok(ServerFrame::GridSize { cols, rows, desk }) => {
+                            if out.send(serde_json::json!({"t": "mirror.size", "cols": cols, "rows": rows, "desk": desk}).to_string()).is_err() {
+                                break;
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                let _ = out.send(serde_json::json!({"t": "mirror.gone", "why": "the session ended"}).to_string());
+                // Only the CURRENT mirror gets to report a death. A superseded one is ending
+                // because the browser asked for a different size, which is the opposite of news.
+                if MIRROR_GEN.load(std::sync::atomic::Ordering::SeqCst) == gen {
+                    let _ = out.send(serde_json::json!({"t": "mirror.gone", "why": "the session ended"}).to_string());
+                }
             });
         }
         // Typing into the web terminal. Straight through: the daemon decodes the bytes, because
@@ -2896,6 +2953,6 @@ pub fn link_main(session_arg: Option<String>) -> Result<()> {
     if let Err(why) = tunnel_answers(&base) {
         eprintln!("{}", tunnel_warning(&why));
     }
-    println!("{}", pair_link(&session, &base)?);
+    println!("{}", pair_link(&session, &base, "rover")?);
     Ok(())
 }
