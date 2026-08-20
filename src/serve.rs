@@ -936,7 +936,72 @@ pub fn notify_frame_from_board(
     Some(out.to_string())
 }
 
-fn tunnel_answers(base: &str) -> Result<(), String> {
+/// A failed tunnel probe, and what to actually do about it.
+///
+/// The remedy used to be one fixed paragraph, on the reasoning that it is the same problem
+/// wherever it is noticed. It is not. "Restart the tunnel" is right for a dead agent and actively
+/// wrong for a filtered one — restarting mints a fresh random `.ngrok-free.dev` name that gets
+/// blocked exactly like the last one, so the advice produces a loop that reads as ngrok "going
+/// stale" when nothing has gone stale at all. Cost us an evening. The fault carries its own
+/// remedy now, because a diagnosis whose fix does not follow from it is not a diagnosis.
+struct TunnelFault {
+    why: String,
+    remedy: Vec<String>,
+}
+
+fn restart_remedy() -> Vec<String> {
+    vec![
+        "   A phone will not reach this machine until the tunnel is replaced:".into(),
+        "   stop the bridge and its ngrok agent, then run `mars pair` again.".into(),
+        "   (Away from the machine, this is what the phone reports as \"the host did not answer\".)".into(),
+    ]
+}
+
+/// The tunnel's hostname, for probes that need to address it directly.
+fn host_of(base: &str) -> Option<String> {
+    let rest = base.split("://").nth(1).unwrap_or(base);
+    let host = rest.split('/').next()?.split('@').next_back()?;
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Is something between here and ngrok's edge answering FOR this host?
+///
+/// The signature is a middlebox doing SNI inspection: it lets the TCP connection through, reads
+/// the hostname out of the TLS ClientHello, and replies in plaintext instead of completing the
+/// handshake — which surfaces as a corrupt-record error rather than anything that says "blocked".
+/// Tunnel domains are a standard category for these filters, so the case is common and looks
+/// nothing like its cause.
+///
+/// Proof rather than inference: ask the same host over plain HTTP and read where it sends us. The
+/// edge's own http→https redirect points back at itself; a filter points at its warning page, and
+/// that hostname is the name of the thing blocking you. Redirects are NOT followed — the redirect
+/// is the evidence, and following it throws the evidence away and reports on the warning page.
+fn intercepted_by(host: &str) -> Option<String> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(5))
+        .build();
+    let resp = match agent.get(&format!("http://{host}/")).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(_) => return None,
+    };
+    let loc = resp.header("location")?;
+    let target = loc.split("://").nth(1)?.split('/').next()?;
+    let target = target.split(':').next()?.trim_end_matches('.');
+    if target.is_empty() || target.eq_ignore_ascii_case(host) {
+        return None; // plain http→https on the same host is the edge behaving correctly
+    }
+    // Anything still inside ngrok is ngrok's business — an interstitial, a moved edge — not a
+    // third party standing in front of it.
+    const NGROK: [&str; 5] = ["ngrok.com", "ngrok.io", "ngrok.app", "ngrok-free.dev", "ngrok-free.app"];
+    if NGROK.iter().any(|d| target.ends_with(d)) {
+        return None;
+    }
+    Some(target.to_string())
+}
+
+fn tunnel_answers(base: &str) -> Result<(), TunnelFault> {
     let ours = |r: &ureq::Response| r.header(BRIDGE_HEADER).is_some();
     match ureq::get(base).timeout(Duration::from_secs(6)).call() {
         Ok(r) if ours(&r) => Ok(()),
@@ -945,28 +1010,66 @@ fn tunnel_answers(base: &str) -> Result<(), String> {
         // Something is there but did not identify itself. Two very different causes, and naming
         // both is what keeps this from being ignored: a bridge older than this header looks
         // exactly like ngrok's edge answering for a bridge that has gone.
-        Ok(_) | Err(ureq::Error::Status(_, _)) => Err(concat!(
-            "that URL answers, but not as this bridge — if you have just upgraded, the running ",
-            "bridge predates this check and only needs restarting; otherwise ngrok's edge is up ",
-            "and the agent is no longer attached to it",
-        )
-        .into()),
-        Err(e) => Err(format!("the tunnel did not answer ({e})")),
+        Ok(_) | Err(ureq::Error::Status(_, _)) => Err(TunnelFault {
+            why: concat!(
+                "that URL answers, but not as this bridge — if you have just upgraded, the running ",
+                "bridge predates this check and only needs restarting; otherwise ngrok's edge is up ",
+                "and the agent is no longer attached to it",
+            )
+            .into(),
+            remedy: restart_remedy(),
+        }),
+        Err(e) => {
+            let msg = e.to_string();
+            // A TLS failure is not a silent host. The connection was accepted and then the
+            // handshake did not complete, which means something answered — so the "it may be
+            // asleep" reading is already excluded before we ask who.
+            let tls = ["tls", "handshake", "certificate", "corrupt", "InvalidContentType", "version number"]
+                .iter()
+                .any(|k| msg.to_ascii_lowercase().contains(&k.to_ascii_lowercase()));
+            let host = host_of(base);
+            if tls {
+                if let Some(by) = host.as_deref().and_then(intercepted_by) {
+                    return Err(TunnelFault {
+                        why: format!(
+                            "this tunnel is being blocked on your network — `{by}` answers for it \
+                             instead of ngrok"
+                        ),
+                        remedy: vec![
+                            "   The tunnel itself is fine: the agent is connected and the session is up.".into(),
+                            "   Something on the path (router or ISP) inspects TLS, sees an ngrok".into(),
+                            "   hostname and replies in plaintext, so the handshake never completes.".into(),
+                            "".into(),
+                            "   RESTARTING WILL NOT HELP — a new tunnel gets a new ngrok name and the".into(),
+                            "   same block. What does work:".into(),
+                            "     · this machine     mars attach '<link>'   no tunnel involved".into(),
+                            "     · same wifi        `mars qr` — a LAN link, which never leaves the network".into(),
+                            "     · a phone          turn wifi off; cellular is a different network".into(),
+                            "     · everywhere       allow ngrok on the router, or use a custom domain".into(),
+                        ],
+                    });
+                }
+                return Err(TunnelFault {
+                    why: format!("the tunnel host accepted the connection but TLS did not complete ({msg})"),
+                    remedy: vec![
+                        "   Something answered and then failed to speak TLS, so the tunnel is".into(),
+                        "   reachable and the fault is on the path — a filter, a proxy, or a captive".into(),
+                        "   portal. Restarting the tunnel does not address any of those.".into(),
+                        "   `mars attach '<link>'` works on this machine regardless.".into(),
+                    ],
+                });
+            }
+            Err(TunnelFault { why: format!("the tunnel did not answer ({msg})"), remedy: restart_remedy() })
+        }
     }
 }
 
-/// What to print when a probe fails. One wording, because it is the same problem wherever it is
-/// noticed, and the remedy is a command the engineer runs rather than one we run for them.
-fn tunnel_warning(why: &str) -> String {
-    [
-        String::new(),
-        format!("⚠  {why}."),
-        "   A phone will not reach this machine until the tunnel is replaced:".into(),
-        "   stop the bridge and its ngrok agent, then run `mars pair` again.".into(),
-        "   (Away from the machine, this is what the phone reports as \"the host did not answer\".)".into(),
-        String::new(),
-    ]
-    .join("\n")
+/// What to print when a probe fails.
+fn tunnel_warning(f: &TunnelFault) -> String {
+    let mut out = vec![String::new(), format!("⚠  {}.", f.why)];
+    out.extend(f.remedy.iter().cloned());
+    out.push(String::new());
+    out.join("\n")
 }
 
 fn running_tunnel_url() -> Option<String> {
