@@ -126,11 +126,53 @@ fn ensure_token() -> Result<String> {
     Ok(t)
 }
 
+/// This machine, durably. Minted once into `~/.mars/machine-id` and never derived again.
+///
+/// IT WAS `$HOSTNAME`, AND `$HOSTNAME` IS UNSET ON macOS. Measured here: `hostname -s` says
+/// `Anjishnus-MacBook-Air` while `$HOSTNAME` is empty, so every Mac fell to the `"lan"` fallback
+/// and every session on every Mac minted the byte-identical `lan-<session>`. Two machines each
+/// running a session called `mars-dev` were indistinguishable.
+///
+/// That is not cosmetic, because the client keys on it. `registry.ts` groups paired rows by host —
+/// recovered by stripping the `-<session>` suffix — so that one machine's sessions can share one
+/// token and one endpoint. With every Mac answering `lan`, that grouping spans MACHINES, and
+/// `shareHostToken` then copies the freshest row's token *and endpoint* across the group. One
+/// machine's sessions get repointed at another machine's bridge, silently, and it looks like
+/// success.
+///
+/// Not the hostname, not an env var, not the socket path: all three change or vanish, which is
+/// exactly how this broke. A minted value is the only kind that cannot.
+pub fn machine_id_for_test() -> String { machine_id() }
+pub fn daemon_fingerprint_for_test(s: &str) -> String { daemon_fingerprint(s) }
+
+fn machine_id() -> String {
+    let Some(dir) = crate::sys::paths::home_dir().map(|h| h.join(".mars")) else {
+        return "mars".into();
+    };
+    let path = dir.join("machine-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let t = existing.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    // Real entropy, from the same source the pairing token uses. A pid-and-clock id would be
+    // unique enough on one machine and is exactly the kind of thing that collides across two.
+    let minted = mint_token()
+        .map(|t| format!("m{}", &t[..8.min(t.len())]))
+        .unwrap_or_else(|_| "mars".into());
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&path, &minted);
+    minted
+}
+
 /// A stable-ish daemon identity fingerprint for the prototype (LAN-scoped, TOFU).
 /// The real bridge signs with a persistent daemon keypair; credentials pin to THIS.
+///
+/// Shape preserved deliberately: the client recovers the machine half by stripping the
+/// `-<session>` suffix, so changing what the host half IS must not change how it is read.
 fn daemon_fingerprint(session: &str) -> String {
-    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "lan".into());
-    format!("{host}-{session}")
+    format!("{}-{session}", machine_id())
 }
 
 // ── mars qr ──────────────────────────────────────────────────────────────────

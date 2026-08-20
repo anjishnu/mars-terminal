@@ -7331,6 +7331,40 @@ fn selfcheck() -> Result<()> {
             let rows = timeline::rows_from_str(fixture, 2);
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[1], Row::Unknown { label: "telepathy".into() });
+
+            // A RENAMED conversation must offer its new name in the picker. Both halves of this
+            // are load-bearing and each one alone reproduced the bug: the name records live at the
+            // END of an append-only transcript (a head-window read can never see a rename), and
+            // `/rename` writes `customTitle`/`agentName` while leaving the generated `aiTitle`
+            // stale (so last-record-wins hands the host's guess the final say).
+            {
+                let t = sdir.join("renamed.jsonl");
+                let born = format!(
+                    "{}\n{}\n",
+                    r#"{"type":"ai-title","aiTitle":"generated-name"}"#,
+                    r#"{"type":"agent-name","agentName":"generated-name"}"#,
+                );
+                // Pad past the window so a head-only read cannot reach the rename below.
+                let filler = format!("{}\n", r#"{"type":"assistant","message":{"content":[]}}"#)
+                    .repeat(2_000);
+                let renamed = format!(
+                    "{}\n{}\n{}\n",
+                    r#"{"type":"custom-title","customTitle":"captains-name"}"#,
+                    r#"{"type":"ai-title","aiTitle":"generated-name"}"#,
+                    r#"{"type":"agent-name","agentName":"captains-name"}"#,
+                );
+                std::fs::write(&t, format!("{born}{filler}{renamed}"))?;
+                assert!(std::fs::metadata(&t)?.len() > 64 * 1024,
+                    "fixture must exceed the read window or it proves nothing");
+                assert_eq!(timeline::title_of(&t), "captains-name",
+                    "a rename at the end of a long transcript must reach the picker");
+
+                // Never renamed: the generated title is the right answer, not an empty row.
+                let auto = sdir.join("auto.jsonl");
+                std::fs::write(&auto, &born)?;
+                assert_eq!(timeline::title_of(&auto), "generated-name",
+                    "an unrenamed conversation still shows its generated title");
+            }
         }
         println!("[selfcheck] timeline: a transcript becomes rows, and bookkeeping leaves no trace ... PASS");
         println!("[selfcheck] manager: a workspace id outlives the daemon that minted it ... PASS");
@@ -8486,6 +8520,23 @@ fn selfcheck() -> Result<()> {
             assert!(!serve::ct_eq(b"secret", b"secret-token"), "a matching prefix is not a match");
             assert!(!serve::ct_eq(b"secret-token", b"secret"), "length asymmetry either way");
             assert!(serve::ct_eq(b"", b""));
+
+            // THE MACHINE ID IS MINTED, NOT DERIVED. It was `$HOSTNAME`, which is unset on macOS,
+            // so every Mac answered `lan` and two machines each running a session called `mars-dev`
+            // produced the byte-identical `lan-mars-dev`. The client keys its per-host token and
+            // ENDPOINT sharing on that value, so the collision repointed one machine's sessions at
+            // another machine's bridge — silently, and looking like success.
+            let a = serve::machine_id_for_test();
+            assert!(!a.is_empty(), "a machine id is always minted");
+            assert_ne!(a, "lan", "the colliding fallback must be gone");
+            assert_eq!(a, serve::machine_id_for_test(), "and it is durable: minted once, read after");
+
+            // The SHAPE is a contract, not a detail: the client recovers the machine half by
+            // stripping `-<session>`, so a fingerprint that did not end in the session name would
+            // file every row under a host that does not exist.
+            let fp = serve::daemon_fingerprint_for_test("mars-dev");
+            assert!(fp.ends_with("-mars-dev"), "the session suffix is how the client reads the host: {fp}");
+            assert_eq!(&fp[..fp.len() - "-mars-dev".len()], a, "and what remains must BE the machine id");
             assert!(!serve::ct_eq(b"", b"x"));
         }
         #[cfg(feature = "web")]
