@@ -2185,7 +2185,7 @@ impl App {
         }
         let msg = crate::briefs::assignment(brief, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
-            t.send_bytes(crate::briefs::typed_bytes(&msg).as_bytes());
+            t.send_bytes(crate::briefs::manager_bytes(&msg).as_bytes());
         }
         Ok(())
     }
@@ -2228,6 +2228,7 @@ impl App {
         &mut self,
         pane_id: crate::pane::PaneId,
         title: &str,
+        decisions: &[crate::session::PriorDecision],
     ) -> Result<String, String> {
         let title = title.trim();
         if title.is_empty() {
@@ -2252,9 +2253,19 @@ impl App {
         let repo = self.terms.get(&tid).and_then(|t| t.spawn_cwd.clone());
         let (id, _path) =
             crate::briefs::create(title, ts, repo.as_deref()).map_err(|e| e.to_string())?;
+        // What was settled in conversation, written down BEFORE the planner is pointed at the
+        // brief — so it reads them as binding rather than re-deriving them and re-opening the
+        // argument that produced them.
+        if !decisions.is_empty() {
+            if let Some(dir) = crate::briefs::dir().map(|d| d.join(&id)) {
+                if let Err(e) = crate::briefs::record_prior(&dir, decisions) {
+                    crate::session::debug_log(&format!("[brief] prior decisions not written: {e}"));
+                }
+            }
+        }
         let msg = crate::briefs::draft_assignment(&id, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
-            t.send_bytes(crate::briefs::typed_bytes(&msg).as_bytes());
+            t.send_bytes(crate::briefs::manager_bytes(&msg).as_bytes());
         }
         Ok(id)
     }

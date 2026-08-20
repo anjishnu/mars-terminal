@@ -723,6 +723,45 @@ fn main() -> Result<()> {
                     println!("  {}", path.display());
                     println!("  acceptance is the unmet subset; decisions inherited whole.");
                 }
+                // THE ENTRY TO THE LOOP. Nothing originated work before this: every round began
+                // with a person typing a title, so "walk a line of code back to the observation
+                // that started it" failed at the first hop.
+                "review" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    if !dir.join("brief.md").exists() {
+                        anyhow::bail!("usage: mars brief review <brief-id>");
+                    }
+                    let objections = briefs::review(&dir)?;
+                    if objections.is_empty() {
+                        println!("  nothing to refute.");
+                    } else {
+                        for o in &objections {
+                            println!("  {o}");
+                        }
+                    }
+                    println!("\n  {} objection(s) → {}", objections.len(), dir.join("review.md").display());
+                    println!("  it annotates; it does not gate.");
+                }
+                "nominate" => {
+                    let session = args.next().unwrap_or_default();
+                    let pane = args.next().unwrap_or_else(|| "0".into());
+                    let headline = args.collect::<Vec<_>>().join(" ");
+                    if session.is_empty() || headline.trim().is_empty() {
+                        anyhow::bail!("usage: mars brief nominate <session> <pane> \"<headline>\"");
+                    }
+                    let path = briefs::nominate(
+                        &session,
+                        &pane,
+                        headline.trim(),
+                        "Nominated by Rover from the session snapshot cited above.",
+                        worklog::now_secs(),
+                    )?;
+                    println!("  {}", path.display());
+                    println!("  kind: nomination — it cites the snapshot it was read out of.");
+                }
                 "worker" => {
                     println!(
                         "Run this in the pane you want to work in, then assign a brief to it:\n\n  {}",
@@ -808,7 +847,7 @@ fn main() -> Result<()> {
                     let frame = if sub == "assign" {
                         session::ClientFrame::AssignBrief { pane, brief: a.clone() }
                     } else {
-                        session::ClientFrame::DraftBrief { pane, title: a.clone() }
+                        session::ClientFrame::DraftBrief { pane, title: a.clone(), decisions: Vec::new() }
                     };
                     session::write_frame(&mut w, &frame)?;
                     // WAIT FOR THE DAEMON TO SAY IT TOOK IT. The first version printed "sent" the
@@ -8701,6 +8740,19 @@ fn selfcheck() -> Result<()> {
             assert!(session::parse_pair_link("#h=wss://h/ws&id=x").is_none(), "no token, no link");
             // Whitespace survives a terminal wrapping the line across two.
             assert!(session::parse_pair_link("  https://x/r#h=wss://h/ws&id=i&t=t&s=s  ").is_some());
+
+            // ── MANAGER-ISSUED TEXT IS WATERMARKED ───────────────────────────────────────────
+            //
+            // A pane's scrollback is an agent's memory, and an instruction MARS typed on your
+            // behalf used to be indistinguishable from one you typed yourself. The mark leads,
+            // because a reader scanning a transcript sees the start of a line.
+            let m = briefs::manager_bytes("First read X. Then read Y. Start building.");
+            assert!(m.starts_with(&format!("\x1b[200~{} ", briefs::MANAGER_MARK)),
+                "the watermark leads the line, inside the bracketed paste");
+            // Still ONE bracketed line ending in \r — the only shape that actually sends. The
+            // watermark must not have turned an assignment into a paste that sits there.
+            assert!(m.ends_with("\x1b[201~\r"), "still a sent line, not a parked paste");
+            assert_eq!(m.matches('\n').count(), 0, "still one line");
             assert!(!serve::ct_eq(b"", b"x"));
         }
         #[cfg(feature = "web")]

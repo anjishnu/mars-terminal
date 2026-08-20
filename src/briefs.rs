@@ -341,7 +341,8 @@ pub struct Decision {
     pub depends_on: Vec<String>,
     /// An upstream override invalidated this ruling. Derived, never stored as its own state.
     pub stale: bool,
-    /// A human chose against the recommendation.
+    
+/// A human chose against the recommendation.
     pub overridden: bool,
 }
 
@@ -349,6 +350,47 @@ impl Decision {
     pub fn chosen(&self) -> Option<&DecisionOption> {
         self.options.iter().find(|o| o.chosen)
     }
+}
+
+/// The raw text of one decision's `###` block — what a re-ruling has to change.
+fn decision_block(body: &str, id: &str) -> Option<String> {
+    let mut cur: Option<String> = None;
+    let mut buf = String::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if let Some((did, _, _)) = decision_heading(t) {
+            if cur.as_deref() == Some(id) {
+                return Some(buf);
+            }
+            cur = Some(did);
+            buf.clear();
+        } else if t.starts_with("## ") {
+            if cur.as_deref() == Some(id) {
+                return Some(buf);
+            }
+            cur = None;
+            buf.clear();
+        }
+        if cur.as_deref() == Some(id) {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    (cur.as_deref() == Some(id)).then_some(buf)
+}
+
+/// A short, stable fingerprint of a ruling.
+///
+/// FNV-1a rather than a crypto hash: this is not defending against anyone, it is answering "did
+/// these bytes change" — and the answer must be the same on every machine that reads the brief,
+/// so a `DefaultHasher` (explicitly not stable across builds) would be the wrong tool.
+fn ruling_mark(text: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.split_whitespace().collect::<Vec<_>>().join(" ").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:06x}", h & 0xffffff)
 }
 
 /// An unfilled slot in the template, rather than something a planner wrote.
@@ -599,12 +641,203 @@ fn append_to_made(body: &str, add: &[String]) -> String {
     }
 }
 
+/// The second reader, deterministic half.
+///
+/// D4 asks four questions of a brief: is the premise checkable, is any criterion unverifiable,
+/// does the file list match the blast radius, and was a fork ruled without naming its rejection.
+/// **Three of those are arithmetic**, and arithmetic does not need a model — it needs to be run.
+/// So this is the half that can be built now and be right every time; the adversarial reader that
+/// tries to REFUTE the design is the half that needs a model, and it is still open.
+///
+/// **It annotates; it does not gate.** A model call standing between you and your own work is a
+/// worse failure than an unreviewed brief. Staleness gates because it is arithmetic about
+/// references; an objection is a judgement about design, and judgements do not get a veto here.
+pub fn review(brief_dir: &Path) -> std::io::Result<Vec<String>> {
+    let body = std::fs::read_to_string(brief_dir.join("brief.md"))?;
+    let mut decisions = parse_decisions(&body);
+    apply_made(&mut decisions, &body);
+    let mut out: Vec<String> = Vec::new();
+
+    // 1 — every ruling must name what it rejected. A fork ruled without its rejection is a
+    //     decision the worker will re-open, because nothing on the page says it was closed.
+    for d in &decisions {
+        let named = d
+            .chosen()
+            .and_then(|c| c.why.as_deref())
+            .map(|w| w.to_lowercase().contains("why") || w.to_lowercase().contains("not the other"))
+            .unwrap_or(false);
+        if !named {
+            out.push(format!(
+                "- [{}] ruled without naming why the others lose. A worker reading this re-opens it.",
+                d.id
+            ));
+        }
+    }
+
+    // 2 — every criterion needs something that checks it. `unverifiable` is a defect in the BRIEF,
+    //     and the brief is exactly where it can still be cheaply fixed.
+    let front = crate::manager::split_front(&body).map(|(f, _)| f).unwrap_or("");
+    let verify = parse_list(front, "verify");
+    let any_keyed = verify.iter().any(|c| !verify_key(c).is_empty());
+    for (n, text) in acceptance(&body) {
+        let covered = if any_keyed {
+            verify.iter().any(|c| verify_key(c).contains(&n))
+        } else {
+            !verify.is_empty()
+        };
+        if !covered {
+            out.push(format!(
+                "- [acceptance {n}] nothing checks it — \"{}\". Key a `verify:` entry to it, or say plainly that it is unverifiable.",
+                text.chars().take(70).collect::<String>()
+            ));
+        }
+    }
+
+    // 3 — a dependency on a decision that does not exist. A dangling reference means staleness
+    //     will never fire for it, which silently disarms the only gate this design has.
+    let ids: Vec<&str> = decisions.iter().map(|d| d.id.as_str()).collect();
+    for d in &decisions {
+        for dep in &d.depends_on {
+            if !ids.contains(&dep.as_str()) {
+                out.push(format!("- [{}] assumes `{dep}`, which is not a decision in this brief.", d.id));
+            }
+        }
+    }
+
+    // 4 — the brief has to have a design at all.
+    if decisions.is_empty() {
+        out.push("- [brief] no ruled decisions. There is nothing here to approve.".into());
+    }
+
+    let head = "# Review\n\n\
+                Written by the deterministic second reader. It annotates and does not gate — an \
+                objection is a judgement, and a judgement does not stand between you and your own \
+                work. Each line names the decision or criterion it is about.\n\n";
+    let doc = if out.is_empty() {
+        format!("{head}Nothing to refute. Every ruling names its rejection, every criterion has \
+                 something that checks it, and no decision assumes one that does not exist.\n")
+    } else {
+        format!("{head}{}\n", out.join("\n"))
+    };
+    std::fs::write(brief_dir.join("review.md"), doc)?;
+    Ok(out)
+}
+
+/// File a nomination — the one thing that originates work.
+///
+/// **A nomination is a memo.** Ruled in the work model and reused here rather than rebuilt: Rover
+/// already proposes memos, you already press them, and they already file and decay by going
+/// unread. A `nominations/` class would buy a lifecycle nothing needs.
+///
+/// What makes it a nomination rather than a note is `kind: nomination` and the fact that it CITES
+/// something. A nomination whose provenance is a sentence is an opinion; one that names the
+/// snapshot it was read out of can be walked back to, which is the whole test this loop has to
+/// pass — point at a line of code and walk it back to the observation that started it.
+pub fn nominate(
+    session: &str,
+    pane: &str,
+    headline: &str,
+    body: &str,
+    ts: u64,
+) -> std::io::Result<PathBuf> {
+    let Some(home) = crate::sys::paths::home_dir() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"));
+    };
+    let sdir = home.join(".mars").join("sessions").join(session);
+    // The newest snapshot IS the observation. Read from disk rather than described, so the cite
+    // names a file that exists and a reader can open.
+    let snap = std::fs::read_dir(sdir.join("snapshots"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".json"))
+        .max();
+    let Some(snap) = snap else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no snapshot under {} — there is nothing to cite, so there is nothing to nominate", sdir.join("snapshots").display()),
+        ));
+    };
+    let slug: String = headline
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("-");
+    let dir = sdir.join("memos");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{slug}.md"));
+    let doc = format!(
+        "---\n\
+         source: agent\n\
+         title: {slug}\n\
+         kind: nomination\n\
+         v: 1\n\
+         created_ts: {ts}\n\
+         priority: 60\n\
+         severity: info\n\
+         session: \"{session}\"\n\
+         pane: \"{pane}\"\n\
+         headline: \"{headline}\"\n\
+         expired: false\n\
+         cites:\n\
+         \x20 - {{snapshot: \"{snap}\", session: \"{session}\", pane: \"{pane}\"}}\n\
+         ---\n\
+         {body}\n\
+         \n\
+         Read out of `{snap}`. Press draft to turn this into a brief; the planner receives this \
+         provenance as the problem statement.\n"
+    );
+    std::fs::write(&path, doc)?;
+    Ok(path)
+}
+
+/// Write decisions settled in conversation into `## Decisions already made`.
+///
+/// The same section an override lands in, and for the same reason: both are decisions already
+/// made, both bind the worker, and both are read back by `parse_made`. One section, one format,
+/// one reader — a `prior.md` beside it would be a second place a settled decision lives and a rule
+/// about which of them wins.
+pub fn record_prior(brief_dir: &Path, prior: &[crate::session::PriorDecision]) -> std::io::Result<()> {
+    if prior.is_empty() {
+        return Ok(());
+    }
+    let path = brief_dir.join("brief.md");
+    let body = std::fs::read_to_string(&path)?;
+    let lines: Vec<String> = prior
+        .iter()
+        .map(|d| {
+            let mut l = format!("- {} — **{}**", d.question.trim(), d.chose.trim());
+            // The rejected option matters more than the chosen one here: it is the thing a worker
+            // would otherwise re-propose, and the reason this section exists.
+            if let Some(r) = d.rejected.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+                l.push_str(&format!(", not {r}"));
+            }
+            if !d.why.trim().is_empty() {
+                l.push_str(&format!(". {}", d.why.trim()));
+            }
+            l
+        })
+        .collect();
+    std::fs::write(&path, append_to_made(&body, &lines))
+}
+
 /// A human chose against the recommendation.
 ///
 /// Returns the ids this override made stale. **Exactly the declared dependents and nothing else**
 /// — the alternative considered and rejected was re-running the planner over the whole brief,
 /// which throws away every decision already agreed with, and the one thing refinement must not do
 /// is discard the agreement it is building.
+
+/// A human chose against the recommendation.
+///
+/// Returns the ids this override made stale.
 pub fn override_decision(brief_dir: &Path, id: &str, key: &str) -> std::io::Result<Vec<String>> {
     let path = brief_dir.join("brief.md");
     let body = std::fs::read_to_string(&path)?;
@@ -624,23 +857,53 @@ pub fn override_decision(brief_dir: &Path, id: &str, key: &str) -> std::io::Resu
         return Ok(Vec::new()); // choosing what is already chosen is not an override
     }
     let (already_over, already_stale) = parse_made(&body);
+    // W10 — WHO AND WHEN, on the line itself. It recorded what was chosen and what the planner
+    // chose, which is enough at n=1 and wrong the moment two people share a board: the section is
+    // BINDING on a worker, and a binding instruction with no author is one nobody can ask about.
+    let who = std::env::var("MARS_ACTOR")
+        .ok()
+        .filter(|w| !w.trim().is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "unknown".into());
+    let when = crate::worklog::now_secs();
     let mut add = vec![format!(
-        "- [{id}] **overridden** → Option {key} — {} *(planner chose {was})*",
+        "- [{id}] **overridden** → Option {key} — {} *(planner chose {was}; by {who} at {when})*",
         opt.text
     )];
-    let mut went_stale = Vec::new();
-    for other in &decisions {
-        if other.id == id || !other.depends_on.iter().any(|x| x == id) {
-            continue;
+    // W7 — TRANSITIVE, not one level deep.
+    //
+    // This walked `depends_on` once, so a decision assuming a decision that assumed the overridden
+    // one was never marked. Silent, and the worst kind: the gate said nothing was stale while a
+    // ruling downstream rested on a premise that had moved. Approving on that is approving
+    // something nobody has read, which is the exact failure the gate exists to prevent.
+    //
+    // Fixed point rather than recursion: the graph is six nodes and a cycle in it is a planner
+    // error, not something to crash on.
+    let mut went_stale: Vec<String> = Vec::new();
+    let mut frontier = vec![id.to_string()];
+    while let Some(cause) = frontier.pop() {
+        for other in &decisions {
+            if other.id == id || !other.depends_on.iter().any(|x| *x == cause) {
+                continue;
+            }
+            if went_stale.contains(&other.id) || already_stale.iter().any(|x| x == &other.id) {
+                continue;
+            }
+            // W6 — THE RULING'S FINGERPRINT RIDES ALONG. Without it `rerule` was a state change
+            // and not a re-ruling: it cleared the note whether or not anything had been
+            // reconsidered, so the only gate in this design could be satisfied by pressing it.
+            // With the mark, clearing requires the ruling to have actually moved.
+            let mark = decision_block(&body, &other.id)
+                .map(|b| ruling_mark(&b))
+                .unwrap_or_else(|| "------".into());
+            add.push(format!(
+                "- [{}] **stale** — assumes {cause}, which {} *(ruling {mark})*",
+                other.id,
+                if cause == id { "was overridden" } else { "went stale" }
+            ));
+            went_stale.push(other.id.clone());
+            frontier.push(other.id.clone());
         }
-        if already_stale.iter().any(|x| x == &other.id) {
-            continue;
-        }
-        add.push(format!(
-            "- [{}] **stale** — assumes {id}, which was overridden",
-            other.id
-        ));
-        went_stale.push(other.id.clone());
     }
     // Re-overriding the same decision replaces the earlier line rather than stacking a second.
     let body = if already_over.iter().any(|(i, _)| i == id) {
@@ -673,6 +936,25 @@ fn strip_made_lines(body: &str, pred: impl Fn(&str) -> bool) -> String {
 pub fn clear_stale(brief_dir: &Path, id: &str) -> std::io::Result<()> {
     let path = brief_dir.join("brief.md");
     let body = std::fs::read_to_string(&path)?;
+    // The mark recorded when it went stale, if there is one.
+    let recorded = body.lines().find_map(|l| {
+        let t = l.trim().trim_start_matches(['-', ' ']);
+        (t.starts_with(&format!("[{id}]")) && t.contains("stale"))
+            .then(|| t.split("*(ruling ").nth(1)?.split(')').next().map(str::to_string))
+            .flatten()
+    });
+    if let Some(mark) = recorded {
+        let now = decision_block(&body, id).map(|b| ruling_mark(&b)).unwrap_or_default();
+        if now == mark {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{id} has not been re-ruled — its options are byte-for-byte what they were \
+                     when it went stale. Edit the ruling in brief.md, then clear it."
+                ),
+            ));
+        }
+    }
     let out = strip_made_lines(&body, |t| {
         t.starts_with(&format!("[{id}]")) && t.contains("stale")
     });
@@ -738,6 +1020,30 @@ fn claims(brief_dir: &Path) -> Vec<(usize, Option<bool>)> {
     out
 }
 
+/// The entry with any `1,2:` key removed — what actually gets run.
+pub fn strip_verify_key(cmd: &str) -> &str {
+    if verify_key(cmd).is_empty() {
+        cmd
+    } else {
+        cmd.split_once(':').map(|(_, rest)| rest.trim()).unwrap_or(cmd)
+    }
+}
+
+/// The criteria a `verify:` entry claims to check — `"1,2: cargo test"` → `[1, 2]`.
+///
+/// Empty when the entry names none, which is the legacy shape and still valid: an unkeyed command
+/// is a check on the brief rather than on any one criterion.
+fn verify_key(cmd: &str) -> Vec<usize> {
+    let Some((head, _)) = cmd.split_once(':') else { return Vec::new() };
+    // Only a bare list of numbers is a key. `git rev-parse --verify HEAD` has no colon; a command
+    // that does — a URL, a path — must not be mistaken for one.
+    let parts: Vec<&str> = head.split(',').map(str::trim).collect();
+    if parts.is_empty() || parts.iter().any(|p| p.is_empty() || !p.chars().all(|c| c.is_ascii_digit())) {
+        return Vec::new();
+    }
+    parts.iter().filter_map(|p| p.parse().ok()).collect()
+}
+
 /// The audit, tiers 0 and 1.
 ///
 /// Tier 0 is the brief's own `verify:` argv and is already built. Tier 1 is this: every numbered
@@ -762,22 +1068,56 @@ pub fn audit(b: &Brief, brief_dir: &Path, timeout: std::time::Duration) -> Audit
     let tier0 = verify(b, timeout);
     let body = std::fs::read_to_string(brief_dir.join("brief.md")).unwrap_or_default();
     let claimed: Vec<(usize, Option<bool>)> = claims(brief_dir);
-    // Tier 0 is a property of the brief, not of any one criterion — the `verify:` list is flat.
-    // So a failing command makes every claim of success suspect rather than one of them.
+    // W4 — TIER 0 IS KEYED TO CRITERIA, when the brief says which.
+    //
+    // It was flat: `verify:` is a list against the whole brief, so ONE failing command disputed
+    // EVERY claim. Measured in the tracer run — a single failing grep marked three criteria unmet,
+    // one of which the worker had honestly reported as unverifiable. An audit louder than its
+    // evidence is one people learn to discount, which costs more than the tier is worth.
+    //
+    // A `verify:` entry may name the criteria it checks: `- "1,2: cargo test -p mars"`. Then a
+    // failure lands only on 1 and 2, and a criterion nothing names is `unverifiable` — a defect in
+    // the BRIEF, said plainly, rather than a failure of the work.
+    //
+    // If NO entry is keyed the brief predates this, so the flat reading stands. A migration that
+    // silently turned every existing brief's criteria unverifiable would be a worse lie than the
+    // one being fixed.
+    let keyed: Vec<(Vec<usize>, bool)> = tier0
+        .iter()
+        .map(|r| (verify_key(&r.cmd), r.ok()))
+        .collect();
+    let any_keyed = keyed.iter().any(|(k, _)| !k.is_empty());
     let commands_pass = !tier0.is_empty() && tier0.iter().all(|r| r.ok());
     let tier1 = acceptance(&body)
         .into_iter()
         .map(|(n, text)| {
             let claim = claimed.iter().find(|(cn, _)| *cn == n).map(|(_, v)| *v);
-            let (verdict, disputed) = match claim {
-                // Nothing said about it at all. Not a failure of the work — nobody looked.
-                None => ("unverifiable", false),
-                Some(None) => ("unverifiable", false),
-                Some(Some(true)) if tier0.is_empty() => ("unverifiable", false),
-                Some(Some(true)) if commands_pass => ("met", false),
-                // Claimed met while the commands say otherwise. THE case tier 1 exists for.
-                Some(Some(true)) => ("unmet", true),
-                Some(Some(false)) => ("unmet", false),
+            // What tier 0 observed ABOUT THIS CRITERION: Some(true/false), or None when nothing
+            // checks it.
+            let observed: Option<bool> = if any_keyed {
+                let mine: Vec<bool> =
+                    keyed.iter().filter(|(k, _)| k.contains(&n)).map(|(_, ok)| *ok).collect();
+                (!mine.is_empty()).then(|| mine.iter().all(|o| *o))
+            } else if tier0.is_empty() {
+                None
+            } else {
+                Some(commands_pass)
+            };
+            let (verdict, disputed) = match (claim, observed) {
+                // Nothing said about it at all, by anyone. Not a failure of the work — nobody looked.
+                (None, _) | (Some(None), None) => ("unverifiable", false),
+                // The worker declined to answer and nothing checks it either.
+                (Some(None), Some(_)) => ("unverifiable", false),
+                // Claimed met, nothing checks it. `unverifiable` is a first-class outcome, and a
+                // criterion no command covers is a hole in the brief rather than a pass.
+                (Some(Some(true)), None) => ("unverifiable", false),
+                (Some(Some(true)), Some(true)) => ("met", false),
+                // Claimed met while the commands that cover it say otherwise. THE case tier 1
+                // exists for, and now it names only the criteria actually implicated.
+                (Some(Some(true)), Some(false)) => ("unmet", true),
+                // Claimed unmet and the commands agree, or nothing checks it — either way, unmet.
+                (Some(Some(false)), Some(true)) => ("unmet", true),
+                (Some(Some(false)), _) => ("unmet", false),
             };
             Criterion { n, text, verdict, disputed }
         })
@@ -828,6 +1168,24 @@ pub fn supersede(brief_dir: &Path, ts: u64) -> std::io::Result<(String, PathBuf)
     // The acceptance section becomes the unmet subset, renumbered from 1 so the next report's
     // tally lines up with it.
     out = replace_section(&out, "## Acceptance", &carried.join("\n"));
+    // W5 — INHERIT THE RULINGS, NOT JUST THE PROSE.
+    //
+    // "Decisions inherited whole" carried the `## Decisions already made` lines and left `## HLD`
+    // and `## LLD` as template stubs, so brief #2 parsed as zero decisions: nothing to approve,
+    // nothing to refine, and no planner run to fix it because nothing triggers one. A continuation
+    // that drops the design it is continuing is a new brief wearing an inheritance.
+    //
+    // The rulings come across verbatim. They were argued once and one of them may carry an
+    // override; re-deriving them would re-open settled ground, which is the cost this whole
+    // section exists to avoid.
+    for section in ["## HLD", "## LLD"] {
+        if let Some((s0, e0)) = section_span(&lines, section) {
+            let carried_rulings = lines[s0 + 1..e0].join("\n").trim().to_string();
+            if !carried_rulings.is_empty() {
+                out = replace_section(&out, section, &carried_rulings);
+            }
+        }
+    }
     out = replace_section(
         &out,
         MADE,
@@ -1170,7 +1528,11 @@ pub fn verify(b: &Brief, timeout: std::time::Duration) -> Vec<VerifyRow> {
         }).collect();
     };
     b.verify.iter().map(|cmd| {
-        let argv = match verify_argv(cmd) {
+        // The key is addressing, not part of the command. Stripped here so `verify_argv` sees
+        // exactly what it saw before this field existed — one place strips it, and it is the same
+        // place that runs it.
+        let bare = strip_verify_key(cmd);
+        let argv = match verify_argv(bare) {
             Ok(a) => a,
             Err(why) => return VerifyRow { cmd: cmd.clone(), exit: None, note: format!("refused: {why}") },
         };
@@ -1247,6 +1609,23 @@ fn run_argv(
 /// fix's clothes.
 ///
 /// The line breaks were only ever for us; `mars brief show` still wraps it for a human.
+/// The watermark on anything MARS types into a pane on your behalf.
+///
+/// An agent's scrollback is its memory, and until now a manager-issued instruction and something
+/// you typed yourself were byte-identical once they landed. Neither the agent nor a person reading
+/// back could tell "you were told this" from "you decided this" — which matters most in exactly
+/// the case it was hardest to see: an assignment that went to the wrong pane, or a draft prompt
+/// somebody thought a human had written.
+///
+/// A slash-leading token because that is already the vocabulary of "not prose, an instruction",
+/// and because it survives being quoted into a transcript intact.
+pub const MANAGER_MARK: &str = "[/MANAGER]";
+
+/// `typed_bytes`, watermarked. Every manager-originated line goes through here.
+pub fn manager_bytes(text: &str) -> String {
+    typed_bytes(&format!("{MANAGER_MARK} {}", text.trim_start()))
+}
+
 pub fn typed_bytes(text: &str) -> String {
     format!("\x1b[200~{}\x1b[201~\r", text.trim_end())
 }

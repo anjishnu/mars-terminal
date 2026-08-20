@@ -2407,14 +2407,48 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let rows = brief_rows();
             let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": rows}).to_string());
         }
+        // THE DOCUMENT ITSELF. "Read it" expanded to show the brief's ID, which is the one fact
+        // about a brief nobody needs — the design, the acceptance criteria and the out-of-scope
+        // list all stayed in a file on a machine you are not sitting at. Approving something you
+        // cannot read is the failure this whole surface exists to prevent.
+        Some("brief.read") => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let out = match crate::briefs::dir().filter(|_| crate::briefs::safe_id(id)) {
+                Some(d) => {
+                    let read = |f: &str| std::fs::read_to_string(d.join(id).join(f)).ok();
+                    match read("brief.md") {
+                        Some(md) => serde_json::json!({
+                            "t": "brief.doc", "id": id, "md": md,
+                            // Sent alongside rather than fetched separately: they are read
+                            // together or not at all, and a second round trip is a second way for
+                            // half the story to arrive.
+                            "report": read("completed.md"),
+                            "review": read("review.md"),
+                        }),
+                        None => serde_json::json!({"t": "brief.doc", "id": id, "error": "no brief.md"}),
+                    }
+                }
+                None => serde_json::json!({"t": "brief.doc", "id": id, "error": "bad brief id"}),
+            };
+            let _ = tx.send(out.to_string());
+        }
         Some("brief.draft") => {
             if let (Some(pane), Some(title)) = (
                 v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()),
                 v.get("title").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()),
             ) {
                 crate::manager::record_client_event("act", &v, crate::worklog::now_secs());
+                // WHAT THE ARGUMENT SETTLED, carried with the title. Optional: a draft pressed
+                // from a board rather than out of a conversation still sends none, and the planner
+                // derives everything as it always did.
+                let decisions: Vec<session::PriorDecision> = v
+                    .get("decisions")
+                    .and_then(|d| serde_json::from_value(d.clone()).ok())
+                    .unwrap_or_default();
                 let _ = session::write_frame(writer, &ClientFrame::DraftBrief {
-                    pane, title: title.chars().take(160).collect(),
+                    pane,
+                    title: title.chars().take(160).collect(),
+                    decisions,
                 });
             }
         }

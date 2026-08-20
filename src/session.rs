@@ -37,6 +37,25 @@ pub const RUNTIME_DIR_ENV: &str = "MARS_RUNTIME_DIR";
 
 // ── Protocol ─────────────────────────────────────────────────────────────────
 
+/// A decision settled in conversation, carried into the brief the planner is about to write.
+///
+/// **This is the field the loop was missing.** `brief.draft` sent a title, so the argument you had
+/// just finished evaporated and the planner started from nothing — the disagreement you settled at
+/// 11pm came back in three weeks, to a worker with no idea it had ever been settled.
+///
+/// It lands in `## Decisions already made`, which the brief format already declares BINDING on the
+/// worker, and which `parse_made` already reads. No new file, no new state, and the planner
+/// receives these as settled rather than re-deriving them.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PriorDecision {
+    pub question: String,
+    pub chose: String,
+    #[serde(default)]
+    pub rejected: Option<String>,
+    #[serde(default)]
+    pub why: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum ClientFrame {
     Hello {
@@ -94,7 +113,13 @@ pub enum ClientFrame {
     /// Mint an empty brief and set the planner in a pane drafting it. Same argument as
     /// `AssignBrief` for why the daemon does this rather than the bridge: the scope check needs a
     /// pid. The title travels because it is the one thing only the person pressing knows.
-    DraftBrief { pane: usize, title: String },
+    DraftBrief {
+        pane: usize,
+        title: String,
+        /// Defaulted, so a client or daemon that predates this field still speaks the frame.
+        #[serde(default)]
+        decisions: Vec<PriorDecision>,
+    },
     /// Pane-targeted raw input from a Rover subscriber (answering a `[y/N]`) — written
     /// straight to that pane's terminal, WITHOUT taking over the session.
     PaneInput { pane: usize, data: String },
@@ -823,7 +848,11 @@ enum SrvEvent {
     AssignBrief { pane: usize, brief: String },
     /// Mint a brief and set a planner drafting it — refused unless that agent carries the planner
     /// scope.
-    DraftBrief { pane: usize, title: String },
+    DraftBrief {
+        pane: usize,
+        title: String,
+        decisions: Vec<PriorDecision>,
+    },
     /// A second render target joined. Carries its own stream and size: one `Terminal` has one
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
     Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64 },
@@ -1511,10 +1540,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     Err(why) => app.write_to_pane(pane, &format!("\r# mars: {why}\r")),
                 }
             }
-            Ok(SrvEvent::DraftBrief { pane, title }) => {
+            Ok(SrvEvent::DraftBrief { pane, title, decisions }) => {
                 // Same gate, other role. The refusal is written into the pane rather than dropped
                 // for the same reason: a press whose failure is invisible reads as a broken app.
-                match app.draft_brief_on_pane(pane, &title) {
+                match app.draft_brief_on_pane(pane, &title, &decisions) {
                     Ok(_id) => {}
                     Err(why) => app.write_to_pane(pane, &format!("\r# mars: {why}\r")),
                 }
@@ -1946,8 +1975,12 @@ fn client_connection(
             let _ = send_exit(&stream, &format!("{brief} sent to pane {pane}"));
             return;
         }
-        Ok(ClientFrame::DraftBrief { pane, title }) => {
-            let _ = tx.send(SrvEvent::DraftBrief { pane: *pane, title: title.clone() });
+        Ok(ClientFrame::DraftBrief { pane, title, decisions }) => {
+            let _ = tx.send(SrvEvent::DraftBrief {
+                pane: *pane,
+                title: title.clone(),
+                decisions: decisions.clone(),
+            });
             let _ = send_exit(&stream, &format!("drafting {title:?} in pane {pane}"));
             return;
         }
@@ -2015,8 +2048,8 @@ fn client_connection(
                             break;
                         }
                     }
-                    Ok(ClientFrame::DraftBrief { pane, title }) => {
-                        if tx.send(SrvEvent::DraftBrief { pane, title }).is_err() {
+                    Ok(ClientFrame::DraftBrief { pane, title, decisions }) => {
+                        if tx.send(SrvEvent::DraftBrief { pane, title, decisions }).is_err() {
                             break;
                         }
                     }
