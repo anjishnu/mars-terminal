@@ -402,6 +402,76 @@ pub fn validate_session_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `n` bytes of real entropy, hex-encoded.
+///
+/// Shared by the pairing token and the machine id because both must be unguessable and neither may
+/// be derived: the one thing that made the old `$HOSTNAME` identity collide across machines was
+/// that it was computed rather than minted.
+pub fn mint_hex(n: usize) -> Result<String> {
+    use std::io::Read as _;
+    let mut buf = vec![0u8; n];
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|e| anyhow!("cannot open /dev/urandom: {e}"))?;
+    f.read_exact(&mut buf)
+        .map_err(|e| anyhow!("short read from /dev/urandom: {e}"))?;
+    // A working urandom cannot plausibly return this, but the whole point of this function is that
+    // a silent all-zero token once shipped. Cheap to assert, catastrophic to miss.
+    if buf.iter().all(|&b| b == 0) {
+        return Err(anyhow!("/dev/urandom returned all zeros — refusing to mint a secret"));
+    }
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// This machine, durably. Minted once into `~/.mars/machine-id` and never derived again.
+///
+/// IT WAS `$HOSTNAME`, AND `$HOSTNAME` IS UNSET ON macOS. Measured here: `hostname -s` says
+/// `Anjishnus-MacBook-Air` while `$HOSTNAME` is empty, so every Mac fell to the `"lan"` fallback
+/// and every session on every Mac minted the byte-identical `lan-<session>`. Two machines each
+/// running a session called `mars-dev` were indistinguishable.
+///
+/// That is not cosmetic, because the client keys on it. `registry.ts` groups paired rows by host —
+/// recovered by stripping the `-<session>` suffix — so that one machine's sessions can share one
+/// token and one endpoint. With every Mac answering `lan`, that grouping spans MACHINES, and
+/// `shareHostToken` then copies the freshest row's token *and endpoint* across the group. One
+/// machine's sessions get repointed at another machine's bridge, silently, and it looks like
+/// success.
+///
+/// Not the hostname, not an env var, not the socket path: all three change or vanish, which is
+/// exactly how this broke. A minted value is the only kind that cannot.
+pub fn machine_id_for_test() -> String { machine_id() }
+pub fn daemon_fingerprint_for_test(s: &str) -> String { daemon_fingerprint(s) }
+
+pub fn machine_id() -> String {
+    let Some(dir) = crate::sys::paths::home_dir().map(|h| h.join(".mars")) else {
+        return "mars".into();
+    };
+    let path = dir.join("machine-id");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let t = existing.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    // Real entropy, from the same source the pairing token uses. A pid-and-clock id would be
+    // unique enough on one machine and is exactly the kind of thing that collides across two.
+    let minted = mint_hex(8)
+        .map(|t| format!("m{}", &t[..8.min(t.len())]))
+        .unwrap_or_else(|_| "mars".into());
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&path, &minted);
+    minted
+}
+
+/// A stable-ish daemon identity fingerprint for the prototype (LAN-scoped, TOFU).
+/// The real bridge signs with a persistent daemon keypair; credentials pin to THIS.
+///
+/// Shape preserved deliberately: the client recovers the machine half by stripping the
+/// `-<session>` suffix, so changing what the host half IS must not change how it is read.
+pub fn daemon_fingerprint(session: &str) -> String {
+    format!("{}-{session}", machine_id())
+}
+
+
 pub fn socket_path(name: &str) -> Result<PathBuf> {
     validate_session_name(name)?;
     Ok(socket_dir()?.join(format!("{name}.sock")))
@@ -2862,6 +2932,115 @@ pub fn session_main(name: &str, file: Option<String>) -> Result<()> {
 }
 
 /// `mars attach [name]` / `--resume`: reattach (most recent if unnamed).
+
+// ── One link, three doors ────────────────────────────────────────────────────
+
+/// What a pairing link carries. The PAGE half is discarded on purpose: a browser needs somewhere
+/// to load, and a terminal needs none of it.
+pub struct PairLink {
+    pub endpoint: String,
+    pub id: String,
+    pub token: String,
+    pub session: String,
+}
+
+/// Read the fragment and ignore the page.
+///
+/// "One URL for all three doors" never required teaching the terminal to be a browser. Both browser
+/// doors — pasting, scanning — need somewhere to load; the terminal needs `h`, `id`, `t` and `s`
+/// and nothing else at all. So this is a parser, not a port.
+pub fn parse_pair_link(raw: &str) -> Option<PairLink> {
+    let raw = raw.trim();
+    let frag = raw.split_once('#').map(|(_, f)| f)?;
+    let mut endpoint = None;
+    let mut id = None;
+    let mut token = None;
+    let mut session = None;
+    for pair in frag.split('&') {
+        let Some((k, v)) = pair.split_once('=') else { continue };
+        match k {
+            "h" => endpoint = Some(v.to_string()),
+            "id" => id = Some(v.to_string()),
+            "t" => token = Some(v.to_string()),
+            "s" => session = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    Some(PairLink {
+        endpoint: endpoint?,
+        id: id?,
+        token: token?,
+        session: session.unwrap_or_else(|| "session".into()),
+    })
+}
+
+/// Does this link name a session running on THIS machine, right now?
+///
+/// BOTH CONDITIONS, NEVER EITHER. The id must name this machine *and* a live socket must confirm
+/// the session is actually here. Two machines can each hold a session called `mars-dev`, so
+/// matching on the name alone would attach you to your own copy of somebody else's link — a silent
+/// wrong target, which is worse than a refusal because it looks like success. And matching on the
+/// id alone would attach to a session that has since ended.
+fn link_is_local(link: &PairLink) -> bool {
+    if link.id != daemon_fingerprint(&link.session) {
+        return false;
+    }
+    let Ok(path) = socket_path(&link.session) else { return false };
+    // `Live` only. `Indeterminate` is a socket file whose owner could not be confirmed, and
+    // treating "probably" as "yes" here is the silent-wrong-target case this whole check exists to
+    // prevent — a refusal a person can act on beats an attach to something unverified.
+    crate::sys::control::probe(&path) == crate::sys::control::Probe::Live
+}
+
+/// `mars attach '<url>'` — and the reason the quotes are in the printed link.
+///
+/// THE SHELL EATS THE LINK. `&` backgrounds and `#` starts a comment, so an unquoted paste is not
+/// merely wrong: it is silently truncated at the first ampersand and the fragment never arrives.
+/// Worse, session names reject `/` and `:`, so what came back was "bad session name" — an error
+/// about entirely the wrong thing. Naming that is most of the value here.
+pub fn attach_link(raw: &str) -> Result<()> {
+    let raw = raw.trim();
+    let Some(link) = parse_pair_link(raw) else {
+        // URL-SHAPED BUT NO FRAGMENT is the signature of a shell that ate it, and it deserves the
+        // remedy rather than a diagnosis.
+        if raw.starts_with("http://") || raw.starts_with("https://") || raw.contains("://") {
+            return Err(anyhow!(
+                "that link lost its `#…` — your shell ate it.\n  \
+                 `&` backgrounds and `#` starts a comment, so the credentials never arrived.\n  \
+                 Wrap it in single quotes:  mars attach '<link>'\n  \
+                 or keep it out of your history entirely:  pbpaste | mars attach -"
+            ));
+        }
+        return Err(anyhow!("that does not look like a Rover link — it contains `#h=` and a token"));
+    };
+
+    if link_is_local(&link) {
+        // No bridge, no tunnel, no token. The socket is right there.
+        return client_main(&link.session);
+    }
+
+    // TWO DIFFERENT PROBLEMS, TWO DIFFERENT ANSWERS. "Wrong machine" and "right machine, session
+    // not running" have nothing in common except that neither attached, and an error that offers
+    // the tunnel remedy to somebody whose session simply is not started is noise at the moment
+    // they most need signal.
+    if link.id == daemon_fingerprint(&link.session) {
+        return Err(anyhow!(
+            "that link is for this machine, but `{}` is not running.\n  \
+             `mars ls` shows what is; `mars new {}` starts it.",
+            link.session,
+            link.session
+        ));
+    }
+    Err(anyhow!(
+        "that link is for another machine — this one is `{}`, the link names `{}`.\n  \
+         Attaching across machines from the terminal is not built yet. Open it in a browser:\n  \
+         {}",
+        machine_id(),
+        link.id,
+        raw
+    ))
+}
+
 pub fn resume_main(name: Option<String>) -> Result<()> {
     if let Some(n) = name {
         return client_main(&n);

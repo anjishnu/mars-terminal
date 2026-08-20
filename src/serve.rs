@@ -73,17 +73,7 @@ fn lan_ip() -> String {
 /// asymmetry with everything else in this file: elsewhere a missing piece degrades to a smaller
 /// feature, because the worst case is a duller product. Here the worst case is an open door.
 fn mint_token() -> Result<String> {
-    let mut buf = [0u8; 16];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .map_err(|e| anyhow!("cannot open /dev/urandom to mint a pairing token: {e}"))?;
-    f.read_exact(&mut buf)
-        .map_err(|e| anyhow!("short read from /dev/urandom while minting a pairing token: {e}"))?;
-    // A working urandom cannot plausibly return this, but the whole point of this function is
-    // that a silent all-zero token once shipped. Cheap to assert, catastrophic to miss.
-    if buf.iter().all(|&b| b == 0) {
-        return Err(anyhow!("/dev/urandom returned all zeros — refusing to mint a pairing token"));
-    }
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+    crate::session::mint_hex(16)
 }
 
 /// The current pairing token, persisted at `~/.mars/serve.token` so it survives a bridge restart
@@ -126,53 +116,14 @@ fn ensure_token() -> Result<String> {
     Ok(t)
 }
 
-/// This machine, durably. Minted once into `~/.mars/machine-id` and never derived again.
+/// The pairing fingerprint, re-exported from `session` where it now lives.
 ///
-/// IT WAS `$HOSTNAME`, AND `$HOSTNAME` IS UNSET ON macOS. Measured here: `hostname -s` says
-/// `Anjishnus-MacBook-Air` while `$HOSTNAME` is empty, so every Mac fell to the `"lan"` fallback
-/// and every session on every Mac minted the byte-identical `lan-<session>`. Two machines each
-/// running a session called `mars-dev` were indistinguishable.
-///
-/// That is not cosmetic, because the client keys on it. `registry.ts` groups paired rows by host —
-/// recovered by stripping the `-<session>` suffix — so that one machine's sessions can share one
-/// token and one endpoint. With every Mac answering `lan`, that grouping spans MACHINES, and
-/// `shareHostToken` then copies the freshest row's token *and endpoint* across the group. One
-/// machine's sessions get repointed at another machine's bridge, silently, and it looks like
-/// success.
-///
-/// Not the hostname, not an env var, not the socket path: all three change or vanish, which is
-/// exactly how this broke. A minted value is the only kind that cannot.
-pub fn machine_id_for_test() -> String { machine_id() }
-pub fn daemon_fingerprint_for_test(s: &str) -> String { daemon_fingerprint(s) }
-
-fn machine_id() -> String {
-    let Some(dir) = crate::sys::paths::home_dir().map(|h| h.join(".mars")) else {
-        return "mars".into();
-    };
-    let path = dir.join("machine-id");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let t = existing.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    // Real entropy, from the same source the pairing token uses. A pid-and-clock id would be
-    // unique enough on one machine and is exactly the kind of thing that collides across two.
-    let minted = mint_token()
-        .map(|t| format!("m{}", &t[..8.min(t.len())]))
-        .unwrap_or_else(|_| "mars".into());
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(&path, &minted);
-    minted
-}
-
-/// A stable-ish daemon identity fingerprint for the prototype (LAN-scoped, TOFU).
-/// The real bridge signs with a persistent daemon keypair; credentials pin to THIS.
-///
-/// Shape preserved deliberately: the client recovers the machine half by stripping the
-/// `-<session>` suffix, so changing what the host half IS must not change how it is read.
+/// It moved because it is not a bridge concept: it identifies THIS MACHINE, and `mars attach` has
+/// to answer "is this link about the machine I am sitting at" with no bridge compiled in at all.
+/// A `web`-gated identity would have made the local attach shortcut impossible in exactly the
+/// build most likely to want it.
 fn daemon_fingerprint(session: &str) -> String {
-    format!("{}-{session}", machine_id())
+    crate::session::daemon_fingerprint(session)
 }
 
 // ── mars qr ──────────────────────────────────────────────────────────────────
@@ -278,7 +229,11 @@ pub fn desk_main(session_arg: Option<String>, web: Option<String>) -> Result<()>
             println!();
             println!("  From anywhere else — phone, another laptop — over the tunnel:");
             println!();
-            println!("  {}", pair_link(&session, &base, "desk")?);
+            // QUOTED, because the shell eats it otherwise. `&` backgrounds and `#` starts a
+            // comment, so an unquoted paste is silently truncated at the first ampersand and the
+            // credentials never arrive. Remembering to quote is not the reader's problem to solve
+            // at the moment they are copying something they cannot read.
+            println!("  mars attach '{}'", pair_link(&session, &base, "desk")?);
         }
         None => {
             println!();

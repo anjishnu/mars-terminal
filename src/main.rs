@@ -427,7 +427,25 @@ fn main() -> Result<()> {
         }
         // Reattach: named, or the most recently active session.
         Some("attach") | Some("a") | Some("resume") | Some("--resume") => {
-            return session::resume_main(args.next());
+            let arg = args.next();
+            // STDIN IS THE ROUTE THAT KEEPS THE TOKEN OUT OF HISTORY, so it is the one worth
+            // offering first. The pairing token is a credential for code execution as you — the
+            // docs say to treat it like an SSH private key — and pasted as an argument it sits in
+            // `~/.zsh_history` in plaintext, forever. The QR and browser doors never touch a
+            // history file; this is a regression the terminal door introduces on its own.
+            if arg.as_deref() == Some("-") {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                return session::attach_link(&buf);
+            }
+            // A link, not a name. Session names cannot contain `:` or `/`, so anything carrying
+            // them was never a name and must not be reported as a bad one.
+            if let Some(a) = arg.as_deref() {
+                if a.contains("://") || a.contains("#h=") {
+                    return session::attach_link(a);
+                }
+            }
+            return session::resume_main(arg);
         }
         Some("ls") | Some("list") | Some("--list") => {
             // Also here, sharing the one marker: a person who reaches `mars ls` before `mars new`
@@ -8526,17 +8544,37 @@ fn selfcheck() -> Result<()> {
             // produced the byte-identical `lan-mars-dev`. The client keys its per-host token and
             // ENDPOINT sharing on that value, so the collision repointed one machine's sessions at
             // another machine's bridge — silently, and looking like success.
-            let a = serve::machine_id_for_test();
+            let a = session::machine_id();
             assert!(!a.is_empty(), "a machine id is always minted");
             assert_ne!(a, "lan", "the colliding fallback must be gone");
-            assert_eq!(a, serve::machine_id_for_test(), "and it is durable: minted once, read after");
+            assert_eq!(a, session::machine_id(), "and it is durable: minted once, read after");
 
             // The SHAPE is a contract, not a detail: the client recovers the machine half by
             // stripping `-<session>`, so a fingerprint that did not end in the session name would
             // file every row under a host that does not exist.
-            let fp = serve::daemon_fingerprint_for_test("mars-dev");
+            let fp = session::daemon_fingerprint("mars-dev");
             assert!(fp.ends_with("-mars-dev"), "the session suffix is how the client reads the host: {fp}");
             assert_eq!(&fp[..fp.len() - "-mars-dev".len()], a, "and what remains must BE the machine id");
+
+            // ── ONE LINK, THREE DOORS ────────────────────────────────────────────────────────
+            //
+            // The terminal reads the FRAGMENT and ignores the page. Both browser doors need
+            // somewhere to load; a terminal needs `h`, `id`, `t` and `s` and nothing else — so
+            // this is a parser, not a port, and every page half must parse identically.
+            for page in ["https://mars-terminal.lovable.app/rover", "http://192.168.1.5:8787/rover", ""] {
+                let raw = format!("{page}#h=wss://host/ws&id={a}-mars-dev&t=deadbeef&s=mars-dev&v=rover-1");
+                let l = session::parse_pair_link(&raw).expect("the fragment is what matters");
+                assert_eq!(l.session, "mars-dev");
+                assert_eq!(l.token, "deadbeef");
+                assert_eq!(l.endpoint, "wss://host/ws");
+            }
+            // A link with no fragment is the shell-ate-it case, and must not parse into a
+            // half-built one: silently dropping to defaults is how a wrong target looks like
+            // success.
+            assert!(session::parse_pair_link("https://mars-terminal.lovable.app/rover").is_none());
+            assert!(session::parse_pair_link("#h=wss://h/ws&id=x").is_none(), "no token, no link");
+            // Whitespace survives a terminal wrapping the line across two.
+            assert!(session::parse_pair_link("  https://x/r#h=wss://h/ws&id=i&t=t&s=s  ").is_some());
             assert!(!serve::ct_eq(b"", b"x"));
         }
         #[cfg(feature = "web")]
