@@ -9326,6 +9326,7 @@ fn selfcheck() -> Result<()> {
         // A brief with no runnable repo REPORTS that, rather than passing quietly. A missing exit
         // code and a zero one are opposite facts.
         let ghost = briefs::Brief {
+            idea: None,
             id: "brief-9-verify".into(), title: "t".into(), state: briefs::State::Draft,
             priority: 0, branch: None, addresses: vec![], created_ts: 1,
             forks: vec![], report: None,

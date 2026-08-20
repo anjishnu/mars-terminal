@@ -150,6 +150,9 @@ pub struct Brief {
     /// The commands that decide whether this was built. Run by MARS, never by the worker — see
     /// `verify`.
     pub verify: Vec<String>,
+    /// One paragraph: what this brief is for. See `idea` — the card leads with this rather than
+    /// with the rulings, because a board is scanned and the rulings are the argument.
+    pub idea: Option<String>,
     /// One line per fork, already ruled: the question and the option chosen.
     ///
     /// **This is what approval actually reads.** The forks ARE the design, so three lines is the
@@ -213,6 +216,7 @@ pub fn read(brief_dir: &Path) -> Option<Brief> {
         addresses: parse_addresses(front),
         repo: f("repo").filter(|r| !r.is_empty() && r != "null").map(PathBuf::from),
         verify: parse_list(front, "verify:"),
+        idea: idea(body),
         forks: parse_forks(body),
         report: read_report(brief_dir),
         created_ts: f("created_ts").and_then(|t| t.parse().ok()).unwrap_or(0),
@@ -639,6 +643,56 @@ fn append_to_made(body: &str, add: &[String]) -> String {
             out
         }
     }
+}
+
+/// WHAT THIS BRIEF IS FOR, in one paragraph.
+///
+/// The card used to lead with the six ruled decisions, which is the argument and not the proposal.
+/// A board is SCANNED — six decision rows times N briefs is a wall — and the one thing a reader
+/// needs in order to triage, "what is this even for", appeared nowhere on it: the problem
+/// statement lived in the document and never reached the surface.
+///
+/// Deterministic, and no model call. The planner writes `## The idea` because it is already
+/// writing six rulings and one paragraph is cheap; when a brief predates the section, the problem
+/// statement's own prose stands in. A summariser here would add latency, cost and a chance of
+/// being wrong to produce a sentence the document already contains.
+pub fn idea(body: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().collect();
+    // The dedicated section first, then the problem statement. Both are prose the planner already
+    // wrote; neither is generated.
+    for heading in ["## The idea", "## Problem + evidence"] {
+        let Some((start, end)) = section_span(&lines, heading) else { continue };
+        let mut para = String::new();
+        for line in &lines[start + 1..end] {
+            let t = line.trim();
+            // A list is evidence — addresses and line anchors — not the idea. The first prose
+            // paragraph is; it ends at the first blank line after it starts.
+            if t.starts_with('-') || t.starts_with('*') || t.starts_with('#') {
+                break;
+            }
+            if t.is_empty() {
+                if !para.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            if !para.is_empty() {
+                para.push(' ');
+            }
+            para.push_str(t);
+        }
+        // The section leads with its own binding-ness, which is a fact about the section rather
+        // than a sentence about the work.
+        let para = para
+            .trim_start_matches("BINDING.")
+            .trim_start_matches("ADVISORY.")
+            .trim()
+            .to_string();
+        if para.chars().count() > 24 {
+            return Some(para);
+        }
+    }
+    None
 }
 
 /// The second reader, deterministic half.
@@ -1786,6 +1840,12 @@ pub fn template(id: &str, title: &str, ts: u64, repo: Option<&Path>) -> String {
          verify: []\n\
          ---\n\
          # {title}\n\
+         \n\
+         ## The idea\n\
+         \n\
+         BINDING. ONE paragraph: the problem, and the shape of the answer. This is the only part\n\
+         of the brief that reaches the board, so it is what a reader triages on — write it for\n\
+         somebody deciding whether to open this at all, not for somebody who already has.\n\
          \n\
          ## Problem + evidence\n\
          \n\

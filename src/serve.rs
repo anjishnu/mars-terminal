@@ -1025,6 +1025,10 @@ fn brief_rows() -> Vec<serde_json::Value> {
                 // `decisions` carries the same design with its ALTERNATIVES intact — you cannot
                 // override an option you cannot see. `forks` stays alongside so a client older
                 // than this field degrades to the line it already rendered rather than to nothing.
+                // THE IDEA LEADS. The card shows this and a count of the decisions; the rulings
+                // themselves belong on the surface where they are argued with, not on one that is
+                // scanned.
+                "idea": b.idea,
                 "forks": b.forks, "verify": b.verify,
                 "decisions": decisions.iter().map(|d| serde_json::json!({
                     "id": d.id, "layer": d.layer, "question": d.question,
