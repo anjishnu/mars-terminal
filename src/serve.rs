@@ -2712,6 +2712,11 @@ fn manager_view_json(want: &str, session: &str) -> String {
         "manager.memos" => serde_json::json!({ "memos": v["memos"] }),
         "manager.health" => serde_json::json!({
             "agentEnabled": v["agentEnabled"], "agentRuns": v["agentRuns"],
+            // WHICH CONVERSATION THE MANAGER IS HAVING, forwarded so a client can render it as a
+            // workspace of its own. This projection names every field it passes on, so a field
+            // added to the index and not added here arrives nowhere — which is what happened on
+            // the first attempt, and is the same shape of bug as the duplicated brief-row builder.
+            "agentChat": v["agentChat"], "agentChatAt": v["agentChatAt"],
             // Rover's own readiness. The mark is gated on this so the control appears when it can
             // be used — a button that does nothing for four seconds teaches people it is broken.
             // `ready` is kept alongside `state` so a phone running an older bundle — which knows

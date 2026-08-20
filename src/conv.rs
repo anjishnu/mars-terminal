@@ -35,6 +35,48 @@ pub struct Conv {
     pub chat: String,
 }
 
+/// The newest conversation Claude Code has recorded for work done in `dir`.
+///
+/// **The manager agent is already a Claude session.** `run.sh` cds into `~/.mars/manager` and runs
+/// `claude` there, so its turns land in `~/.claude/projects/<encoded dir>/<session>.jsonl` in
+/// exactly the format every agent pane's conversation uses. Nothing has to be built to watch it —
+/// only found, which is what this does.
+///
+/// Newest by mtime rather than by name: the file name is a uuid and carries no order, and the
+/// question is "what is it doing now", which is a property of writes.
+/// Returns the id AND when it was last written — because a row that says "live" about a session
+/// that last ran hours ago is a lie of exactly the kind this surface exists to stop telling.
+pub fn newest_for_dir(dir: &Path) -> Option<(String, u64)> {
+    let root = projects_root()?;
+    // Claude Code's encoding: every `/` and `.` becomes `-`. `/Users/x/.mars/manager` →
+    // `-Users-x--mars-manager`, which is why the double dash is not a typo.
+    let encoded: String = dir
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for e in std::fs::read_dir(root.join(encoded)).ok()?.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = p.file_stem().and_then(|x| x.to_str()) else { continue };
+        let Ok(m) = e.metadata().and_then(|m| m.modified()) else { continue };
+        if best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+            best = Some((m, stem.to_string()));
+        }
+    }
+    best.map(|(t, id)| {
+        let secs = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        (id, secs)
+    })
+}
+
 fn projects_root() -> Option<PathBuf> {
     crate::sys::paths::home_dir().map(|h| h.join(".claude").join("projects"))
 }

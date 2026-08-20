@@ -926,6 +926,13 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
         "agentStaleSecs": stale_secs,
         "agentRuns": { "ok": runs_ok, "total": runs_total, "timing": timing },
         "agentEnabled": agent_enabled(repo),
+        // WHICH CONVERSATION THE MANAGER IS HAVING. It is a Claude session like any other — the
+        // only reason it has never been visible is that nobody looked it up. Sent as one string
+        // rather than as a board row: the host states the fact, and a client decides whether its
+        // reader wants to see it. A row pushed at every client would appear on ones that predate
+        // the setting meant to gate it.
+        "agentChat": crate::conv::newest_for_dir(repo).map(|(id, _)| id),
+        "agentChatAt": crate::conv::newest_for_dir(repo).map(|(_, at)| at),
         "memos": cards,
     });
     // Temp + rename: atomic on POSIX, so a reader never sees half an index even when two
