@@ -1617,9 +1617,10 @@ fn run_argv(
 /// the case it was hardest to see: an assignment that went to the wrong pane, or a draft prompt
 /// somebody thought a human had written.
 ///
-/// A slash-leading token because that is already the vocabulary of "not prose, an instruction",
-/// and because it survives being quoted into a transcript intact.
-pub const MANAGER_MARK: &str = "[/MANAGER]";
+/// Short, because it leads every manager-issued line and a long tag turns into furniture the eye
+/// stops reading. Bracketed so it survives being quoted into a transcript intact, and so it cannot
+/// be mistaken for the start of the instruction itself.
+pub const MANAGER_MARK: &str = "[XO]";
 
 /// `typed_bytes`, watermarked. Every manager-originated line goes through here.
 pub fn manager_bytes(text: &str) -> String {
