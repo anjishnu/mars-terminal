@@ -1001,6 +1001,47 @@ fn intercepted_by(host: &str) -> Option<String> {
     Some(target.to_string())
 }
 
+/// One JSON row per brief — the single definition of what the board sends.
+///
+/// It was written out twice, once for `brief.list` and once to re-send the board after an
+/// override. Two copies of a wire shape is two places a field gets added to and one place it gets
+/// forgotten, and the field most likely to be forgotten is the newest — which here is the whole
+/// decision set.
+fn brief_rows() -> Vec<serde_json::Value> {
+    crate::briefs::list()
+        .into_iter()
+        .map(|b| {
+            let decisions = crate::briefs::dir()
+                .map(|d| crate::briefs::decisions_of(&d.join(&b.id)))
+                .unwrap_or_default();
+            serde_json::json!({
+                "id": b.id, "title": b.title, "state": b.state.label(),
+                "priority": b.priority, "branch": b.branch,
+                "addresses": b.addresses, "createdTs": b.created_ts,
+                // The forks are what approval reads, and the verify list is what pressing assign
+                // authorises to run. Both belong on the card rather than one tap in: a command
+                // nobody saw is a command nobody approved.
+                //
+                // `decisions` carries the same design with its ALTERNATIVES intact — you cannot
+                // override an option you cannot see. `forks` stays alongside so a client older
+                // than this field degrades to the line it already rendered rather than to nothing.
+                "forks": b.forks, "verify": b.verify,
+                "decisions": decisions.iter().map(|d| serde_json::json!({
+                    "id": d.id, "layer": d.layer, "question": d.question,
+                    "dependsOn": d.depends_on, "stale": d.stale, "overridden": d.overridden,
+                    "options": d.options.iter().map(|o| serde_json::json!({
+                        "key": o.key, "text": o.text, "chosen": o.chosen, "why": o.why,
+                    })).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+                "repo": b.repo.as_ref().map(|r| r.display().to_string()),
+                "report": b.report.as_ref().map(|r| serde_json::json!({
+                    "outcome": r.outcome, "pr": r.pr, "met": r.met, "total": r.total,
+                })),
+            })
+        })
+        .collect()
+}
+
 fn tunnel_answers(base: &str) -> Result<(), TunnelFault> {
     let ours = |r: &ureq::Response| r.header(BRIDGE_HEADER).is_some();
     match ureq::get(base).timeout(Duration::from_secs(6)).call() {
@@ -2186,22 +2227,7 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // The queue. A directory read, computed on demand — there is no index to go stale, and
         // "what is in flight" is answered by which files exist rather than by a stored status.
         Some("brief.list") => {
-            let rows: Vec<serde_json::Value> = crate::briefs::list()
-                .into_iter()
-                .map(|b| serde_json::json!({
-                    "id": b.id, "title": b.title, "state": b.state.label(),
-                    "priority": b.priority, "branch": b.branch,
-                    "addresses": b.addresses, "createdTs": b.created_ts,
-                    // The forks are what approval reads, and the verify list is what pressing
-                    // assign authorises to run. Both belong on the card rather than one tap in:
-                    // a command nobody saw is a command nobody approved.
-                    "forks": b.forks, "verify": b.verify,
-                    "repo": b.repo.as_ref().map(|r| r.display().to_string()),
-                    "report": b.report.as_ref().map(|r| serde_json::json!({
-                        "outcome": r.outcome, "pr": r.pr, "met": r.met, "total": r.total,
-                    })),
-                }))
-                .collect();
+            let rows = brief_rows();
             let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": rows}).to_string());
         }
         // Hand a brief to a worker. The bridge forwards and does NOT judge — the pane's tool scope
@@ -2348,6 +2374,39 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // Kick off ideation: mint an empty brief and set the planner in this pane filling it in.
         // The title is the whole payload because it is the only thing the host cannot derive —
         // everything else about the brief (its id, its path, its sections) is minted daemon-side.
+        // REFINEMENT IS ONE GESTURE: pick a different option. No free-text editing of a binding
+        // document, no second composer, no re-drafting — an override is definitionally a decision
+        // already made, so it lands in the section that is already binding and already parsed.
+        Some("brief.decide") => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let did = v.get("decision").and_then(|x| x.as_str()).unwrap_or("");
+            let key = v.get("option").and_then(|x| x.as_str()).unwrap_or("");
+            let dir = crate::briefs::dir().map(|d| d.join(id));
+            // `safe_id` because this id names a directory and arrives over the wire.
+            let out = match dir {
+                Some(d) if crate::briefs::safe_id(id) && !did.is_empty() && !key.is_empty() => {
+                    match crate::briefs::override_decision(&d, did, key) {
+                        Ok(stale) => serde_json::json!({
+                            "t": "brief.decided", "id": id, "decision": did,
+                            "option": key.to_uppercase(), "stale": stale,
+                        }),
+                        Err(e) => serde_json::json!({
+                            "t": "brief.decided", "id": id, "decision": did, "error": e.to_string(),
+                        }),
+                    }
+                }
+                _ => serde_json::json!({
+                    "t": "brief.decided", "id": id, "error": "bad brief id, decision or option",
+                }),
+            };
+            crate::manager::record_client_event("act", &v, crate::worklog::now_secs());
+            let _ = tx.send(out.to_string());
+            // The board is the source of truth for what the card renders, so re-read it rather
+            // than patching the row client-side — two copies of a decision is two things to keep
+            // true.
+            let rows = brief_rows();
+            let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": rows}).to_string());
+        }
         Some("brief.draft") => {
             if let (Some(pane), Some(title)) = (
                 v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()),

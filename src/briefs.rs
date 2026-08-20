@@ -270,7 +270,13 @@ fn parse_forks(body: &str) -> Vec<String> {
         if question.is_some() && trimmed.contains("chosen") {
             let choice = strip_md(trimmed);
             if let Some(q) = question.take() {
-                out.push(format!("{q} → {choice}"));
+                // The same guard `parse_decisions` applies. A template heading is not a ruled
+                // fork, and putting one on an approval card invites a press on a decision nobody
+                // made.
+                let slot = q.split('—').next_back().unwrap_or(&q);
+                if !is_stub(slot) && !is_stub(&choice) {
+                    out.push(format!("{q} → {choice}"));
+                }
             }
         }
     }
@@ -297,6 +303,571 @@ fn strip_md(line: &str) -> String {
     } else {
         s
     }
+}
+
+/// One option inside a decision — the thing an override picks.
+#[derive(Clone, Debug)]
+pub struct DecisionOption {
+    /// "A" | "B" | "C". Addressable, because an override has to name one.
+    pub key: String,
+    pub text: String,
+    pub chosen: bool,
+    /// The `*For:*` / `*Against:*` / `*Why this and not the others:*` clause, kept whole.
+    ///
+    /// `strip_md` throws this away on purpose — "a card shows the decision, not the argument for
+    /// it". That is right for a card you only read and wrong for a card you refine on: **you
+    /// cannot override an option you cannot see.**
+    pub why: Option<String>,
+}
+
+/// A ruled decision — one fork or one artefact.
+///
+/// A brief carries SIX of these, not three: three HLD forks (what shape) and three LLD artefacts
+/// (the hardest things to build). `parse_forks` matched `### Fork` only, so the three hardest
+/// decisions in the document never reached the surface at all.
+#[derive(Clone, Debug)]
+pub struct Decision {
+    /// "hld-2" | "lld-1". Stable within a brief, so an override and a staleness note can name it.
+    pub id: String,
+    pub layer: &'static str,
+    pub question: String,
+    pub options: Vec<DecisionOption>,
+    /// Earlier decisions this ruling assumed, from `*Assumes:* hld-1`.
+    ///
+    /// One field, written by the planner that is already writing the ruling — and the whole reason
+    /// an override can be surgical. Without it the only honest response to a changed premise is
+    /// re-running the planner over the entire brief, which discards every decision you already
+    /// agreed with.
+    pub depends_on: Vec<String>,
+    /// An upstream override invalidated this ruling. Derived, never stored as its own state.
+    pub stale: bool,
+    /// A human chose against the recommendation.
+    pub overridden: bool,
+}
+
+impl Decision {
+    pub fn chosen(&self) -> Option<&DecisionOption> {
+        self.options.iter().find(|o| o.chosen)
+    }
+}
+
+/// An unfilled slot in the template, rather than something a planner wrote.
+///
+/// The template's own two marks: `<angled>` for a slot and `…` for a body. Shared by both
+/// parsers — `parse_decisions` grew this test first and `parse_forks` did not, so a superseded
+/// brief showed no decisions (correct) and then fell straight through to the legacy fork line and
+/// rendered `Fork 1 — <the question> → Option C — …` on the card anyway. One filter, two readers.
+fn is_stub(t: &str) -> bool {
+    let t = t.trim();
+    t.is_empty() || t == "…" || t == "..." || (t.starts_with('<') && t.ends_with('>'))
+}
+
+/// The heading that opens a decision, if this line is one.
+fn decision_heading(trimmed: &str) -> Option<(String, &'static str, String)> {
+    // "### Fork 2 — where does the claim live?"
+    if let Some(rest) = trimmed.strip_prefix("### Fork") {
+        let rest = rest.trim();
+        let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if n.is_empty() {
+            return None;
+        }
+        let q = rest[n.len()..].trim().trim_start_matches(['—', '-', ':']).trim();
+        return Some((format!("hld-{n}"), "hld", q.to_string()));
+    }
+    // "### Artefact 1 of 3 — the hardest thing to build". The template's own words, so the parser
+    // matches the document the planner is told to write rather than a second shape nobody writes.
+    for lead in ["### Artefact", "### Artifact"] {
+        if let Some(rest) = trimmed.strip_prefix(lead) {
+            let rest = rest.trim();
+            let n: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if n.is_empty() {
+                return None;
+            }
+            let q = rest[n.len()..]
+                .trim()
+                .trim_start_matches("of 3")
+                .trim()
+                .trim_start_matches(['—', '-', ':'])
+                .trim();
+            return Some((format!("lld-{n}"), "lld", q.to_string()));
+        }
+    }
+    None
+}
+
+/// `- **Option B** — text *For:* …` → one option. `None` when the line is not an option.
+fn parse_option(trimmed: &str) -> Option<DecisionOption> {
+    let s = trimmed.trim_start_matches(['-', '*', ' ']);
+    let s = s.strip_prefix("**").unwrap_or(s);
+    let rest = s.strip_prefix("Option ")?;
+    let key = rest.chars().next().filter(|c| c.is_ascii_alphabetic())?.to_ascii_uppercase();
+    let after = &rest[key.len_utf8()..];
+    // The chosen marker rides inside the bold run: `**Option C ✅ chosen**`.
+    let chosen = after.contains("chosen") || after.contains('✅');
+    let body = after
+        .split_once("**")
+        .map(|(_, b)| b)
+        .unwrap_or(after)
+        .trim()
+        .trim_start_matches(['—', '-', ':'])
+        .trim();
+    // The argument is kept, not split off — see `DecisionOption::why`.
+    let (text, why) = match body.find(" *For:*").or_else(|| body.find(" *Why")) {
+        Some(i) => (body[..i].trim().to_string(), Some(body[i..].trim().to_string())),
+        None => (body.to_string(), None),
+    };
+    Some(DecisionOption {
+        key: key.to_string(),
+        text: text.replace("**", "").replace('`', "").trim().to_string(),
+        chosen,
+        why: why.map(|w| w.replace('*', "").trim().to_string()).filter(|w| !w.is_empty()),
+    })
+}
+
+/// Every decision in a brief, with its options intact.
+pub fn parse_decisions(body: &str) -> Vec<Decision> {
+    let mut out: Vec<Decision> = Vec::new();
+    let mut cur: Option<Decision> = None;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some((id, layer, question)) = decision_heading(trimmed) {
+            if let Some(d) = cur.take() {
+                out.push(d);
+            }
+            cur = Some(Decision {
+                id,
+                layer,
+                question,
+                options: Vec::new(),
+                depends_on: Vec::new(),
+                stale: false,
+                overridden: false,
+            });
+            continue;
+        }
+        // A `##` heading closes whatever was open, so an option further down the document cannot
+        // attach itself to a question it does not belong to.
+        if trimmed.starts_with("## ") {
+            if let Some(d) = cur.take() {
+                out.push(d);
+            }
+            continue;
+        }
+        let Some(d) = cur.as_mut() else { continue };
+        if let Some(rest) = trimmed
+            .trim_start_matches(['-', '*', ' '])
+            .strip_prefix("Assumes:")
+            .or_else(|| trimmed.strip_prefix("*Assumes:*"))
+        {
+            d.depends_on.extend(
+                rest.replace('*', "")
+                    .split(',')
+                    .map(|x| x.trim().trim_matches('`').to_string())
+                    .filter(|x| !x.is_empty()),
+            );
+            continue;
+        }
+        if let Some(o) = parse_option(trimmed) {
+            d.options.push(o);
+        }
+    }
+    if let Some(d) = cur.take() {
+        out.push(d);
+    }
+    // TEMPLATE STUBS ARE NOT DECISIONS, and "has options" is not enough to tell them apart —
+    // the template ships literal `- **Option A** — …` lines as an example of the shape, so a
+    // freshly minted brief parsed as six fully-formed decisions and the card offered
+    // `<the question> → …` for approval. Found by pointing the tracer at a superseded brief,
+    // which is minted from the template and had never been read on a card before.
+    //
+    // The placeholders are the template's own two marks: `<angled>` for a slot and `…` for a
+    // body. Nothing a planner writes looks like that, so the test stays specific rather than
+    // guessing at "looks unfinished".
+    out.retain(|d| {
+        !d.options.is_empty() && !is_stub(&d.question) && !d.options.iter().all(|o| is_stub(&o.text))
+    });
+    out
+}
+
+/// Re-attach the trailing newline `lines()` drops.
+///
+/// Every rewrite here goes through `lines()` + `join("\n")`, which silently eats the final
+/// newline — so each override left the file one byte shorter and made the LAST block in the
+/// document differ from itself. Caught by the tracer's own acceptance check ("every other
+/// decision is byte-identical before and after"), which is exactly the kind of thing that
+/// assertion is for.
+fn keep_trailing(original: &str, out: String) -> String {
+    if original.ends_with('\n') && !out.ends_with('\n') { out + "\n" } else { out }
+}
+
+/// The section a heading opens, as a line range over the document.
+fn section_span(lines: &[&str], heading: &str) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|l| l.trim() == heading)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with("## "))
+        .map(|i| start + 1 + i)
+        .unwrap_or(lines.len());
+    Some((start, end))
+}
+
+/// The section every override and every staleness note is written into.
+///
+/// **No new file, and no new state.** An override is definitionally a decision already made, so it
+/// belongs in the section that is already binding on the worker, already parsed, and already
+/// exists to stop settled ground being re-litigated at 3am. Inventing an `overrides.json` beside
+/// it would mean two places a decision lives and a rule about which wins.
+const MADE: &str = "## Decisions already made";
+
+/// Overrides and staleness, read back out of the brief.
+fn parse_made(body: &str) -> (Vec<(String, String)>, Vec<String>) {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some((start, end)) = section_span(&lines, MADE) else { return (Vec::new(), Vec::new()) };
+    let (mut over, mut stale) = (Vec::new(), Vec::new());
+    for line in &lines[start..end] {
+        let t = line.trim().trim_start_matches(['-', ' ']);
+        let Some(rest) = t.strip_prefix('[') else { continue };
+        let Some((id, rest)) = rest.split_once(']') else { continue };
+        let id = id.trim().to_string();
+        if rest.contains("stale") {
+            stale.push(id);
+        } else if let Some((_, choice)) = rest.split_once('→') {
+            // "→ Option B — …" — the key is all that has to survive the round trip.
+            if let Some(k) = choice.trim().strip_prefix("Option ").and_then(|c| c.chars().next()) {
+                over.push((id, k.to_ascii_uppercase().to_string()));
+            }
+        }
+    }
+    (over, stale)
+}
+
+/// Fold the recorded overrides and staleness back onto the parsed decisions.
+pub fn apply_made(decisions: &mut [Decision], body: &str) {
+    let (over, stale) = parse_made(body);
+    for (id, key) in over {
+        if let Some(d) = decisions.iter_mut().find(|d| d.id == id) {
+            // The human's pick replaces the planner's, rather than sitting beside it. Two "chosen"
+            // marks on one decision is a card that cannot say what was decided.
+            if d.options.iter().any(|o| o.key == key) {
+                for o in d.options.iter_mut() {
+                    o.chosen = o.key == key;
+                }
+                d.overridden = true;
+            }
+        }
+    }
+    for id in stale {
+        if let Some(d) = decisions.iter_mut().find(|d| d.id == id) {
+            d.stale = true;
+        }
+    }
+}
+
+/// Every decision in a brief, with overrides and staleness already folded in.
+pub fn decisions_of(brief_dir: &Path) -> Vec<Decision> {
+    let Ok(body) = std::fs::read_to_string(brief_dir.join("brief.md")) else { return Vec::new() };
+    let mut d = parse_decisions(&body);
+    apply_made(&mut d, &body);
+    d
+}
+
+/// Append lines to `## Decisions already made`, creating the section if the brief lacks it.
+fn append_to_made(body: &str, add: &[String]) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    match section_span(&lines, MADE) {
+        Some((_, end)) => {
+            let mut out: Vec<String> = lines[..end].iter().map(|s| s.to_string()).collect();
+            // Trailing blank lines inside the section would push the new entry away from the ones
+            // it belongs with.
+            while out.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+                out.pop();
+            }
+            out.extend(add.iter().cloned());
+            out.push(String::new());
+            out.extend(lines[end..].iter().map(|s| s.to_string()));
+            keep_trailing(body, out.join("\n"))
+        }
+        None => {
+            let mut out = body.trim_end().to_string();
+            out.push_str("\n\n");
+            out.push_str(MADE);
+            out.push_str("\n\n");
+            out.push_str(&add.join("\n"));
+            out.push('\n');
+            out
+        }
+    }
+}
+
+/// A human chose against the recommendation.
+///
+/// Returns the ids this override made stale. **Exactly the declared dependents and nothing else**
+/// — the alternative considered and rejected was re-running the planner over the whole brief,
+/// which throws away every decision already agreed with, and the one thing refinement must not do
+/// is discard the agreement it is building.
+pub fn override_decision(brief_dir: &Path, id: &str, key: &str) -> std::io::Result<Vec<String>> {
+    let path = brief_dir.join("brief.md");
+    let body = std::fs::read_to_string(&path)?;
+    let decisions = parse_decisions(&body);
+    let Some(d) = decisions.iter().find(|d| d.id == id) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no decision {id}")));
+    };
+    let key = key.to_ascii_uppercase();
+    let Some(opt) = d.options.iter().find(|o| o.key == key) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{id} has no option {key}"),
+        ));
+    };
+    let was = d.chosen().map(|o| o.key.clone()).unwrap_or_default();
+    if was == key {
+        return Ok(Vec::new()); // choosing what is already chosen is not an override
+    }
+    let (already_over, already_stale) = parse_made(&body);
+    let mut add = vec![format!(
+        "- [{id}] **overridden** → Option {key} — {} *(planner chose {was})*",
+        opt.text
+    )];
+    let mut went_stale = Vec::new();
+    for other in &decisions {
+        if other.id == id || !other.depends_on.iter().any(|x| x == id) {
+            continue;
+        }
+        if already_stale.iter().any(|x| x == &other.id) {
+            continue;
+        }
+        add.push(format!(
+            "- [{}] **stale** — assumes {id}, which was overridden",
+            other.id
+        ));
+        went_stale.push(other.id.clone());
+    }
+    // Re-overriding the same decision replaces the earlier line rather than stacking a second.
+    let body = if already_over.iter().any(|(i, _)| i == id) {
+        strip_made_lines(&body, |t| t.starts_with(&format!("[{id}]")) && !t.contains("stale"))
+    } else {
+        body
+    };
+    std::fs::write(&path, append_to_made(&body, &add))?;
+    Ok(went_stale)
+}
+
+/// Drop lines from `## Decisions already made` that match a predicate on their trimmed text.
+fn strip_made_lines(body: &str, pred: impl Fn(&str) -> bool) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some((start, end)) = section_span(&lines, MADE) else { return body.to_string() };
+    let mut out: Vec<String> = lines[..=start].iter().map(|s| s.to_string()).collect();
+    for line in &lines[start + 1..end] {
+        if !pred(line.trim().trim_start_matches(['-', ' '])) {
+            out.push(line.to_string());
+        }
+    }
+    out.extend(lines[end..].iter().map(|s| s.to_string()));
+    keep_trailing(body, out.join("\n"))
+}
+
+/// The planner re-ruled this decision, so it is no longer stale.
+///
+/// Only the staleness note is removed; the override that caused it stays, because it is still a
+/// decision that was made.
+pub fn clear_stale(brief_dir: &Path, id: &str) -> std::io::Result<()> {
+    let path = brief_dir.join("brief.md");
+    let body = std::fs::read_to_string(&path)?;
+    let out = strip_made_lines(&body, |t| {
+        t.starts_with(&format!("[{id}]")) && t.contains("stale")
+    });
+    std::fs::write(&path, out)
+}
+
+/// One numbered acceptance criterion, and what the audit made of it.
+#[derive(Clone, Debug)]
+pub struct Criterion {
+    pub n: usize,
+    pub text: String,
+    /// `met` | `unmet` | `unverifiable`.
+    ///
+    /// **`unverifiable` is a first-class outcome, not a soft failure.** A criterion nothing can
+    /// check is a defect in the BRIEF, and it has to read as one — rolling it into `unmet` blames
+    /// the work for the specification's problem, and rolling it into `met` is how a brief passes
+    /// without anybody having checked anything.
+    pub verdict: &'static str,
+    /// Set when the worker's claim and the observation disagree — the case the tier exists for.
+    pub disputed: bool,
+}
+
+/// Numbered criteria from `## Acceptance`.
+pub fn acceptance(body: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some((start, end)) = section_span(&lines, "## Acceptance") else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in &lines[start + 1..end] {
+        let t = line.trim();
+        let n: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if n.is_empty() {
+            continue;
+        }
+        let rest = t[n.len()..].trim_start_matches(['.', ')', ' ']).trim();
+        // The template ships `1. …` as a placeholder; an ellipsis is not a criterion.
+        if rest.is_empty() || rest == "…" || rest == "..." {
+            continue;
+        }
+        if let Ok(n) = n.parse::<usize>() {
+            out.push((n, rest.to_string()));
+        }
+    }
+    out
+}
+
+/// What the worker claimed, per criterion, from `completed.md`'s front matter.
+fn claims(brief_dir: &Path) -> Vec<(usize, Option<bool>)> {
+    let Ok(text) = std::fs::read_to_string(brief_dir.join("completed.md")) else { return Vec::new() };
+    let Some((front, _)) = crate::manager::split_front(&text) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in front.lines().map(str::trim).filter(|l| l.starts_with("- {n:")) {
+        let n: String = line[5..].trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(n) = n.parse::<usize>() else { continue };
+        // A claim can decline to answer. `met: unverifiable` is the worker saying the criterion
+        // cannot be checked, which is information — and different from claiming failure.
+        let v = if line.contains("met: unverifiable") {
+            None
+        } else {
+            Some(line.contains("met: true"))
+        };
+        out.push((n, v));
+    }
+    out
+}
+
+/// The audit, tiers 0 and 1.
+///
+/// Tier 0 is the brief's own `verify:` argv and is already built. Tier 1 is this: every numbered
+/// criterion set against what the worker claimed and what tier 0 observed. It is free arithmetic,
+/// and its whole value is the case where they disagree — `outcome: done` beside a failing command
+/// is the thing a rounded-up card would hide.
+pub struct Audit {
+    pub tier0: Vec<VerifyRow>,
+    pub tier1: Vec<Criterion>,
+}
+
+impl Audit {
+    pub fn disagreements(&self) -> usize {
+        self.tier1.iter().filter(|c| c.disputed).count()
+    }
+    pub fn unmet(&self) -> Vec<usize> {
+        self.tier1.iter().filter(|c| c.verdict != "met").map(|c| c.n).collect()
+    }
+}
+
+pub fn audit(b: &Brief, brief_dir: &Path, timeout: std::time::Duration) -> Audit {
+    let tier0 = verify(b, timeout);
+    let body = std::fs::read_to_string(brief_dir.join("brief.md")).unwrap_or_default();
+    let claimed: Vec<(usize, Option<bool>)> = claims(brief_dir);
+    // Tier 0 is a property of the brief, not of any one criterion — the `verify:` list is flat.
+    // So a failing command makes every claim of success suspect rather than one of them.
+    let commands_pass = !tier0.is_empty() && tier0.iter().all(|r| r.ok());
+    let tier1 = acceptance(&body)
+        .into_iter()
+        .map(|(n, text)| {
+            let claim = claimed.iter().find(|(cn, _)| *cn == n).map(|(_, v)| *v);
+            let (verdict, disputed) = match claim {
+                // Nothing said about it at all. Not a failure of the work — nobody looked.
+                None => ("unverifiable", false),
+                Some(None) => ("unverifiable", false),
+                Some(Some(true)) if tier0.is_empty() => ("unverifiable", false),
+                Some(Some(true)) if commands_pass => ("met", false),
+                // Claimed met while the commands say otherwise. THE case tier 1 exists for.
+                Some(Some(true)) => ("unmet", true),
+                Some(Some(false)) => ("unmet", false),
+            };
+            Criterion { n, text, verdict, disputed }
+        })
+        .collect();
+    Audit { tier0, tier1 }
+}
+
+/// Mint the next brief from what this one did not finish.
+///
+/// **Mechanical, and deliberately not a model call.** The tally is already keyed to the brief's
+/// acceptance numbering, so the unmet subset is arithmetic — and a model rewriting criteria it
+/// has just failed is the last thing wanted in this loop. `## Decisions already made` is inherited
+/// whole, overrides included: they were settled, and settling them again is the cost this section
+/// exists to avoid.
+pub fn supersede(brief_dir: &Path, ts: u64) -> std::io::Result<(String, PathBuf)> {
+    let body = std::fs::read_to_string(brief_dir.join("brief.md"))?;
+    let Some(b) = read(brief_dir) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "unreadable brief"));
+    };
+    let a = audit(&b, brief_dir, std::time::Duration::from_secs(20));
+    let unmet: Vec<usize> = a.unmet();
+    if unmet.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "nothing unmet — there is nothing to supersede",
+        ));
+    }
+    let all = acceptance(&body);
+    let title = format!("{} (cont.)", b.title);
+    let id = mint_id(&title, ts);
+    let Some(dir) = dir().map(|d| d.join(&id)) else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))
+    };
+    std::fs::create_dir_all(&dir)?;
+
+    let lines: Vec<&str> = body.lines().collect();
+    let made = section_span(&lines, MADE)
+        .map(|(s, e)| lines[s + 1..e].join("\n").trim().to_string())
+        .unwrap_or_default();
+    let carried: Vec<String> = all
+        .iter()
+        .filter(|(n, _)| unmet.contains(n))
+        .enumerate()
+        .map(|(i, (_, t))| format!("{}. {t}", i + 1))
+        .collect();
+
+    let mut out = template(&id, &title, ts, b.repo.as_deref());
+    // The acceptance section becomes the unmet subset, renumbered from 1 so the next report's
+    // tally lines up with it.
+    out = replace_section(&out, "## Acceptance", &carried.join("\n"));
+    out = replace_section(
+        &out,
+        MADE,
+        &format!(
+            "Inherited whole from `{}`, including any override. These are settled.\n\n{made}",
+            b.id
+        ),
+    );
+    out = replace_section(
+        &out,
+        "## Problem + evidence",
+        &format!(
+            "Supersedes `{}` — {} of {} acceptance criteria were not met:\n\n{}",
+            b.id,
+            unmet.len(),
+            all.len(),
+            all.iter()
+                .filter(|(n, _)| unmet.contains(n))
+                .map(|(n, t)| format!("- ({}) criterion {n}: {t}",
+                    a.tier1.iter().find(|c| c.n == *n).map(|c| c.verdict).unwrap_or("unmet")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    );
+    let path = dir.join("brief.md");
+    std::fs::write(&path, out)?;
+    let _ = scaffold();
+    Ok((id, path))
+}
+
+/// Replace a `##` section's body, keeping the heading.
+fn replace_section(body: &str, heading: &str, content: &str) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    let Some((start, end)) = section_span(&lines, heading) else { return body.to_string() };
+    let mut out: Vec<String> = lines[..=start].iter().map(|s| s.to_string()).collect();
+    out.push(String::new());
+    out.push(content.to_string());
+    out.push(String::new());
+    out.extend(lines[end..].iter().map(|s| s.to_string()));
+    keep_trailing(body, out.join("\n"))
 }
 
 /// The worker's report, if there is one.
@@ -851,9 +1422,16 @@ pub fn template(id: &str, title: &str, ts: u64, repo: Option<&Path>) -> String {
          \n\
          ### Fork 2 — <the question>\n\
          \n\
+         *Assumes:* hld-1\n\
+         \n\
          ### Fork 3 — <the question>\n\
          \n\
          Three is a strong default, not a schema. Two real forks beat three with one invented.\n\
+         \n\
+         `*Assumes:* hld-1` names the earlier decision a ruling rests on, and it is not optional\n\
+         bookkeeping — it is what lets a reader override one recommendation without re-approving\n\
+         the other five. Write it wherever a ruling would change if the named decision changed.\n\
+         Decisions are addressed `hld-1..3` and `lld-1..3`, in the order they appear.\n\
          \n\
          ## LLD\n\
          \n\
@@ -864,7 +1442,14 @@ pub fn template(id: &str, title: &str, ts: u64, repo: Option<&Path>) -> String {
          \n\
          ### Artefact 1 of 3 — <the hardest thing to build>\n\
          \n\
-         Three options considered, one chosen, with the reason the others lose.\n\
+         *Assumes:* hld-2\n\
+         \n\
+         - **Option A** — … *For:* … *Against:* …\n\
+         - **Option B** — … *For:* … *Against:* …\n\
+         - **Option C ✅ chosen** — … *Why this and not the others:* …\n\
+         \n\
+         Same shape as a fork, and for the same reason: these three are the decisions most likely\n\
+         to be wrong, so they are the three most worth overriding. They reach the approval card.\n\
          \n\
          ### Artefact 2 of 3\n\
          \n\

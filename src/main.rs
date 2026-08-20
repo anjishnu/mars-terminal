@@ -597,6 +597,132 @@ fn main() -> Result<()> {
                          the same bytes for every worker."
                     );
                 }
+                // THE SIX DECISIONS, WITH THEIR OPTIONS. `brief show` prints the one-line
+                // summary the card used to get; this prints what an override needs to be
+                // possible at all — every option, which is chosen, and why not the others.
+                "decisions" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    if !dir.join("brief.md").exists() {
+                        anyhow::bail!("usage: mars brief decisions <brief-id>");
+                    }
+                    let ds = briefs::decisions_of(&dir);
+                    if ds.is_empty() {
+                        println!("no decisions parsed — the brief has no ruled forks or artefacts yet.");
+                        return Ok(());
+                    }
+                    let stale = ds.iter().filter(|d| d.stale).count();
+                    for d in &ds {
+                        let mark = if d.stale { " ⚠ STALE" } else if d.overridden { " ✎ overridden" } else { "" };
+                        println!("\n  [{}] {}{}", d.id, d.question, mark);
+                        if !d.depends_on.is_empty() {
+                            println!("        assumes {}", d.depends_on.join(", "));
+                        }
+                        for o in &d.options {
+                            println!("    {} {} — {}", if o.chosen { "✅" } else { "  " }, o.key, o.text);
+                            if let Some(w) = &o.why {
+                                println!("           {w}");
+                            }
+                        }
+                    }
+                    // The gate, stated where the decisions are — approving a brief with a hole in
+                    // its design is approving something nobody has read.
+                    println!(
+                        "\n  {} decision(s): {} hld, {} lld, {} stale.  approve is {}.",
+                        ds.len(),
+                        ds.iter().filter(|d| d.layer == "hld").count(),
+                        ds.iter().filter(|d| d.layer == "lld").count(),
+                        stale,
+                        if stale > 0 { "WITHHELD" } else { "offered" },
+                    );
+                }
+                // Choose against the recommendation.
+                "override" => {
+                    let id = args.next().unwrap_or_default();
+                    let did = args.next().unwrap_or_default();
+                    let key = args.next().unwrap_or_default();
+                    if id.is_empty() || did.is_empty() || key.is_empty() {
+                        anyhow::bail!("usage: mars brief override <brief-id> <decision-id> <A|B|C>");
+                    }
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    let stale = briefs::override_decision(&dir, &did, &key)?;
+                    println!("  [{did}] → Option {}", key.to_uppercase());
+                    println!("  recorded in `## Decisions already made` — no new file, no new state.");
+                    if stale.is_empty() {
+                        println!("  nothing declared a dependency on it, so nothing went stale.");
+                    } else {
+                        println!("  stale now: {} — the planner re-rules ONLY these.", stale.join(", "));
+                    }
+                }
+                // The planner re-ruled one decision. Only the staleness note lifts; the override
+                // that caused it stays, because it is still a decision that was made.
+                "rerule" => {
+                    let id = args.next().unwrap_or_default();
+                    let did = args.next().unwrap_or_default();
+                    if id.is_empty() || did.is_empty() {
+                        anyhow::bail!("usage: mars brief rerule <brief-id> <decision-id>");
+                    }
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    briefs::clear_stale(&dir, &did)?;
+                    let left = briefs::decisions_of(&dir).iter().filter(|d| d.stale).count();
+                    println!("  [{did}] re-ruled. {left} decision(s) still stale.");
+                }
+                // Tiers 0 and 1. Tier 0 runs the argv; tier 1 sets every numbered criterion
+                // against what the worker claimed and what tier 0 observed.
+                "audit" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    let Some(b) = briefs::read(&dir) else {
+                        anyhow::bail!("usage: mars brief audit <brief-id>")
+                    };
+                    let a = briefs::audit(&b, &dir, std::time::Duration::from_secs(30));
+                    println!("  tier 0 · deterministic");
+                    if a.tier0.is_empty() {
+                        println!("    (the brief declares no verify: commands)");
+                    }
+                    for r in &a.tier0 {
+                        println!("    {} {}  {}", if r.ok() { "✓" } else { "✗" }, r.cmd, r.note);
+                    }
+                    println!("\n  tier 1 · claim vs observation");
+                    for c in &a.tier1 {
+                        println!(
+                            "    {:>2}. {:<12} {}{}",
+                            c.n,
+                            c.verdict,
+                            c.text,
+                            if c.disputed { "   ← claimed met, commands disagree" } else { "" }
+                        );
+                    }
+                    let unmet = a.unmet();
+                    println!(
+                        "\n  {} criteria: {} met, {} not.  {} disagreement(s).",
+                        a.tier1.len(),
+                        a.tier1.len() - unmet.len(),
+                        unmet.len(),
+                        a.disagreements(),
+                    );
+                    if !unmet.is_empty() {
+                        println!("  `mars brief supersede {id}` mints the next brief from {:?}.", unmet);
+                    }
+                }
+                "supersede" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    let (new_id, path) = briefs::supersede(&dir, worklog::now_secs())?;
+                    println!("  {new_id}");
+                    println!("  {}", path.display());
+                    println!("  acceptance is the unmet subset; decisions inherited whole.");
+                }
                 "worker" => {
                     println!(
                         "Run this in the pane you want to work in, then assign a brief to it:\n\n  {}",
