@@ -367,6 +367,11 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     println!();
     println!("  {url}");
     println!("  single-use  ·  `mars serve` accepts the connection");
+    // THE FOURTH DOOR, named on the screen that hands out the link. `mars attach` reads the same
+    // fragment a browser does, so somebody who already has this URL in their scrollback has no
+    // reason to reach for a browser. The quoting warning rides along because an unquoted paste
+    // fails silently — the shell truncates at the first `&` and the link arrives credential-less.
+    println!("  in a terminal, the same link attaches:  \x1b[1mmars attach '<link>'\x1b[0m  (quoted — the shell eats `#` and `&`)");
     Ok(())
 }
 
