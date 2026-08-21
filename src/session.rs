@@ -3085,6 +3085,10 @@ pub struct SessionEntry {
     pub as_of: Option<u64>,
     /// The command that gets you there (`mars attach x` / `mars ssh h`).
     pub connect: String,
+    /// Where this session's workspaces are rooted, home-relative, as `restore.json`
+    /// last recorded it — spawn-time truth (see `Term::spawn_cwd`), not a live `pwd`.
+    /// `None` = nothing recorded: a remote, or a session with no manifest yet.
+    pub dir: Option<String>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -3093,6 +3097,93 @@ fn clip(s: &str, max: usize) -> String {
     }
     let cut: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{cut}…")
+}
+
+/// `clip` from the other end, for paths: `~/Mars-Mission/mars-e2e` at 12 becomes
+/// `…on/mars-e2e`, not `~/Mars-Missi…`. The tail is the half that identifies the
+/// directory, so it is the half that must survive. `clip` is left alone: every
+/// other cell in the table is prose, where the head is the half that matters.
+pub fn clip_left(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = s.chars().skip(n - keep).collect();
+    format!("…{tail}")
+}
+
+/// `$HOME/x` → `~/x` for display only. Nothing outside home is rewritten, and
+/// this never parses a path back — `resolve_path_in` is the other direction.
+fn home_relative(p: &str) -> String {
+    let Some(home) = crate::sys::paths::home_dir() else { return p.to_string() };
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return p.to_string();
+    }
+    if p == home {
+        return "~".to_string();
+    }
+    match p.strip_prefix(home) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => p.to_string(),
+    }
+}
+
+/// Column widths for one `mars ls` table at `cols` terminal width.
+/// `dir == 0` means the terminal is too narrow for the column and the directory
+/// goes on its own indented line instead.
+pub struct LsLayout {
+    pub name: usize,
+    pub dir: usize,
+    pub status: usize,
+}
+
+impl LsLayout {
+    /// Columns consumed before `SUMMARY` starts — the ordinal, the two fixed
+    /// columns (`WHERE` 6, `AS OF` 8) and every separating space. The header and
+    /// the rows both measure themselves with this, so they cannot drift apart.
+    pub fn prefix(&self) -> usize {
+        23 + self.name + self.status + if self.dir > 0 { self.dir + 1 } else { 0 }
+    }
+}
+
+/// Where the `DIR` column fits, and what it costs.
+///
+/// The floor is `SUMMARY`: below 24 columns it stops being prose and starts
+/// being a ragged stripe against the screen edge, so it is reserved first and
+/// everything else is bought out of what remains. `DIR` is bought last — it
+/// takes the slack at wide widths and only forces `SESSION`/`STATUS` to give
+/// ground between 76 and 96, where a directory still fits but the slack does
+/// not. Below 76 there is no column at all and `list_main` prints the directory
+/// on its own indented line.
+pub fn ls_layout(cols: usize) -> LsLayout {
+    const SUMMARY_MIN: usize = 24;
+    const DIR_MAX: usize = 24;
+    const DIR_MIN: usize = 12;
+    const NAME_MIN: usize = 8;
+    const STATUS_MIN: usize = 5;
+    let cols = cols.max(48);
+    let mut l = LsLayout { name: 18, dir: 0, status: 18 };
+    let spare = cols.saturating_sub(l.prefix() + SUMMARY_MIN);
+    if spare > DIR_MIN {
+        l.dir = (spare - 1).min(DIR_MAX);
+    } else if cols >= 76 {
+        l.dir = DIR_MIN;
+    }
+    // Narrow the two fixed columns together, the wider one first, until the
+    // summary has its floor back.
+    while cols < l.prefix() + SUMMARY_MIN {
+        if l.status > STATUS_MIN && (l.status >= l.name || l.name == NAME_MIN) {
+            l.status -= 1;
+        } else if l.name > NAME_MIN {
+            l.name -= 1;
+        } else {
+            break;
+        }
+    }
+    l
 }
 
 /// Lifecycle noise that says nothing about the work: an interactive shell being
@@ -3219,6 +3310,29 @@ pub fn wrap_text(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Which directory a session is working in, for the `DIR` column.
+///
+/// The first workspace's directory, plus ` +N` when N further distinct ones
+/// exist: a session with tabs in three repos must not claim one of them and
+/// stay silent about the rest, and the full list has no width to be printed in.
+/// The deepest common ancestor was the other candidate — for `~/a` and `~/b` it
+/// computes `~`, which is true and identifies nothing.
+fn session_dir(name: &str) -> Option<String> {
+    let panes = read_restore(name);
+    let first = panes.first()?;
+    let mut distinct: Vec<&str> = Vec::new();
+    for p in &panes {
+        if !distinct.contains(&p.cwd.as_str()) {
+            distinct.push(&p.cwd);
+        }
+    }
+    let base = home_relative(&first.cwd);
+    Some(match distinct.len() {
+        n if n > 1 => format!("{base} +{}", n - 1),
+        _ => base,
+    })
+}
+
 /// Everything `mars ls` knows about, locals first. The single access path for
 /// both kinds — callers never touch `list_sessions`/`fleet_load` shapes.
 pub fn all_sessions() -> Result<Vec<SessionEntry>> {
@@ -3231,6 +3345,7 @@ pub fn all_sessions() -> Result<Vec<SessionEntry>> {
         }
         .to_string();
         let summary = if alive { session_summary(&name) } else { String::new() };
+        let dir = session_dir(&name);
         out.push(SessionEntry {
             connect: format!("mars attach {name}"),
             name,
@@ -3238,6 +3353,7 @@ pub fn all_sessions() -> Result<Vec<SessionEntry>> {
             status,
             summary,
             as_of: None,
+            dir,
         });
     }
     for e in crate::fleet::fleet_load() {
@@ -3252,6 +3368,9 @@ pub fn all_sessions() -> Result<Vec<SessionEntry>> {
             status,
             summary: String::new(),
             as_of: Some(e.as_of),
+            // Nothing records a remote's working directory — `FleetEntry.cwd` is
+            // written `None` at every call site. The column says `—`, not blank.
+            dir: None,
         });
     }
     Ok(out)
@@ -3265,38 +3384,61 @@ pub fn list_main(prompt: bool) -> Result<()> {
         println!("no sessions — start one with: mars new <name>, or reach a box with: mars ssh <host>");
         return Ok(());
     }
-    println!(
-        "  #  {:<18} {:<6} {:<18} {:<8} {}",
-        "SESSION", "WHERE", "STATUS", "AS OF", "SUMMARY"
-    );
     // Keep the columns tight so the summary gets real width. A summary that fits
     // sits inline; a longer one goes on its own full-width indented lines rather
     // than wrapping into a thin ragged column jammed against the screen edge.
     let cols = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(100).max(48);
+    let layout = ls_layout(cols);
+    let dir_col = |cell: &str| match layout.dir {
+        0 => String::new(),
+        w => format!("{:<w$} ", clip_left(cell, w), w = w),
+    };
+    println!(
+        "  #  {:<nw$} {:<6} {}{:<sw$} {:<8} {}",
+        "SESSION",
+        "WHERE",
+        dir_col("DIR"),
+        "STATUS",
+        "AS OF",
+        "SUMMARY",
+        nw = layout.name,
+        sw = layout.status
+    );
     for (i, e) in entries.iter().enumerate() {
         let seen = match e.as_of {
             None => "now".to_string(),
             Some(t) => crate::worklog::ago(t),
         };
         let prefix = format!(
-            "  {:<2} {:<18} {:<6} {:<18} {:<8} ",
+            "  {:<2} {:<nw$} {:<6} {}{:<sw$} {:<8} ",
             i + 1,
-            clip(&e.name, 18),
+            clip(&e.name, layout.name),
             if e.remote { "remote" } else { "local" },
-            clip(&e.status, 18),
-            seen
+            // An omitted value still says it was omitted: a blank cell reads as a
+            // rendering bug, `—` reads as "nothing recorded".
+            dir_col(e.dir.as_deref().unwrap_or("—")),
+            clip(&e.status, layout.status),
+            seen,
+            nw = layout.name,
+            sw = layout.status
         );
+        // Too narrow for a column — the directory takes its own indented line
+        // above the summary block rather than being dropped or clipped to noise.
+        let dir_line = (layout.dir == 0).then(|| e.dir.clone()).flatten();
         let indent = prefix.chars().count();
         let first_width = cols.saturating_sub(indent);
         let one_line = !e.summary.contains('\n');
-        if e.summary.is_empty() {
+        if dir_line.is_none() && e.summary.is_empty() {
             println!("{}", prefix.trim_end());
-        } else if one_line && e.summary.chars().count() <= first_width {
+        } else if dir_line.is_none() && one_line && e.summary.chars().count() <= first_width {
             println!("{prefix}{}", e.summary);
         } else {
             // Multi-line (a goal list) or too long for the row — give each line
             // the full width on its own indented line(s).
             println!("{}", prefix.trim_end());
+            if let Some(d) = &dir_line {
+                println!("      ↳ {d}");
+            }
             for seg in e.summary.split('\n') {
                 for l in wrap_text(seg, cols.saturating_sub(6)) {
                     println!("      {l}");

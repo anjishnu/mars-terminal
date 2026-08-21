@@ -51,6 +51,15 @@ English when you come back. Everything the phone can do is something you press; 
 acts on its own.
 
 ### Added
+- **`mars ls` says which directory each session is in.** A `DIR` column, from the
+  session's restore manifest — so it is there for every session, not only the ones with
+  nothing better to say. The directory used to appear only in the summary's last-resort
+  floor, which meant the better a session was summarized the less you could tell which
+  of your repos it was in. A session with workspaces in more than one directory shows
+  the first and `+N` for the rest rather than claiming one; a remote shows `—`, because
+  nothing records a remote's working directory. The column sizes itself to the terminal
+  and, below 76 columns, steps aside to an indented `↳` line so a narrow table still
+  fits. Spawn-time truth, not a live `pwd`: a `cd` inside the shell does not move it.
 - **Name the workspace you are working in.** A workspace called `terminal 3` that has
   spent the morning on a migration tells you nothing from a phone. Three things can now
   rename one, and none acts alone: a rename row in Rover's side menu for the workspace

@@ -5239,6 +5239,67 @@ fn selfcheck() -> Result<()> {
             Some("gpubox"),
             "unified resolver lost prefix matching"
         );
+        // A remote has no recorded directory (nothing populates `FleetEntry.cwd`),
+        // and the column must say so rather than invent one.
+        assert_eq!(g.dir, None, "a remote claimed a working directory");
+        // The DIR column's source: the restore manifest, which every session has
+        // from its daemon's first loop pass. A session spanning two directories
+        // shows the first and says how many more — never one repo silently.
+        let sroot = manager::sessions_root().expect("sessions root");
+        let sdir = sroot.join("__selfcheck_ls_dir__");
+        std::fs::create_dir_all(&sdir)?;
+        std::fs::write(sdir.join("meta.json"), r#"{"name":"__sc_ls__"}"#)?;
+        let (repo_a, repo_b) = (tmp.join("repo-a"), tmp.join("repo-b"));
+        std::fs::create_dir_all(&repo_a)?;
+        std::fs::create_dir_all(&repo_b)?;
+        session::write_restore(
+            "__sc_ls__",
+            &[
+                session::RestoredPane {
+                    wid: "1-a".into(),
+                    cwd: repo_a.to_string_lossy().into_owned(),
+                    agent: false,
+                    chat: None,
+                },
+                session::RestoredPane {
+                    wid: "2-b".into(),
+                    cwd: repo_b.to_string_lossy().into_owned(),
+                    agent: false,
+                    chat: None,
+                },
+            ],
+        );
+        // `list_sessions` enumerates sockets, so the fixture needs one to be listed
+        // under; a plain file is enough to be seen and reaped as a dead session.
+        let sock = session::socket_dir()?.join("__sc_ls__.sock");
+        std::fs::write(&sock, b"")?;
+        let entries = session::all_sessions()?;
+        let s = entries
+            .iter()
+            .find(|e| e.name == "__sc_ls__")
+            .expect("fixture session missing from all_sessions");
+        assert_eq!(
+            s.dir.as_deref(),
+            Some("~/repo-a +1"),
+            "DIR must be the first workspace, home-relative, with a count of the rest"
+        );
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&sdir);
+        // The width-aware layout (Fork 2): a column when there is room, none when
+        // there isn't, and never at the summary's expense.
+        for w in [60usize, 80, 120] {
+            let l = session::ls_layout(w);
+            assert!(
+                w - l.prefix() >= 24,
+                "ls_layout({w}) left the summary {} columns",
+                w - l.prefix()
+            );
+        }
+        assert!(session::ls_layout(120).dir >= 16, "a wide terminal must get a real DIR column");
+        assert_eq!(session::ls_layout(60).dir, 0, "60 columns cannot hold a DIR column");
+        // Paths are elided from the LEFT: the leaf is what identifies a directory.
+        let c = session::clip_left("~/Mars-Mission/mars-e2e", 12);
+        assert!(c.ends_with("mars-e2e") && c.chars().count() == 12, "clip_left kept the wrong half: {c}");
         match saved {
             Some(h) => std::env::set_var(sys::paths::HOME_ENV, h),
             None => std::env::remove_var(sys::paths::HOME_ENV),
