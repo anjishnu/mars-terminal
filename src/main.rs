@@ -726,6 +726,18 @@ fn main() -> Result<()> {
                 // THE ENTRY TO THE LOOP. Nothing originated work before this: every round began
                 // with a person typing a title, so "walk a line of code back to the observation
                 // that started it" failed at the first hop.
+                // OUT OF THE WAY, NOT GONE. A brief carries the argument that produced it, and
+                // the one thing you want when a decision resurfaces months later is the document
+                // that settled it.
+                "archive" => {
+                    let id = args.next().unwrap_or_default();
+                    if id.is_empty() {
+                        anyhow::bail!("usage: mars brief archive <brief-id>");
+                    }
+                    let to = briefs::archive(&id)?;
+                    println!("  {}", to.display());
+                    println!("  moved, not deleted — `mv` it back to un-archive.");
+                }
                 "review" => {
                     let id = args.next().unwrap_or_default();
                     let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {

@@ -645,6 +645,40 @@ fn append_to_made(body: &str, add: &[String]) -> String {
     }
 }
 
+/// Put a brief out of the way.
+///
+/// **A move, not a flag.** State here is which files exist — `brief` / `in_process` / `completed`
+/// — and adding an `archived: true` somewhere would be the first piece of state in this design
+/// that is asserted rather than observed, with all the drift that invites. Moving the directory
+/// under `archive/` keeps the rule: `list` reads one level and `read` returns `None` for a
+/// directory with no `brief.md`, so the archive is skipped without `list` learning it exists.
+///
+/// Reversible with `mv`, deliberately. Nothing is deleted — a brief carries the argument that
+/// produced it, and the one thing you want when a decision resurfaces months later is the document
+/// that settled it. "Delete" is not offered for the same reason.
+pub fn archive(id: &str) -> std::io::Result<PathBuf> {
+    if !safe_id(id) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad brief id"));
+    }
+    let Some(root) = dir() else {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"));
+    };
+    let from = root.join(id);
+    if !from.join("brief.md").exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no brief {id}")));
+    }
+    let to = root.join("archive").join(id);
+    std::fs::create_dir_all(root.join("archive"))?;
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is already archived", to.display()),
+        ));
+    }
+    std::fs::rename(&from, &to)?;
+    Ok(to)
+}
+
 /// WHAT THIS BRIEF IS FOR, in one paragraph.
 ///
 /// The card used to lead with the six ruled decisions, which is the argument and not the proposal.

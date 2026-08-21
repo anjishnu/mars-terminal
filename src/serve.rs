@@ -2415,6 +2415,18 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // about a brief nobody needs — the design, the acceptance criteria and the out-of-scope
         // list all stayed in a file on a machine you are not sitting at. Approving something you
         // cannot read is the failure this whole surface exists to prevent.
+        Some("brief.archive") => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let out = match crate::briefs::archive(id) {
+                Ok(_) => serde_json::json!({"t": "brief.archived", "id": id}),
+                Err(e) => serde_json::json!({"t": "brief.archived", "id": id, "error": e.to_string()}),
+            };
+            crate::manager::record_client_event("act", &v, crate::worklog::now_secs());
+            let _ = tx.send(out.to_string());
+            // The board is the source of truth for what the card renders, so re-read it rather
+            // than dropping the row client-side.
+            let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": brief_rows()}).to_string());
+        }
         Some("brief.read") => {
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let out = match crate::briefs::dir().filter(|_| crate::briefs::safe_id(id)) {
