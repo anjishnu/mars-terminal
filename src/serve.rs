@@ -179,7 +179,13 @@ pub fn lan_pair_url(session: &str) -> Result<String> {
 pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
     let ip = host.to_string();
     let port = default_port();
-    let token = mint_token()?;
+    // `ensure_token`, NOT `mint_token`. This minted a fresh 128-bit token on every call and never
+    // wrote it anywhere, so the QR — the screen that says "On your phone: scan the code below" —
+    // handed out a credential the bridge had never heard of. Every scan was rejected, and the
+    // rejection's own advice is "re-pair", which sends you back to this QR for another invalid
+    // one. Verified by running `mars qr` twice and getting two different tokens, neither matching
+    // `~/.mars/serve.token`.
+    let token = ensure_token()?;
     let fp = daemon_fingerprint(session);
     let endpoint = format!("ws://{ip}:{port}/ws");
     Ok(format!(
@@ -1407,6 +1413,27 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                         // A beat before refusing: the token is 128 bits so brute force is a
                         // fantasy, but a guessing loop gets nothing for free either.
                         thread::sleep(Duration::from_millis(250));
+                        // SAY WHY. This closed silently, and the client's own comment says "the
+                        // bridge refuses loudly … carry its own words rather than guessing from a
+                        // close code" — but nothing here has ever sent that frame, so the client
+                        // fell into its fallback and GUESSED "the pairing token may have been
+                        // rotated" for every socket that opened and closed. That guess is right
+                        // sometimes and unfalsifiable always, and it is the sentence a person then
+                        // acts on.
+                        //
+                        // Measured before this line: a bad token closed at 257ms with zero frames
+                        // and close code 1006 — indistinguishable from a wedged host.
+                        let _ = ws.send(Message::Text(
+                            serde_json::json!({
+                                "t": "bye",
+                                "message": "this link's token is not the one this bridge holds — \
+                                            it was minted by a different bridge, or rotated since. \
+                                            `mars pair` on the host prints a current link.",
+                            })
+                            .to_string()
+                            .into(),
+                        ));
+                        let _ = ws.flush();
                         return Ok(());
                     }
                     AuthCheck::Other => {} // subscribe before auth → keep waiting
