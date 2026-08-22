@@ -1386,6 +1386,20 @@ impl App {
             "health": self.health.line(), // ambient host stats for the phone's console
             "cwd": cwd,
             "daemon": {
+                // WHO THIS DAEMON IS, on every connect.
+                //
+                // A client stores the `id` out of the pairing link and then depends on it —
+                // to key its saved row, and to group rows that share a host's token. That made a
+                // LABEL load-bearing, and the label turned out to be mutable: when the machine id
+                // stopped being derived from `$HOSTNAME` (empty on macOS, so every machine
+                // answered to `lan`) every previously saved row was left holding an identity this
+                // host no longer answers to, with no way to learn the new one.
+                //
+                // So the host states it, every time, and the client reconciles. An identity change
+                // can orphan a client exactly once now — until its next successful connection,
+                // which is also the moment it is proven reachable.
+                "id": self.session_name.as_deref().map(crate::session::daemon_fingerprint),
+                "machine": crate::session::machine_id(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "startedTs": started,
                 "binaryMtime": binary_mtime,
