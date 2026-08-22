@@ -94,6 +94,32 @@ fn mint_token() -> Result<String> {
 ///
 /// `MARS_BRIDGE_LOOPBACK=1` restores loopback-only for anyone who wants it; `mars qr` then says
 /// the QR cannot work rather than printing one that silently does not.
+/// How many sessions this machine is running — for the sentence `--all` prints, so it states a
+/// number rather than a promise.
+/// WHAT THIS LINK SHARES, said on every screen that prints one.
+///
+/// The difference is one invisible fragment key and it decides whether the other end ends up
+/// holding one session or the whole machine. Both pair screens call this, because two screens
+/// saying it separately is the same shape as two builders making the link separately — and that
+/// one drifted until the QR was handing out tokens the bridge had never stored.
+fn print_scope_line() {
+    if std::env::var_os("MARS_PAIR_ALL").is_some() {
+        let n = live_session_count().max(1);
+        println!();
+        println!("  \x1b[38;5;208mThis link shares all {n} sessions on this machine\x1b[0m, not just the one named in it.");
+    } else {
+        println!("  \x1b[38;5;244m`mars pair --all`   share every session on this machine\x1b[0m");
+    }
+}
+
+fn live_session_count() -> usize {
+    crate::session::socket_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "sock")).count())
+        .unwrap_or(0)
+}
+
 fn bind_host() -> &'static str {
     if std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() { "127.0.0.1" } else { "0.0.0.0" }
 }
@@ -181,6 +207,18 @@ pub enum Reach<'a> {
 ///
 /// The reach is the only real difference, so it is the only parameter.
 pub fn build_pair_link(session: &str, reach: Reach<'_>) -> Result<String> {
+    build_pair_link_all(session, reach, false)
+}
+
+/// The same link, optionally offering the WHOLE MACHINE rather than one session.
+///
+/// A token has always been host-wide — one `~/.mars/serve.token`, one endpoint, and
+/// `sessions.list` will name every session to anyone holding it. So `all` grants no access that
+/// the link did not already carry; it says the person who ran `mars pair` MEANT to share the
+/// machine, and the client adopts every session instead of making somebody discover and tap each
+/// one. Being explicit matters because the two readings have different blast radii and the link
+/// looked identical either way.
+pub fn build_pair_link_all(session: &str, reach: Reach<'_>, all: bool) -> Result<String> {
     // ONE TOKEN, from the file the bridge validates against. Never minted here — a link is a
     // reference to a credential this machine already holds, not an occasion to invent one.
     let token = ensure_token()?;
@@ -195,11 +233,18 @@ pub fn build_pair_link(session: &str, reach: Reach<'_>) -> Result<String> {
             (format!("http://{ip}:{port}/rover"), format!("ws://{ip}:{port}/ws"))
         }
     };
-    Ok(format!("{page}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"))
+    // Appended last and only when set, so a link for one session is byte-identical to what it
+    // has always been — an older client parses it exactly as before.
+    let all = if all { "&all=1" } else { "" };
+    Ok(format!("{page}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1{all}"))
 }
 
 pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String> {
-    build_pair_link(session, Reach::Tunnel { base: tunnel_base, route })
+    build_pair_link_all(
+        session,
+        Reach::Tunnel { base: tunnel_base, route },
+        std::env::var_os("MARS_PAIR_ALL").is_some(),
+    )
 }
 
 /// The three routes in, named by where the reader is standing rather than by mechanism.
@@ -211,6 +256,7 @@ pub fn print_routes() {
     println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
     println!("  \x1b[1mOn your phone\x1b[0m        scan the code below     camera at the QR");
     println!("  \x1b[1mAnother computer\x1b[0m     paste the link below    any network");
+    print_scope_line();
     println!();
 }
 
@@ -402,7 +448,11 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
         println!();
         return Ok(());
     }
-    let url = lan_pair_url(&session)?;
+    // `--all` on the screen that hands a link to a phone. Read from the environment rather than
+    // threaded through five signatures: it is one bit, set once by the CLI arm for this process,
+    // and every printer of a link needs it or none do.
+    let all = std::env::var_os("MARS_PAIR_ALL").is_some();
+    let url = build_pair_link_all(&session, Reach::Lan { ip: &lan_ip() }, all)?;
 
     print_wordmark();
     println!();
@@ -417,6 +467,7 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
     println!("  \x1b[1mOn your phone\x1b[0m        scan the code below     same wifi as this machine");
     println!("  \x1b[1mAnother computer\x1b[0m     paste the link below    any network, via the tunnel");
+    print_scope_line();
     println!();
     print_qr(&url);
     println!();

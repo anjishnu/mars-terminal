@@ -959,6 +959,13 @@ fn main() -> Result<()> {
             let has = |f: &str| rest.iter().any(|a| a == f);
             let reset = has("--reset") || rest.iter().any(|a| a == "reset");
             let session = rest.iter().find(|a| !a.starts_with('-') && *a != "reset").cloned();
+            // SHARE THE MACHINE, NOT ONE SESSION. A token has always been host-wide, so this
+            // grants no reach the link did not already carry — it states that sharing the whole
+            // machine is what was MEANT, and the client then adopts every session instead of
+            // making somebody discover and tap each one.
+            if has("--all") {
+                std::env::set_var("MARS_PAIR_ALL", "1");
+            }
             if has("--check") {
                 return serve::check_main(session);
             }
