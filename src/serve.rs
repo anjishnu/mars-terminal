@@ -2480,7 +2480,8 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         // old briefings, workspace notes and memos that have since been rewritten or pruned.
         Some("manager.archive") => {
             let day = v.get("day").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let _ = tx.send(manager_archive_json(&day));
+            let session_name = socket.file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+            let _ = tx.send(manager_archive_json(&day, &session_name));
         }
         // The queue. A directory read, computed on demand — there is no index to go stale, and
         // "what is in flight" is answered by which files exist rather than by a stored status.
@@ -2973,13 +2974,15 @@ fn manager_view_json(want: &str, session: &str) -> String {
     // collide, and a name match with a fallback is how the wrong briefing got picked.
     let dir_id = crate::manager::existing_session_dir_pub(session)
         .and_then(|d| d.file_name().map(|x| x.to_string_lossy().to_string()));
-    if let Some(dir_id) = &dir_id {
-        if let Some(memos) = v["memos"].as_array_mut() {
-            memos.retain(|c| c["dir"].as_str() == Some(dir_id.as_str()));
-        }
-        if let Some(sessions) = v["sessions"].as_array_mut() {
-            sessions.retain(|e| e["dir"].as_str() == Some(dir_id.as_str()));
-        }
+    // FAIL CLOSED. This skipped filtering entirely when the directory could not be resolved, so
+    // the one case where isolation is uncertain was the case that showed everything. A session
+    // whose dir is missing is exactly when you know least about what belongs to it.
+    let want = dir_id.as_deref().unwrap_or("\u{0}never-matches");
+    if let Some(memos) = v["memos"].as_array_mut() {
+        memos.retain(|c| c["dir"].as_str() == Some(want));
+    }
+    if let Some(sessions) = v["sessions"].as_array_mut() {
+        sessions.retain(|e| e["dir"].as_str() == Some(want));
     }
     let body = match want {
         "manager.memos" => serde_json::json!({ "memos": v["memos"] }),
@@ -3015,7 +3018,13 @@ const ARCHIVE_MAX_ENTRIES: usize = 200;
 /// One archive day, newest entries first, plus the list of days that exist. The requested day is
 /// matched against the ENUMERATED list, never joined into a path — a string from a phone must
 /// not aim, same rule as everywhere else on this boundary. Unknown or empty → the newest day.
-fn manager_archive_json(day: &str) -> String {
+/// The archive, scoped like everything else.
+///
+/// It took a day and nothing else, so while the live memo list was correctly isolated by session
+/// the panel that reads OLD memos showed every session on the machine — you could be in `nourish`
+/// and reading `mars-dev`'s. The isolation was written once for the live view and the archive was
+/// simply never given it.
+fn manager_archive_json(day: &str, session: &str) -> String {
     let ts = crate::worklog::now_secs();
     let Some(repo) = crate::manager::repo_dir() else {
         return serde_json::json!({ "t": "manager.archive", "error": "no manager repo", "generated_ts": ts }).to_string();
@@ -3041,16 +3050,32 @@ fn manager_archive_json(day: &str) -> String {
     } else {
         days.first().cloned().unwrap_or_default()
     };
+    // The durable directory id, exactly as the live view scopes by — names get renamed and reused,
+    // directories do not.
+    let dir_id = crate::manager::existing_session_dir_pub(session)
+        .and_then(|d| d.file_name().map(|x| x.to_string_lossy().to_string()));
     let mut entries: Vec<serde_json::Value> = Vec::new();
     if !pick.is_empty() {
         for line in std::fs::read_to_string(dir.join(format!("{pick}.jsonl")))
             .unwrap_or_default()
             .lines()
             .rev()
-            .take(ARCHIVE_MAX_ENTRIES)
         {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                entries.push(v);
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            // FILTER BEFORE THE CAP, not after. Taking the newest N and then filtering means a
+            // busy neighbour session can fill the window and leave this one looking empty — the
+            // limit would silently become "the last N entries on the machine" rather than "the
+            // last N of yours".
+            match (&dir_id, v["session_id"].as_str()) {
+                // Fail CLOSED. If this session's directory cannot be resolved, showing every
+                // session's history is the one outcome worse than showing none.
+                (None, _) => continue,
+                (Some(want), Some(sid)) if sid == want => {}
+                _ => continue,
+            }
+            entries.push(v);
+            if entries.len() >= ARCHIVE_MAX_ENTRIES {
+                break;
             }
         }
     }
