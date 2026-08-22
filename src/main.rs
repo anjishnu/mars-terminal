@@ -7374,8 +7374,8 @@ fn selfcheck() -> Result<()> {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("meta.json"), r#"{"name":"__sc_wid__"}"#)?;
             let panes = vec![
-                session::RestoredPane { wid: "111-alpha".into(), cwd: "/a".into(), agent: false, chat: None },
-                session::RestoredPane { wid: "222-beta".into(), cwd: "/b".into(), agent: false, chat: None },
+                session::RestoredPane { wid: "111-alpha".into(), cwd: "/a".into(), agent: false, chat: None, name: None },
+                session::RestoredPane { wid: "222-beta".into(), cwd: "/b".into(), agent: false, chat: None, name: None },
             ];
             session::write_restore("__sc_wid__", &panes);
             let back = session::read_restore("__sc_wid__");
@@ -7390,8 +7390,8 @@ fn selfcheck() -> Result<()> {
             // the id, the rest come back blank and mint fresh. Two workspaces answering to one
             // set of files is worse than one workspace losing its history once.
             let dup = vec![
-                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None },
-                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None },
+                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None, name: None },
+                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None, name: None },
             ];
             session::write_restore("__sc_wid__", &dup);
             let back = session::read_restore("__sc_wid__");
@@ -8307,6 +8307,7 @@ fn selfcheck() -> Result<()> {
                 cwd: cwd.to_string(),
                 agent,
                 chat: chat.map(String::from),
+                name: None,
             };
             let plan = session::restore_plan(&[
                 p("/repo", true, Some("aaaa-bbbb")),   // known id — exact

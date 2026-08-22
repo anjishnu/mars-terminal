@@ -1215,6 +1215,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // this workspace, and its conversation gist, would be looked up under an id that
                 // now belongs to whichever pane happened to land in the same position.
                 app.restore_workspace(std::path::Path::new(&p.cwd), start, &p.wid);
+                // AND THE NAME A PERSON CHOSE. Applied after the workspace exists, and only when
+                // the manifest carries one — a pane that was auto-named stays auto-named, so the
+                // label keeps following what the pane is doing. Without this the rename worked on
+                // screen and evaporated at the next reboot, which reads as the reboot renaming
+                // things rather than as a rename that was never written down.
+                if let Some(n) = p.name.as_deref().filter(|n| !n.is_empty()) {
+                    app.rename_current_workspace(n);
+                }
             }
             app.clear_startup_cwd();
             // The manifest just consumed becomes read-only until its promise is delivered —
@@ -1752,7 +1760,12 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         // The conversation id, while the process is still alive to be asked. After
                         // the reboot there is nothing left to ask.
                         let chat = agent.then(|| term.foreground_pid().and_then(claude_session_of)).flatten();
-                        Some(RestoredPane { wid: term.wid.clone(), cwd, agent, chat })
+                        // Only a name a PERSON set. `settle()` marks a tab as manually named —
+                        // the same flag that stops auto-naming from overwriting it here — so the
+                        // two agree about what "named" means instead of guessing from the string.
+                        let named = app.tab_manually_named(t.id);
+                        let name = named.then(|| t.name.clone()).filter(|n| !n.is_empty());
+                        Some(RestoredPane { wid: term.wid.clone(), cwd, agent, chat, name })
                     })
                     .collect();
                 let agents_now = shape.iter().filter(|p| p.agent).count();
@@ -2641,6 +2654,18 @@ pub fn restore_hold(promise: &mut Option<(usize, u64)>, agents_now: usize, now: 
 pub struct RestoredPane {
     /// Durable workspace id. Empty for a manifest written before ids existed.
     pub wid: String,
+    /// The workspace's NAME, when a person chose it.
+    ///
+    /// It was never written down. A rename — from the Rover UI, from the desk, from anywhere —
+    /// changed `Tab::name` in memory and nothing else, so every name a person picked was lost on
+    /// the next reboot and the workspace came back auto-named after its directory. The rename
+    /// looked like it worked, which is why this survived: the failure is invisible until the
+    /// reboot, and by then it reads as "the reboot renamed things" rather than as a rename that
+    /// was never saved.
+    ///
+    /// `None` means auto-named, and stays auto-named — restoring a generated name would freeze a
+    /// label that is supposed to follow what the pane is doing.
+    pub name: Option<String>,
     pub cwd: String,
     pub agent: bool,
     pub chat: Option<String>,
@@ -2652,7 +2677,7 @@ pub fn write_restore(name: &str, panes: &[RestoredPane]) {
     let body = serde_json::json!({
         "at_ts": crate::worklog::now_secs(),
         "panes": panes.iter().map(|p| serde_json::json!({
-            "wid": p.wid, "cwd": p.cwd, "agent": p.agent, "chat": p.chat,
+            "wid": p.wid, "cwd": p.cwd, "agent": p.agent, "chat": p.chat, "name": p.name,
         })).collect::<Vec<_>>(),
     });
     if let Ok(t) = serde_json::to_string_pretty(&body) {
@@ -2769,7 +2794,9 @@ pub fn read_restore(name: &str) -> Vec<RestoredPane> {
     v["panes"].as_array().map(|a| {
         a.iter().filter_map(|p| {
             let cwd = p["cwd"].as_str()?.to_string();
+            let name = p["name"].as_str().map(str::to_string).filter(|n| !n.is_empty());
             (!cwd.is_empty()).then(|| RestoredPane {
+                name,
                 // A manifest written before ids existed has none. Empty means "mint a fresh one",
                 // which loses that workspace's history exactly once and never again — the same
                 // trade `restore.json` itself already makes for pre-feature sessions.

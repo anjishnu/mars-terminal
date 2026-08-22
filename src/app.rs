@@ -941,6 +941,34 @@ impl App {
     /// in `tabs` that every close shifts. An index that crossed the wire can name a different
     /// workspace by the time it lands, and renaming the wrong one is silent. A pane id never
     /// means anything but the pane it was minted for.
+    /// Did a PERSON name this tab, or is it still auto-named?
+    ///
+    /// `settle()` is what a manual rename calls to opt out of auto-naming, so that flag already
+    /// carries the answer — exposed as a question rather than the map so the restore path and the
+    /// auto-namer cannot come to disagree about what "named" means.
+    pub fn tab_manually_named(&self, tab_id: crate::tab::TabId) -> bool {
+        self.auto_name_attempts.get(&tab_id).map(|a| a.done).unwrap_or(false)
+    }
+
+    /// Name the tab being restored right now — the one `restore_workspace` just built.
+    ///
+    /// By pane rather than by index everywhere else in this file, but the restore loop has no pane
+    /// to hand: it has just created the workspace and the focused tab IS the one it made.
+    pub fn rename_current_workspace(&mut self, to: &str) {
+        let to = to.trim();
+        if to.is_empty() {
+            return;
+        }
+        let idx = self.active_tab;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            let id = t.id;
+            t.name = to.to_string();
+            // Opt out of auto-naming, exactly as a live rename does — otherwise the restored name
+            // is overwritten by the first auto-name tick and the reboot loses it a second way.
+            self.auto_name_attempts.entry(id).or_default().settle();
+        }
+    }
+
     pub fn rename_workspace_of_pane(&mut self, pane: PaneId, to: &str) -> bool {
         let to = to.trim();
         if to.is_empty() {

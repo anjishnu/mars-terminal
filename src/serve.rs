@@ -80,6 +80,24 @@ fn mint_token() -> Result<String> {
 /// (a launchd relaunch keeps the same token → paired phones reconnect with no re-scan). It's what
 /// the bridge validates each phone's `{t:"auth"}` frame against; `mars serve --reset` rotates it,
 /// which refuses stale tokens and drops every connected phone.
+/// What the bridge listens on.
+///
+/// Loopback only, until now — and `mars qr` has been advertising a LAN address the whole time.
+/// The QR's entire purpose is a phone on the same wifi, so the feature could not work in the only
+/// situation it exists for, and the tunnel-blocked message even recommends it as the fallback. A
+/// capability that is advertised and unserved is worse than one that is absent.
+///
+/// So the bridge accepts from the network by default. What guards it is what has always guarded
+/// it: a 128-bit token, compared in constant time, now refused out loud. That is the same posture
+/// as the tunnel — which has been exposing this bridge to the entire internet — so binding to a
+/// home LAN is a reduction in reach, not an increase.
+///
+/// `MARS_BRIDGE_LOOPBACK=1` restores loopback-only for anyone who wants it; `mars qr` then says
+/// the QR cannot work rather than printing one that silently does not.
+fn bind_host() -> &'static str {
+    if std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() { "127.0.0.1" } else { "0.0.0.0" }
+}
+
 fn token_file() -> Option<std::path::PathBuf> {
     crate::sys::paths::home_dir().map(|h| h.join(".mars").join("serve.token"))
 }
@@ -144,13 +162,44 @@ fn daemon_fingerprint(session: &str) -> String {
 /// bad thing to have four copies of. Two of them had already drifted: `--open` was handing out a
 /// loopback address the hosted app cannot dial, and `mars qr` a LAN address the bridge does not
 /// even listen on.
-pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String> {
-    let endpoint = format!("{}/ws", tunnel_base.replacen("https://", "wss://", 1));
+/// How a client will reach this bridge. The only thing that differs between pairing links.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Reach<'a> {
+    /// Through the tunnel, to the hosted app. Works from anywhere the tunnel is not blocked.
+    Tunnel { base: &'a str, route: &'a str },
+    /// Straight at this machine over the LAN, page and socket both served by the bridge.
+    Lan { ip: &'a str },
+}
+
+/// THE pairing link. One builder, because there was more than one and they drifted.
+///
+/// `mars pair` and `mars qr` each grew their own, and the divergence was not cosmetic: the QR's
+/// copy called `mint_token` where this one calls `ensure_token`, so it handed out a credential the
+/// bridge had never stored and every scan was refused. Two functions that must agree about a token,
+/// a fragment format, a route and a protocol version will eventually not, and the one that drifts
+/// is the one nobody is looking at.
+///
+/// The reach is the only real difference, so it is the only parameter.
+pub fn build_pair_link(session: &str, reach: Reach<'_>) -> Result<String> {
+    // ONE TOKEN, from the file the bridge validates against. Never minted here — a link is a
+    // reference to a credential this machine already holds, not an occasion to invent one.
     let token = ensure_token()?;
     let fp = daemon_fingerprint(session);
-    Ok(format!(
-        "https://mars-terminal.lovable.app/{route}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    ))
+    let (page, endpoint) = match reach {
+        Reach::Tunnel { base, route } => (
+            format!("https://mars-terminal.lovable.app/{route}"),
+            format!("{}/ws", base.replacen("https://", "wss://", 1)),
+        ),
+        Reach::Lan { ip } => {
+            let port = default_port();
+            (format!("http://{ip}:{port}/rover"), format!("ws://{ip}:{port}/ws"))
+        }
+    };
+    Ok(format!("{page}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"))
+}
+
+pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String> {
+    build_pair_link(session, Reach::Tunnel { base: tunnel_base, route })
 }
 
 /// The three routes in, named by where the reader is standing rather than by mechanism.
@@ -177,21 +226,9 @@ pub fn lan_pair_url(session: &str) -> Result<String> {
 /// "Paired on open". The QR keeps the LAN address because a phone cannot use loopback; that path
 /// needs the bridge bound wider, which is a separate question from this one.
 pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
-    let ip = host.to_string();
-    let port = default_port();
-    // `ensure_token`, NOT `mint_token`. This minted a fresh 128-bit token on every call and never
-    // wrote it anywhere, so the QR — the screen that says "On your phone: scan the code below" —
-    // handed out a credential the bridge had never heard of. Every scan was rejected, and the
-    // rejection's own advice is "re-pair", which sends you back to this QR for another invalid
-    // one. Verified by running `mars qr` twice and getting two different tokens, neither matching
-    // `~/.mars/serve.token`.
-    let token = ensure_token()?;
-    let fp = daemon_fingerprint(session);
-    let endpoint = format!("ws://{ip}:{port}/ws");
-    Ok(format!(
-        "http://{ip}:{port}/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    ))
+    build_pair_link(session, Reach::Lan { ip: host })
 }
+
 
 /// `mars pair --desk` — the local link for the full-screen web terminal.
 ///
@@ -353,6 +390,18 @@ fn open_in_browser(url: &str) -> Result<()> {
 
 pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
+    // A QR NOBODY CAN REACH IS WORSE THAN NO QR. This printed a LAN address while the bridge was
+    // bound to loopback, so the code scanned, the phone dialled, and nothing answered — and the
+    // failure surfaced as "the host did not answer", which accuses the machine. Say it here, where
+    // it is knowable, instead of leaving it to be discovered by a phone.
+    if std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() {
+        println!();
+        println!("  This bridge is bound to loopback (MARS_BRIDGE_LOOPBACK is set), so a phone");
+        println!("  cannot reach it and a QR would point at an address that answers nothing.");
+        println!("  Unset it and restart the bridge, or use `mars pair` for the tunnel link.");
+        println!();
+        return Ok(());
+    }
     let url = lan_pair_url(&session)?;
 
     print_wordmark();
@@ -723,7 +772,7 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     // Bind localhost; cloudflared fronts it with a public https/wss URL, so the phone
     // (loading the app from Lovable over https) can reach this bridge over wss without a
     // LAN/cert dance.
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+    let listener = match TcpListener::bind((bind_host(), port)) {
         Ok(l) => l,
         // A bridge is already running (commonly the launchd agent owns :8787). Don't stand up a
         // second one — just reprint the pairing QR for the live tunnel, so `mars serve` doubles
