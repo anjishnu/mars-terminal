@@ -5350,6 +5350,13 @@ impl App {
                         self.status_msg = Some(format!("Tab renamed to '{name}'"));
                         tab.name = name;
                     }
+                    // ACCEPTING A SUGGESTION IS CHOOSING A NAME. The other three rename paths
+                    // settle and this one did not, so a name you pressed to accept was still
+                    // considered auto — the auto-namer could move it later, and the restore
+                    // manifest only writes down names a person chose, so it evaporated at the
+                    // next reboot while a typed name survived. Same act, two outcomes, and no
+                    // way to tell from the screen which kind of name you were looking at.
+                    self.auto_name_attempts.entry(id).or_default().settle();
                 }
             }
             Action::SplitHorizontal    => self.split_horizontal(),
