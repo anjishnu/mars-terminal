@@ -120,6 +120,24 @@ fn live_session_count() -> usize {
         .unwrap_or(0)
 }
 
+/// Can this bridge actually serve the Rover app, or only the socket?
+///
+/// A LAN link is a page URL: the browser fetches HTML from this bridge and the page then opens the
+/// socket. Without a built bundle the bridge answers every path with its own placeholder — "the
+/// WebSocket bridge is live" — so the link resolves, returns 200, and shows a stub. The socket was
+/// never the problem; there was no app at that address.
+///
+/// Checked rather than assumed, because I shipped a screen that offered the LAN door while this
+/// was false, and a 200 that is not the app is the most convincing kind of broken.
+///
+/// `index.html` specifically: this server matches exact files and has no SPA fallback, so a
+/// directory without an entry document cannot answer `/rover` whatever else is in it.
+fn serves_app() -> bool {
+    std::env::var_os("MARS_WEB_DIR")
+        .map(std::path::PathBuf::from)
+        .is_some_and(|d| d.join("index.html").is_file())
+}
+
 fn bind_host() -> &'static str {
     if std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() { "127.0.0.1" } else { "0.0.0.0" }
 }
@@ -449,6 +467,19 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
         println!("  This bridge is bound to loopback (MARS_BRIDGE_LOOPBACK is set), so a phone");
         println!("  cannot reach it and a QR would point at an address that answers nothing.");
         println!("  Unset it and restart the bridge, or use `mars pair` for the tunnel link.");
+        println!();
+        return Ok(());
+    }
+    // Reachable is not the same as useful. Without a bundle every path on this bridge returns its
+    // own placeholder, so the code scans, the page loads, returns 200, and is not Rover — which
+    // reads as the app being broken rather than as nothing having been built.
+    if !serves_app() {
+        println!();
+        println!("  This bridge has no app to serve, so a LAN QR would open a placeholder page");
+        println!("  rather than Rover — the socket is live, but a QR is a page URL.");
+        println!();
+        println!("  Point MARS_WEB_DIR at a directory containing index.html, or use");
+        println!("  `mars pair` for the hosted link, which brings its own app.");
         println!();
         return Ok(());
     }
@@ -1288,13 +1319,18 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
     // The caveats are measured, not generic: the tunnel line reports the probe that just ran, and
     // the LAN line reports whether this bridge is actually bound to the network.
     let app_url = pair_link(session, &base, "rover")?;
-    let lan = (!std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some())
+    // Offered only when both halves are true: the bridge accepts from the network AND it has an
+    // app to hand over. Either one alone is a link that connects to nothing a person can use.
+    let lan = (!std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() && serves_app())
         .then(|| lan_pair_url(session).ok())
         .flatten();
 
     // The QR is for a phone, so it encodes whichever door a phone can currently walk through. A
     // code that scans cleanly onto a blocked address is worse than no code: it looks like the
     // machine is broken rather than the network.
+    // If the tunnel is blocked and there is no LAN app, the QR necessarily points at something
+    // that will not work — but the tunnel link at least fails HONESTLY, with a network error,
+    // rather than rendering a stub that looks like Rover is broken.
     let (qr_url, qr_note) = match (&tunnel_fault, &lan) {
         (Some(_), Some(l)) => (l.clone(), "the LAN link — the tunnel is blocked from here"),
         _ => (app_url.clone(), "the tunnel link — works from any network"),
@@ -1334,6 +1370,15 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
     for (label, url, caveat) in doors {
         println!("  \x1b[1m{label}\x1b[0m  {caveat}");
         println!("  {url}");
+        println!();
+    }
+    // LABELLED ABSENCE. A door that is missing for a fixable reason should say the reason; leaving
+    // it out entirely is how somebody concludes the LAN path does not exist.
+    if lan.is_none() && !std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() {
+        println!("  \x1b[1msame wifi\x1b[0m  \x1b[38;5;208mnot available — this bridge has no app to serve\x1b[0m");
+        println!("  \x1b[38;5;244mThe socket is live, but a LAN link is a page URL and there is no built");
+        println!("  bundle behind it. Point MARS_WEB_DIR at a directory containing index.html");
+        println!("  and this door appears.\x1b[0m");
         println!();
     }
     Ok(())
