@@ -941,6 +941,34 @@ impl App {
     /// in `tabs` that every close shifts. An index that crossed the wire can name a different
     /// workspace by the time it lands, and renaming the wrong one is silent. A pane id never
     /// means anything but the pane it was minted for.
+    /// Did a PERSON name this tab, or is it still auto-named?
+    ///
+    /// `settle()` is what a manual rename calls to opt out of auto-naming, so that flag already
+    /// carries the answer — exposed as a question rather than the map so the restore path and the
+    /// auto-namer cannot come to disagree about what "named" means.
+    pub fn tab_manually_named(&self, tab_id: crate::tab::TabId) -> bool {
+        self.auto_name_attempts.get(&tab_id).map(|a| a.done).unwrap_or(false)
+    }
+
+    /// Name the tab being restored right now — the one `restore_workspace` just built.
+    ///
+    /// By pane rather than by index everywhere else in this file, but the restore loop has no pane
+    /// to hand: it has just created the workspace and the focused tab IS the one it made.
+    pub fn rename_current_workspace(&mut self, to: &str) {
+        let to = to.trim();
+        if to.is_empty() {
+            return;
+        }
+        let idx = self.active_tab;
+        if let Some(t) = self.tabs.get_mut(idx) {
+            let id = t.id;
+            t.name = to.to_string();
+            // Opt out of auto-naming, exactly as a live rename does — otherwise the restored name
+            // is overwritten by the first auto-name tick and the reboot loses it a second way.
+            self.auto_name_attempts.entry(id).or_default().settle();
+        }
+    }
+
     pub fn rename_workspace_of_pane(&mut self, pane: PaneId, to: &str) -> bool {
         let to = to.trim();
         if to.is_empty() {
@@ -1386,6 +1414,20 @@ impl App {
             "health": self.health.line(), // ambient host stats for the phone's console
             "cwd": cwd,
             "daemon": {
+                // WHO THIS DAEMON IS, on every connect.
+                //
+                // A client stores the `id` out of the pairing link and then depends on it —
+                // to key its saved row, and to group rows that share a host's token. That made a
+                // LABEL load-bearing, and the label turned out to be mutable: when the machine id
+                // stopped being derived from `$HOSTNAME` (empty on macOS, so every machine
+                // answered to `lan`) every previously saved row was left holding an identity this
+                // host no longer answers to, with no way to learn the new one.
+                //
+                // So the host states it, every time, and the client reconciles. An identity change
+                // can orphan a client exactly once now — until its next successful connection,
+                // which is also the moment it is proven reachable.
+                "id": self.session_name.as_deref().map(crate::session::daemon_fingerprint),
+                "machine": crate::session::machine_id(),
                 "version": env!("CARGO_PKG_VERSION"),
                 "startedTs": started,
                 "binaryMtime": binary_mtime,
@@ -2185,7 +2227,7 @@ impl App {
         }
         let msg = crate::briefs::assignment(brief, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
-            t.send_bytes(crate::briefs::typed_bytes(&msg).as_bytes());
+            t.send_bytes(crate::briefs::manager_bytes(&msg).as_bytes());
         }
         Ok(())
     }
@@ -2228,6 +2270,7 @@ impl App {
         &mut self,
         pane_id: crate::pane::PaneId,
         title: &str,
+        decisions: &[crate::session::PriorDecision],
     ) -> Result<String, String> {
         let title = title.trim();
         if title.is_empty() {
@@ -2252,9 +2295,19 @@ impl App {
         let repo = self.terms.get(&tid).and_then(|t| t.spawn_cwd.clone());
         let (id, _path) =
             crate::briefs::create(title, ts, repo.as_deref()).map_err(|e| e.to_string())?;
+        // What was settled in conversation, written down BEFORE the planner is pointed at the
+        // brief — so it reads them as binding rather than re-deriving them and re-opening the
+        // argument that produced them.
+        if !decisions.is_empty() {
+            if let Some(dir) = crate::briefs::dir().map(|d| d.join(&id)) {
+                if let Err(e) = crate::briefs::record_prior(&dir, decisions) {
+                    crate::session::debug_log(&format!("[brief] prior decisions not written: {e}"));
+                }
+            }
+        }
         let msg = crate::briefs::draft_assignment(&id, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
-            t.send_bytes(crate::briefs::typed_bytes(&msg).as_bytes());
+            t.send_bytes(crate::briefs::manager_bytes(&msg).as_bytes());
         }
         Ok(id)
     }
@@ -5297,6 +5350,13 @@ impl App {
                         self.status_msg = Some(format!("Tab renamed to '{name}'"));
                         tab.name = name;
                     }
+                    // ACCEPTING A SUGGESTION IS CHOOSING A NAME. The other three rename paths
+                    // settle and this one did not, so a name you pressed to accept was still
+                    // considered auto — the auto-namer could move it later, and the restore
+                    // manifest only writes down names a person chose, so it evaporated at the
+                    // next reboot while a typed name survived. Same act, two outcomes, and no
+                    // way to tell from the screen which kind of name you were looking at.
+                    self.auto_name_attempts.entry(id).or_default().settle();
                 }
             }
             Action::SplitHorizontal    => self.split_horizontal(),

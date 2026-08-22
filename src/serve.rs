@@ -80,6 +80,50 @@ fn mint_token() -> Result<String> {
 /// (a launchd relaunch keeps the same token → paired phones reconnect with no re-scan). It's what
 /// the bridge validates each phone's `{t:"auth"}` frame against; `mars serve --reset` rotates it,
 /// which refuses stale tokens and drops every connected phone.
+/// What the bridge listens on.
+///
+/// Loopback only, until now — and `mars qr` has been advertising a LAN address the whole time.
+/// The QR's entire purpose is a phone on the same wifi, so the feature could not work in the only
+/// situation it exists for, and the tunnel-blocked message even recommends it as the fallback. A
+/// capability that is advertised and unserved is worse than one that is absent.
+///
+/// So the bridge accepts from the network by default. What guards it is what has always guarded
+/// it: a 128-bit token, compared in constant time, now refused out loud. That is the same posture
+/// as the tunnel — which has been exposing this bridge to the entire internet — so binding to a
+/// home LAN is a reduction in reach, not an increase.
+///
+/// `MARS_BRIDGE_LOOPBACK=1` restores loopback-only for anyone who wants it; `mars qr` then says
+/// the QR cannot work rather than printing one that silently does not.
+/// How many sessions this machine is running — for the sentence `--all` prints, so it states a
+/// number rather than a promise.
+/// WHAT THIS LINK SHARES, said on every screen that prints one.
+///
+/// The difference is one invisible fragment key and it decides whether the other end ends up
+/// holding one session or the whole machine. Both pair screens call this, because two screens
+/// saying it separately is the same shape as two builders making the link separately — and that
+/// one drifted until the QR was handing out tokens the bridge had never stored.
+fn print_scope_line() {
+    if std::env::var_os("MARS_PAIR_ALL").is_some() {
+        let n = live_session_count().max(1);
+        println!();
+        println!("  \x1b[38;5;208mThis link shares all {n} sessions on this machine\x1b[0m, not just the one named in it.");
+    } else {
+        println!("  \x1b[38;5;244m`mars pair --all`   share every session on this machine\x1b[0m");
+    }
+}
+
+fn live_session_count() -> usize {
+    crate::session::socket_dir()
+        .ok()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "sock")).count())
+        .unwrap_or(0)
+}
+
+fn bind_host() -> &'static str {
+    if std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() { "127.0.0.1" } else { "0.0.0.0" }
+}
+
 fn token_file() -> Option<std::path::PathBuf> {
     crate::sys::paths::home_dir().map(|h| h.join(".mars").join("serve.token"))
 }
@@ -144,13 +188,63 @@ fn daemon_fingerprint(session: &str) -> String {
 /// bad thing to have four copies of. Two of them had already drifted: `--open` was handing out a
 /// loopback address the hosted app cannot dial, and `mars qr` a LAN address the bridge does not
 /// even listen on.
-pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String> {
-    let endpoint = format!("{}/ws", tunnel_base.replacen("https://", "wss://", 1));
+/// How a client will reach this bridge. The only thing that differs between pairing links.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Reach<'a> {
+    /// Through the tunnel, to the hosted app. Works from anywhere the tunnel is not blocked.
+    Tunnel { base: &'a str, route: &'a str },
+    /// Straight at this machine over the LAN, page and socket both served by the bridge.
+    Lan { ip: &'a str },
+}
+
+/// THE pairing link. One builder, because there was more than one and they drifted.
+///
+/// `mars pair` and `mars qr` each grew their own, and the divergence was not cosmetic: the QR's
+/// copy called `mint_token` where this one calls `ensure_token`, so it handed out a credential the
+/// bridge had never stored and every scan was refused. Two functions that must agree about a token,
+/// a fragment format, a route and a protocol version will eventually not, and the one that drifts
+/// is the one nobody is looking at.
+///
+/// The reach is the only real difference, so it is the only parameter.
+pub fn build_pair_link(session: &str, reach: Reach<'_>) -> Result<String> {
+    build_pair_link_all(session, reach, false)
+}
+
+/// The same link, optionally offering the WHOLE MACHINE rather than one session.
+///
+/// A token has always been host-wide — one `~/.mars/serve.token`, one endpoint, and
+/// `sessions.list` will name every session to anyone holding it. So `all` grants no access that
+/// the link did not already carry; it says the person who ran `mars pair` MEANT to share the
+/// machine, and the client adopts every session instead of making somebody discover and tap each
+/// one. Being explicit matters because the two readings have different blast radii and the link
+/// looked identical either way.
+pub fn build_pair_link_all(session: &str, reach: Reach<'_>, all: bool) -> Result<String> {
+    // ONE TOKEN, from the file the bridge validates against. Never minted here — a link is a
+    // reference to a credential this machine already holds, not an occasion to invent one.
     let token = ensure_token()?;
     let fp = daemon_fingerprint(session);
-    Ok(format!(
-        "https://mars-terminal.lovable.app/{route}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    ))
+    let (page, endpoint) = match reach {
+        Reach::Tunnel { base, route } => (
+            format!("https://mars-terminal.lovable.app/{route}"),
+            format!("{}/ws", base.replacen("https://", "wss://", 1)),
+        ),
+        Reach::Lan { ip } => {
+            let port = default_port();
+            (format!("http://{ip}:{port}/rover"), format!("ws://{ip}:{port}/ws"))
+        }
+    };
+    // Appended last and only when set, so a link for one session is byte-identical to what it
+    // has always been — an older client parses it exactly as before.
+    let all = if all { "&all=1" } else { "" };
+    Ok(format!("{page}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1{all}"))
+}
+
+pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String> {
+    build_pair_link_all(
+        session,
+        Reach::Tunnel { base: tunnel_base, route },
+        std::env::var_os("MARS_PAIR_ALL").is_some(),
+    )
 }
 
 /// The three routes in, named by where the reader is standing rather than by mechanism.
@@ -162,6 +256,7 @@ pub fn print_routes() {
     println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
     println!("  \x1b[1mOn your phone\x1b[0m        scan the code below     camera at the QR");
     println!("  \x1b[1mAnother computer\x1b[0m     paste the link below    any network");
+    print_scope_line();
     println!();
 }
 
@@ -177,15 +272,9 @@ pub fn lan_pair_url(session: &str) -> Result<String> {
 /// "Paired on open". The QR keeps the LAN address because a phone cannot use loopback; that path
 /// needs the bridge bound wider, which is a separate question from this one.
 pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
-    let ip = host.to_string();
-    let port = default_port();
-    let token = mint_token()?;
-    let fp = daemon_fingerprint(session);
-    let endpoint = format!("ws://{ip}:{port}/ws");
-    Ok(format!(
-        "http://{ip}:{port}/rover#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1"
-    ))
+    build_pair_link(session, Reach::Lan { ip: host })
 }
+
 
 /// `mars pair --desk` — the local link for the full-screen web terminal.
 ///
@@ -347,7 +436,23 @@ fn open_in_browser(url: &str) -> Result<()> {
 
 pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     let session = resolve_session(session_arg)?;
-    let url = lan_pair_url(&session)?;
+    // A QR NOBODY CAN REACH IS WORSE THAN NO QR. This printed a LAN address while the bridge was
+    // bound to loopback, so the code scanned, the phone dialled, and nothing answered — and the
+    // failure surfaced as "the host did not answer", which accuses the machine. Say it here, where
+    // it is knowable, instead of leaving it to be discovered by a phone.
+    if std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() {
+        println!();
+        println!("  This bridge is bound to loopback (MARS_BRIDGE_LOOPBACK is set), so a phone");
+        println!("  cannot reach it and a QR would point at an address that answers nothing.");
+        println!("  Unset it and restart the bridge, or use `mars pair` for the tunnel link.");
+        println!();
+        return Ok(());
+    }
+    // `--all` on the screen that hands a link to a phone. Read from the environment rather than
+    // threaded through five signatures: it is one bit, set once by the CLI arm for this process,
+    // and every printer of a link needs it or none do.
+    let all = std::env::var_os("MARS_PAIR_ALL").is_some();
+    let url = build_pair_link_all(&session, Reach::Lan { ip: &lan_ip() }, all)?;
 
     print_wordmark();
     println!();
@@ -362,6 +467,7 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
     println!("  \x1b[1mOn your phone\x1b[0m        scan the code below     same wifi as this machine");
     println!("  \x1b[1mAnother computer\x1b[0m     paste the link below    any network, via the tunnel");
+    print_scope_line();
     println!();
     print_qr(&url);
     println!();
@@ -717,7 +823,7 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     // Bind localhost; cloudflared fronts it with a public https/wss URL, so the phone
     // (loading the app from Lovable over https) can reach this bridge over wss without a
     // LAN/cert dance.
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
+    let listener = match TcpListener::bind((bind_host(), port)) {
         Ok(l) => l,
         // A bridge is already running (commonly the launchd agent owns :8787). Don't stand up a
         // second one — just reprint the pairing QR for the live tunnel, so `mars serve` doubles
@@ -1025,6 +1131,10 @@ fn brief_rows() -> Vec<serde_json::Value> {
                 // `decisions` carries the same design with its ALTERNATIVES intact — you cannot
                 // override an option you cannot see. `forks` stays alongside so a client older
                 // than this field degrades to the line it already rendered rather than to nothing.
+                // THE IDEA LEADS. The card shows this and a count of the decisions; the rulings
+                // themselves belong on the surface where they are argued with, not on one that is
+                // scanned.
+                "idea": b.idea,
                 "forks": b.forks, "verify": b.verify,
                 "decisions": decisions.iter().map(|d| serde_json::json!({
                     "id": d.id, "layer": d.layer, "question": d.question,
@@ -1403,6 +1513,27 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                         // A beat before refusing: the token is 128 bits so brute force is a
                         // fantasy, but a guessing loop gets nothing for free either.
                         thread::sleep(Duration::from_millis(250));
+                        // SAY WHY. This closed silently, and the client's own comment says "the
+                        // bridge refuses loudly … carry its own words rather than guessing from a
+                        // close code" — but nothing here has ever sent that frame, so the client
+                        // fell into its fallback and GUESSED "the pairing token may have been
+                        // rotated" for every socket that opened and closed. That guess is right
+                        // sometimes and unfalsifiable always, and it is the sentence a person then
+                        // acts on.
+                        //
+                        // Measured before this line: a bad token closed at 257ms with zero frames
+                        // and close code 1006 — indistinguishable from a wedged host.
+                        let _ = ws.send(Message::Text(
+                            serde_json::json!({
+                                "t": "bye",
+                                "message": "this link's token is not the one this bridge holds — \
+                                            it was minted by a different bridge, or rotated since. \
+                                            `mars pair` on the host prints a current link.",
+                            })
+                            .to_string()
+                            .into(),
+                        ));
+                        let _ = ws.flush();
                         return Ok(());
                     }
                     AuthCheck::Other => {} // subscribe before auth → keep waiting
@@ -2288,6 +2419,9 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some("mirror") => {
             let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(120).clamp(20, 400) as u16;
             let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(32).clamp(8, 200) as u16;
+            // WHERE THIS MIRROR IS. Forwarded verbatim; the daemon decides what it means. An
+            // absent field is a client older than it, not a phone.
+            let surface = v.get("surface").and_then(|x| x.as_str()).map(|x| x.to_string());
             // ONE MIRROR PER BROWSER, REPLACED RATHER THAN STACKED.
             //
             // A resize re-sends `mirror` at the new size, and the daemon's handshake is once per
@@ -2305,7 +2439,7 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 return;
             };
             let mut w = match sock.try_clone() { Ok(w) => w, Err(_) => return };
-            if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows }).is_err() {
+            if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows, surface: surface.clone() }).is_err() {
                 return;
             }
             // Kept so `mirror.key` can write to the same connection the frames come from — a
@@ -2407,14 +2541,60 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let rows = brief_rows();
             let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": rows}).to_string());
         }
+        // THE DOCUMENT ITSELF. "Read it" expanded to show the brief's ID, which is the one fact
+        // about a brief nobody needs — the design, the acceptance criteria and the out-of-scope
+        // list all stayed in a file on a machine you are not sitting at. Approving something you
+        // cannot read is the failure this whole surface exists to prevent.
+        Some("brief.archive") => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let out = match crate::briefs::archive(id) {
+                Ok(_) => serde_json::json!({"t": "brief.archived", "id": id}),
+                Err(e) => serde_json::json!({"t": "brief.archived", "id": id, "error": e.to_string()}),
+            };
+            crate::manager::record_client_event("act", &v, crate::worklog::now_secs());
+            let _ = tx.send(out.to_string());
+            // The board is the source of truth for what the card renders, so re-read it rather
+            // than dropping the row client-side.
+            let _ = tx.send(serde_json::json!({"t": "brief.board", "briefs": brief_rows()}).to_string());
+        }
+        Some("brief.read") => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let out = match crate::briefs::dir().filter(|_| crate::briefs::safe_id(id)) {
+                Some(d) => {
+                    let read = |f: &str| std::fs::read_to_string(d.join(id).join(f)).ok();
+                    match read("brief.md") {
+                        Some(md) => serde_json::json!({
+                            "t": "brief.doc", "id": id, "md": md,
+                            // Sent alongside rather than fetched separately: they are read
+                            // together or not at all, and a second round trip is a second way for
+                            // half the story to arrive.
+                            "report": read("completed.md"),
+                            "review": read("review.md"),
+                        }),
+                        None => serde_json::json!({"t": "brief.doc", "id": id, "error": "no brief.md"}),
+                    }
+                }
+                None => serde_json::json!({"t": "brief.doc", "id": id, "error": "bad brief id"}),
+            };
+            let _ = tx.send(out.to_string());
+        }
         Some("brief.draft") => {
             if let (Some(pane), Some(title)) = (
                 v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()),
                 v.get("title").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty()),
             ) {
                 crate::manager::record_client_event("act", &v, crate::worklog::now_secs());
+                // WHAT THE ARGUMENT SETTLED, carried with the title. Optional: a draft pressed
+                // from a board rather than out of a conversation still sends none, and the planner
+                // derives everything as it always did.
+                let decisions: Vec<session::PriorDecision> = v
+                    .get("decisions")
+                    .and_then(|d| serde_json::from_value(d.clone()).ok())
+                    .unwrap_or_default();
                 let _ = session::write_frame(writer, &ClientFrame::DraftBrief {
-                    pane, title: title.chars().take(160).collect(),
+                    pane,
+                    title: title.chars().take(160).collect(),
+                    decisions,
                 });
             }
         }
@@ -2678,6 +2858,11 @@ fn manager_view_json(want: &str, session: &str) -> String {
         "manager.memos" => serde_json::json!({ "memos": v["memos"] }),
         "manager.health" => serde_json::json!({
             "agentEnabled": v["agentEnabled"], "agentRuns": v["agentRuns"],
+            // WHICH CONVERSATION THE MANAGER IS HAVING, forwarded so a client can render it as a
+            // workspace of its own. This projection names every field it passes on, so a field
+            // added to the index and not added here arrives nowhere — which is what happened on
+            // the first attempt, and is the same shape of bug as the duplicated brief-row builder.
+            "agentChat": v["agentChat"], "agentChatAt": v["agentChatAt"],
             // Rover's own readiness. The mark is gated on this so the control appears when it can
             // be used — a button that does nothing for four seconds teaches people it is broken.
             // `ready` is kept alongside `state` so a phone running an older bundle — which knows

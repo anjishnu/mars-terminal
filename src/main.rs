@@ -723,6 +723,57 @@ fn main() -> Result<()> {
                     println!("  {}", path.display());
                     println!("  acceptance is the unmet subset; decisions inherited whole.");
                 }
+                // THE ENTRY TO THE LOOP. Nothing originated work before this: every round began
+                // with a person typing a title, so "walk a line of code back to the observation
+                // that started it" failed at the first hop.
+                // OUT OF THE WAY, NOT GONE. A brief carries the argument that produced it, and
+                // the one thing you want when a decision resurfaces months later is the document
+                // that settled it.
+                "archive" => {
+                    let id = args.next().unwrap_or_default();
+                    if id.is_empty() {
+                        anyhow::bail!("usage: mars brief archive <brief-id>");
+                    }
+                    let to = briefs::archive(&id)?;
+                    println!("  {}", to.display());
+                    println!("  moved, not deleted — `mv` it back to un-archive.");
+                }
+                "review" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    if !dir.join("brief.md").exists() {
+                        anyhow::bail!("usage: mars brief review <brief-id>");
+                    }
+                    let objections = briefs::review(&dir)?;
+                    if objections.is_empty() {
+                        println!("  nothing to refute.");
+                    } else {
+                        for o in &objections {
+                            println!("  {o}");
+                        }
+                    }
+                    println!("\n  {} objection(s) → {}", objections.len(), dir.join("review.md").display());
+                    println!("  it annotates; it does not gate.");
+                }
+                "nominate" => {
+                    let session = args.next().unwrap_or_default();
+                    let pane = args.next().unwrap_or_else(|| "0".into());
+                    let headline = args.collect::<Vec<_>>().join(" ");
+                    if session.is_empty() || headline.trim().is_empty() {
+                        anyhow::bail!("usage: mars brief nominate <session> <pane> \"<headline>\"");
+                    }
+                    let path = briefs::nominate(
+                        &session,
+                        &pane,
+                        headline.trim(),
+                        "Nominated by Rover from the session snapshot cited above.",
+                        worklog::now_secs(),
+                    )?;
+                    println!("  {}", path.display());
+                    println!("  kind: nomination — it cites the snapshot it was read out of.");
+                }
                 "worker" => {
                     println!(
                         "Run this in the pane you want to work in, then assign a brief to it:\n\n  {}",
@@ -808,7 +859,7 @@ fn main() -> Result<()> {
                     let frame = if sub == "assign" {
                         session::ClientFrame::AssignBrief { pane, brief: a.clone() }
                     } else {
-                        session::ClientFrame::DraftBrief { pane, title: a.clone() }
+                        session::ClientFrame::DraftBrief { pane, title: a.clone(), decisions: Vec::new() }
                     };
                     session::write_frame(&mut w, &frame)?;
                     // WAIT FOR THE DAEMON TO SAY IT TOOK IT. The first version printed "sent" the
@@ -908,6 +959,13 @@ fn main() -> Result<()> {
             let has = |f: &str| rest.iter().any(|a| a == f);
             let reset = has("--reset") || rest.iter().any(|a| a == "reset");
             let session = rest.iter().find(|a| !a.starts_with('-') && *a != "reset").cloned();
+            // SHARE THE MACHINE, NOT ONE SESSION. A token has always been host-wide, so this
+            // grants no reach the link did not already carry — it states that sharing the whole
+            // machine is what was MEANT, and the client then adopts every session instead of
+            // making somebody discover and tap each one.
+            if has("--all") {
+                std::env::set_var("MARS_PAIR_ALL", "1");
+            }
             if has("--check") {
                 return serve::check_main(session);
             }
@@ -3292,7 +3350,7 @@ fn selfcheck() -> Result<()> {
                 // The owner is 100x30 (see `TestClient::connect`).
                 let mirror = crate::sys::control::connect(&bpath)?;
                 let mut mw = mirror.try_clone()?;
-                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 64, rows: 20 })?;
+                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 64, rows: 20 , surface: None })?;
                 std::thread::sleep(std::time::Duration::from_millis(400));
 
                 // 1. The owner was not told to go away.
@@ -7323,8 +7381,8 @@ fn selfcheck() -> Result<()> {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("meta.json"), r#"{"name":"__sc_wid__"}"#)?;
             let panes = vec![
-                session::RestoredPane { wid: "111-alpha".into(), cwd: "/a".into(), agent: false, chat: None },
-                session::RestoredPane { wid: "222-beta".into(), cwd: "/b".into(), agent: false, chat: None },
+                session::RestoredPane { wid: "111-alpha".into(), cwd: "/a".into(), agent: false, chat: None, name: None },
+                session::RestoredPane { wid: "222-beta".into(), cwd: "/b".into(), agent: false, chat: None, name: None },
             ];
             session::write_restore("__sc_wid__", &panes);
             let back = session::read_restore("__sc_wid__");
@@ -7339,8 +7397,8 @@ fn selfcheck() -> Result<()> {
             // the id, the rest come back blank and mint fresh. Two workspaces answering to one
             // set of files is worse than one workspace losing its history once.
             let dup = vec![
-                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None },
-                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None },
+                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None, name: None },
+                session::RestoredPane { wid: "1-code".into(), cwd: "/c".into(), agent: false, chat: None, name: None },
             ];
             session::write_restore("__sc_wid__", &dup);
             let back = session::read_restore("__sc_wid__");
@@ -8256,6 +8314,7 @@ fn selfcheck() -> Result<()> {
                 cwd: cwd.to_string(),
                 agent,
                 chat: chat.map(String::from),
+                name: None,
             };
             let plan = session::restore_plan(&[
                 p("/repo", true, Some("aaaa-bbbb")),   // known id — exact
@@ -8701,6 +8760,19 @@ fn selfcheck() -> Result<()> {
             assert!(session::parse_pair_link("#h=wss://h/ws&id=x").is_none(), "no token, no link");
             // Whitespace survives a terminal wrapping the line across two.
             assert!(session::parse_pair_link("  https://x/r#h=wss://h/ws&id=i&t=t&s=s  ").is_some());
+
+            // ── MANAGER-ISSUED TEXT IS WATERMARKED ───────────────────────────────────────────
+            //
+            // A pane's scrollback is an agent's memory, and an instruction MARS typed on your
+            // behalf used to be indistinguishable from one you typed yourself. The mark leads,
+            // because a reader scanning a transcript sees the start of a line.
+            let m = briefs::manager_bytes("First read X. Then read Y. Start building.");
+            assert!(m.starts_with(&format!("\x1b[200~{} ", briefs::MANAGER_MARK)),
+                "the watermark leads the line, inside the bracketed paste");
+            // Still ONE bracketed line ending in \r — the only shape that actually sends. The
+            // watermark must not have turned an assignment into a paste that sits there.
+            assert!(m.ends_with("\x1b[201~\r"), "still a sent line, not a parked paste");
+            assert_eq!(m.matches('\n').count(), 0, "still one line");
             assert!(!serve::ct_eq(b"", b"x"));
         }
         #[cfg(feature = "web")]
@@ -9274,6 +9346,7 @@ fn selfcheck() -> Result<()> {
         // A brief with no runnable repo REPORTS that, rather than passing quietly. A missing exit
         // code and a zero one are opposite facts.
         let ghost = briefs::Brief {
+            idea: None,
             id: "brief-9-verify".into(), title: "t".into(), state: briefs::State::Draft,
             priority: 0, branch: None, addresses: vec![], created_ts: 1,
             forks: vec![], report: None,

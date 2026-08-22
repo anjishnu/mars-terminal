@@ -37,6 +37,25 @@ pub const RUNTIME_DIR_ENV: &str = "MARS_RUNTIME_DIR";
 
 // ── Protocol ─────────────────────────────────────────────────────────────────
 
+/// A decision settled in conversation, carried into the brief the planner is about to write.
+///
+/// **This is the field the loop was missing.** `brief.draft` sent a title, so the argument you had
+/// just finished evaporated and the planner started from nothing — the disagreement you settled at
+/// 11pm came back in three weeks, to a worker with no idea it had ever been settled.
+///
+/// It lands in `## Decisions already made`, which the brief format already declares BINDING on the
+/// worker, and which `parse_made` already reads. No new file, no new state, and the planner
+/// receives these as settled rather than re-deriving them.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PriorDecision {
+    pub question: String,
+    pub chose: String,
+    #[serde(default)]
+    pub rejected: Option<String>,
+    #[serde(default)]
+    pub why: String,
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum ClientFrame {
     Hello {
@@ -84,7 +103,22 @@ pub enum ClientFrame {
     /// right for "I moved to another terminal" and catastrophic for "I opened a browser tab".
     /// A mirror renders the same frames to another screen and owns nothing: no ownership, no
     /// eviction, no `Exit` to anybody.
-    Mirror { cols: u16, rows: u16 },
+    Mirror {
+        cols: u16,
+        rows: u16,
+        /// WHICH SURFACE this mirror is, so the size policy can tell them apart.
+        ///
+        /// `"desk"` is a browser being worked in and may claim the grid; `"phone"` is a second
+        /// pair of eyes and must not — "the target that typed last decides" is right between a
+        /// terminal and a desktop browser and a footgun with a phone in it, because answering one
+        /// prompt from a pocket would reshape a 211-column session down to 40 and reflow every
+        /// full-screen program in it.
+        ///
+        /// Absent means a client that predates this field. Those are treated as a plain terminal
+        /// — the behaviour they were written against — rather than guessed at.
+        #[serde(default)]
+        surface: Option<String>,
+    },
     /// Keystrokes from a mirror, as the bytes a terminal would send.
     ///
     /// A mirror types without owning: no gen, no ownership check, no eviction. That is not a new
@@ -94,7 +128,13 @@ pub enum ClientFrame {
     /// Mint an empty brief and set the planner in a pane drafting it. Same argument as
     /// `AssignBrief` for why the daemon does this rather than the bridge: the scope check needs a
     /// pid. The title travels because it is the one thing only the person pressing knows.
-    DraftBrief { pane: usize, title: String },
+    DraftBrief {
+        pane: usize,
+        title: String,
+        /// Defaulted, so a client or daemon that predates this field still speaks the frame.
+        #[serde(default)]
+        decisions: Vec<PriorDecision>,
+    },
     /// Pane-targeted raw input from a Rover subscriber (answering a `[y/N]`) — written
     /// straight to that pane's terminal, WITHOUT taking over the session.
     PaneInput { pane: usize, data: String },
@@ -823,10 +863,14 @@ enum SrvEvent {
     AssignBrief { pane: usize, brief: String },
     /// Mint a brief and set a planner drafting it — refused unless that agent carries the planner
     /// scope.
-    DraftBrief { pane: usize, title: String },
+    DraftBrief {
+        pane: usize,
+        title: String,
+        decisions: Vec<PriorDecision>,
+    },
     /// A second render target joined. Carries its own stream and size: one `Terminal` has one
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
-    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64 },
+    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64, surface: Option<String> },
     MirrorKeys { data: String, id: u64 },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
@@ -1011,6 +1055,9 @@ static MIRROR_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// A second render target. Owns nothing — not the session, and not its size.
 struct MirrorTarget {
+    /// Which surface this mirror is — see `ClientFrame::Mirror::surface`. `None` for a client
+    /// older than the field, which is treated as a plain terminal.
+    surface: Option<String>,
     id: u64,
     term: Terminal<CrosstermBackend<FrameWriter>>,
     /// A private handle on the same socket, for the frames that are not rendered bytes.
@@ -1052,11 +1099,22 @@ fn grid_size(
         return fallback();
     }
     match last {
-        // The mirror that was typed into, if it is still attached. A mirror that has since gone
-        // decides nothing — falling back is not a lost preference, it is the absence of a target.
+        // The mirror that was typed into, if it is still attached AND is a surface allowed to
+        // claim the grid. A mirror that has since gone decides nothing — falling back is not a
+        // lost preference, it is the absence of a target.
+        //
+        // NOT EVERY SURFACE MAY RESHAPE THE SESSION. "The target typed into last decides" is
+        // right between a terminal and a desktop browser, which are comparable screens, and a
+        // footgun with a phone in it: answering one `[y/N]` from a pocket would drag a
+        // 211-column session down to 40 and reflow every full-screen program running in it. A
+        // phone is a second pair of eyes and one thumb, not a new window size.
+        //
+        // `None` — a client older than the field — keeps the old behaviour rather than being
+        // guessed at, because that is what it was written against.
         Some(LastInput::Mirror(id)) => mirrors
             .iter()
             .find(|m| m.id == id)
+            .filter(|m| m.surface.as_deref() != Some("phone"))
             .map(|m| (m.cols, m.rows))
             .or_else(fallback),
         Some(LastInput::Owner) | None => fallback(),
@@ -1186,6 +1244,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // this workspace, and its conversation gist, would be looked up under an id that
                 // now belongs to whichever pane happened to land in the same position.
                 app.restore_workspace(std::path::Path::new(&p.cwd), start, &p.wid);
+                // AND THE NAME A PERSON CHOSE. Applied after the workspace exists, and only when
+                // the manifest carries one — a pane that was auto-named stays auto-named, so the
+                // label keeps following what the pane is doing. Without this the rename worked on
+                // screen and evaporated at the next reboot, which reads as the reboot renaming
+                // things rather than as a rename that was never written down.
+                if let Some(n) = p.name.as_deref().filter(|n| !n.is_empty()) {
+                    app.rename_current_workspace(n);
+                }
             }
             app.clear_startup_cwd();
             // The manifest just consumed becomes read-only until its promise is delivered —
@@ -1338,11 +1404,24 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     // mirror that is not the grid's size is seeing a crop, and it cannot work
                     // that out from bytes that are a valid frame of a screen it has never been
                     // told the size of.
+                    // WHOSE SIZE THIS IS, from THIS mirror's point of view.
+                    //
+                    // It reported `client_size.is_some()` — "a TUI client exists somewhere" — which
+                    // is true for the entire life of a normal session and says nothing about whose
+                    // shape the grid currently has. A mirror that had just claimed the grid by
+                    // being typed into was still told the size was the desk's, so it went on
+                    // letterboxing a grid that was already its own: the fit stayed inexact no
+                    // matter what the client did, because the fact it was reacting to was a
+                    // different fact than the one it needed.
+                    //
+                    // The question a mirror is actually asking is "is this MY size" — so the
+                    // answer is computed against the same `last` that decided the grid.
+                    let mine = matches!(last_input, Some(LastInput::Mirror(id)) if id == m.id);
                     if m.announced != Some(grid_dims) {
                         let frame = ServerFrame::GridSize {
                             cols: grid_dims.0,
                             rows: grid_dims.1,
-                            desk: client_size.is_some(),
+                            desk: !mine,
                         };
                         if write_frame(&mut m.sock, &frame).is_err() {
                             return false;
@@ -1451,7 +1530,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 push_mobile(&mut app, &mut subscribers);
                 last_mobile_push = Some(std::time::Instant::now());
             }
-            Ok(SrvEvent::Mirror { stream, cols, rows, id }) => {
+            Ok(SrvEvent::Mirror { stream, cols, rows, id, surface }) => {
                 // NOTHING IS EVICTED. No `client` assignment, no `send_exit`, no `attached` flag.
                 // That is the whole property, and the selfcheck asserts it by watching the
                 // client's socket rather than by reading this code.
@@ -1463,6 +1542,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     Ok(mut m) => {
                         let _ = m.clear();
                         mirrors.push(MirrorTarget {
+                            surface,
                             id,
                             term: m,
                             sock,
@@ -1511,10 +1591,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     Err(why) => app.write_to_pane(pane, &format!("\r# mars: {why}\r")),
                 }
             }
-            Ok(SrvEvent::DraftBrief { pane, title }) => {
+            Ok(SrvEvent::DraftBrief { pane, title, decisions }) => {
                 // Same gate, other role. The refusal is written into the pane rather than dropped
                 // for the same reason: a press whose failure is invisible reads as a broken app.
-                match app.draft_brief_on_pane(pane, &title) {
+                match app.draft_brief_on_pane(pane, &title, &decisions) {
                     Ok(_id) => {}
                     Err(why) => app.write_to_pane(pane, &format!("\r# mars: {why}\r")),
                 }
@@ -1723,7 +1803,12 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         // The conversation id, while the process is still alive to be asked. After
                         // the reboot there is nothing left to ask.
                         let chat = agent.then(|| term.foreground_pid().and_then(claude_session_of)).flatten();
-                        Some(RestoredPane { wid: term.wid.clone(), cwd, agent, chat })
+                        // Only a name a PERSON set. `settle()` marks a tab as manually named —
+                        // the same flag that stops auto-naming from overwriting it here — so the
+                        // two agree about what "named" means instead of guessing from the string.
+                        let named = app.tab_manually_named(t.id);
+                        let name = named.then(|| t.name.clone()).filter(|n| !n.is_empty());
+                        Some(RestoredPane { wid: term.wid.clone(), cwd, agent, chat, name })
                     })
                     .collect();
                 let agents_now = shape.iter().filter(|p| p.agent).count();
@@ -1946,12 +2031,16 @@ fn client_connection(
             let _ = send_exit(&stream, &format!("{brief} sent to pane {pane}"));
             return;
         }
-        Ok(ClientFrame::DraftBrief { pane, title }) => {
-            let _ = tx.send(SrvEvent::DraftBrief { pane: *pane, title: title.clone() });
+        Ok(ClientFrame::DraftBrief { pane, title, decisions }) => {
+            let _ = tx.send(SrvEvent::DraftBrief {
+                pane: *pane,
+                title: title.clone(),
+                decisions: decisions.clone(),
+            });
             let _ = send_exit(&stream, &format!("drafting {title:?} in pane {pane}"));
             return;
         }
-        Ok(ClientFrame::Mirror { cols, rows }) => {
+        Ok(ClientFrame::Mirror { cols, rows, surface }) => {
             // Non-takeover, exactly like `Subscribe` — it registers a stream and never touches
             // client ownership. The difference is what it receives: rendered frames, not board
             // JSON.
@@ -1959,7 +2048,7 @@ fn client_connection(
             let mid = MIRROR_IDS.fetch_add(1, Ordering::SeqCst);
             let Ok(render_stream) = stream.try_clone() else { return };
             let _ = render_stream.set_write_timeout(Some(Duration::from_secs(2)));
-            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows, id: mid }).is_err() {
+            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows, id: mid, surface: surface.clone() }).is_err() {
                 return;
             }
             // Held open — dropping here would close the socket the daemon is drawing to — and
@@ -2015,8 +2104,8 @@ fn client_connection(
                             break;
                         }
                     }
-                    Ok(ClientFrame::DraftBrief { pane, title }) => {
-                        if tx.send(SrvEvent::DraftBrief { pane, title }).is_err() {
+                    Ok(ClientFrame::DraftBrief { pane, title, decisions }) => {
+                        if tx.send(SrvEvent::DraftBrief { pane, title, decisions }).is_err() {
                             break;
                         }
                     }
@@ -2608,6 +2697,18 @@ pub fn restore_hold(promise: &mut Option<(usize, u64)>, agents_now: usize, now: 
 pub struct RestoredPane {
     /// Durable workspace id. Empty for a manifest written before ids existed.
     pub wid: String,
+    /// The workspace's NAME, when a person chose it.
+    ///
+    /// It was never written down. A rename — from the Rover UI, from the desk, from anywhere —
+    /// changed `Tab::name` in memory and nothing else, so every name a person picked was lost on
+    /// the next reboot and the workspace came back auto-named after its directory. The rename
+    /// looked like it worked, which is why this survived: the failure is invisible until the
+    /// reboot, and by then it reads as "the reboot renamed things" rather than as a rename that
+    /// was never saved.
+    ///
+    /// `None` means auto-named, and stays auto-named — restoring a generated name would freeze a
+    /// label that is supposed to follow what the pane is doing.
+    pub name: Option<String>,
     pub cwd: String,
     pub agent: bool,
     pub chat: Option<String>,
@@ -2619,7 +2720,7 @@ pub fn write_restore(name: &str, panes: &[RestoredPane]) {
     let body = serde_json::json!({
         "at_ts": crate::worklog::now_secs(),
         "panes": panes.iter().map(|p| serde_json::json!({
-            "wid": p.wid, "cwd": p.cwd, "agent": p.agent, "chat": p.chat,
+            "wid": p.wid, "cwd": p.cwd, "agent": p.agent, "chat": p.chat, "name": p.name,
         })).collect::<Vec<_>>(),
     });
     if let Ok(t) = serde_json::to_string_pretty(&body) {
@@ -2736,7 +2837,9 @@ pub fn read_restore(name: &str) -> Vec<RestoredPane> {
     v["panes"].as_array().map(|a| {
         a.iter().filter_map(|p| {
             let cwd = p["cwd"].as_str()?.to_string();
+            let name = p["name"].as_str().map(str::to_string).filter(|n| !n.is_empty());
             (!cwd.is_empty()).then(|| RestoredPane {
+                name,
                 // A manifest written before ids existed has none. Empty means "mint a fresh one",
                 // which loses that workspace's history exactly once and never again — the same
                 // trade `restore.json` itself already makes for pre-feature sessions.
