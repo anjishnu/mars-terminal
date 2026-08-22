@@ -125,6 +125,22 @@ pub mod daemon {
 
 /// Process identity and lifecycle.
 pub mod proc {
+    /// Which process is LISTENING on a TCP port, when the OS will say.
+    ///
+    /// Only ever used to make an error message actionable — "restart the bridge" is advice, `kill
+    /// 43610 && mars pair` is a thing you can run. Best-effort by design: `lsof` may be absent or
+    /// refuse, and a remedy that names no pid is still a correct remedy, just a slower one.
+    pub fn listener_pid(port: u16) -> Option<u32> {
+        let out = std::process::Command::new("lsof")
+            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.parse().ok())
+    }
+
     /// A per-user tag used to namespace runtime sockets — the numeric uid on Unix.
     pub fn uid_tag() -> String {
         unsafe { libc::getuid() }.to_string()

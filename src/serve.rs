@@ -1242,11 +1242,34 @@ fn running_tunnel_url() -> Option<String> {
 /// Print the pairing QR for a bridge that's already live: read its tunnel URL from ngrok and the
 /// persisted token, and render the QR. `reset` tailors the message (after a token rotation).
 fn reprint_running(session: &str, reset: bool) -> Result<()> {
-    let base = running_tunnel_url().ok_or_else(|| anyhow!(
-        "a bridge is already running on :{}, but its tunnel URL couldn't be read from \
-         ngrok (http://127.0.0.1:4040). See the bridge's log (`~/.mars/serve-agent.log`).",
-        default_port()
-    ))?;
+    // NAME THE STATE, AND THE COMMAND THAT LEAVES IT.
+    //
+    // This said "the tunnel URL couldn't be read — see the log", which describes the symptom and
+    // sends you somewhere else to work out the cause. The usual cause is one thing and it is
+    // knowable from here: the ngrok agent has gone while the bridge kept running, so there is a
+    // bridge on the port with nothing behind it, and `mars pair` will not start a tunnel while a
+    // bridge holds the socket. Hit it by killing ngrok on its own — which is exactly what someone
+    // does when they are trying to make the tunnel come back with new settings.
+    //
+    // The remedy is the bridge's pid, so print the pid.
+    let base = match running_tunnel_url() {
+        Some(b) => b,
+        None => {
+            let port = default_port();
+            let who = crate::sys::proc::listener_pid(port)
+                .map(|p| format!("kill {p}"))
+                .unwrap_or_else(|| "stop the bridge".into());
+            anyhow::bail!(
+                "the bridge on :{port} has no tunnel — ngrok is not answering on \
+                 http://127.0.0.1:4040.\n  \
+                 A bridge holds the port, so `mars pair` will not start a replacement while it \
+                 runs.\n  \
+                 Restart it and the tunnel comes with it:  {who} && mars pair\n  \
+                 (If that is not what you expected, ~/.mars/serve-agent.log has the bridge's own \
+                 account.)"
+            )
+        }
+    };
     // Before the QR, not after: a code printed under a warning still gets scanned.
     if let Err(why) = tunnel_answers(&base) {
         println!("{}", tunnel_warning(&why));
@@ -1302,7 +1325,18 @@ fn start_tunnel(local_port: u16) -> Result<(Option<std::process::Child>, String)
         crate::session::debug_log(&format!("[rover] adopting the running ngrok tunnel {url}"));
         return Ok((None, url));
     }
-    let domain = std::env::var("MARS_NGROK_DOMAIN").ok().filter(|d| !d.trim().is_empty());
+    // ENV FIRST, THEN CONFIG — because `mars pair --domain` writes CONFIG and this read only the
+    // env var, so the flag wrote a setting nothing consumed. The command reported "stable URL set
+    // … it survives restarts", the next restart spawned ngrok with no `--url`, and the promise in
+    // this function's own doc comment went unkept.
+    //
+    // Env still wins: it is the per-run override, and config is the durable default a new shell
+    // and a launchd relaunch both inherit — which is the whole reason `--domain` writes there.
+    let domain = std::env::var("MARS_NGROK_DOMAIN")
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .or_else(ngrok_domain)
+        .filter(|d| !d.trim().is_empty());
     let mut args: Vec<String> = vec!["http".into(), local_port.to_string()];
     if let Some(d) = &domain {
         // Accept a bare host or a full https URL; ngrok's --url wants the scheme.

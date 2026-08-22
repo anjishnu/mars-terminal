@@ -375,6 +375,11 @@ pub mod daemon {
 
 /// Process identity and lifecycle.
 pub mod proc {
+    /// No `lsof` here, and the remedy reads fine without a pid. See the Unix implementation.
+    pub fn listener_pid(_port: u16) -> Option<u32> {
+        None
+    }
+
     /// A per-user tag to namespace runtime channels. Windows has no uid; use
     /// the username (sanitized to path-safe chars).
     pub fn uid_tag() -> String {
