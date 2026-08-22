@@ -272,7 +272,11 @@ pub fn lan_pair_url(session: &str) -> Result<String> {
 /// "Paired on open". The QR keeps the LAN address because a phone cannot use loopback; that path
 /// needs the bridge bound wider, which is a separate question from this one.
 pub fn pair_url_for(session: &str, host: &str) -> Result<String> {
-    build_pair_link(session, Reach::Lan { ip: host })
+    // READS `--all` LIKE THE TUNNEL LINK DOES. It called `build_pair_link`, which hardcodes
+    // `all = false`, so `mars pair --all` printed a tunnel link that shared the machine beside a
+    // LAN link that shared one session — two links on one screen disagreeing about what pressing
+    // them grants. The flag is a property of the pairing act, not of the transport.
+    build_pair_link_all(session, Reach::Lan { ip: host }, std::env::var_os("MARS_PAIR_ALL").is_some())
 }
 
 
@@ -448,11 +452,8 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
         println!();
         return Ok(());
     }
-    // `--all` on the screen that hands a link to a phone. Read from the environment rather than
-    // threaded through five signatures: it is one bit, set once by the CLI arm for this process,
-    // and every printer of a link needs it or none do.
-    let all = std::env::var_os("MARS_PAIR_ALL").is_some();
-    let url = build_pair_link_all(&session, Reach::Lan { ip: &lan_ip() }, all)?;
+    // `lan_pair_url`, which now reads `--all` itself — one place decides what a LAN link grants.
+    let url = lan_pair_url(&session)?;
 
     print_wordmark();
     println!();
@@ -1271,13 +1272,37 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
         }
     };
     // Before the QR, not after: a code printed under a warning still gets scanned.
-    if let Err(why) = tunnel_answers(&base) {
-        println!("{}", tunnel_warning(&why));
+    let tunnel_fault = tunnel_answers(&base).err();
+    if let Some(why) = &tunnel_fault {
+        println!("{}", tunnel_warning(why));
     }
+
+    // BOTH DOORS, WITH WHAT IS WRONG WITH EACH.
+    //
+    // This printed one link — the tunnel — under a heading that said "on your phone, scan the
+    // code below", while the LAN link lived behind a different command entirely. So on a network
+    // that blocks ngrok the screen offered exactly one way in, it did not work, and the way that
+    // did work was not on the screen. Choosing between them is the reader's decision, and a
+    // decision needs both options in front of it.
+    //
+    // The caveats are measured, not generic: the tunnel line reports the probe that just ran, and
+    // the LAN line reports whether this bridge is actually bound to the network.
     let app_url = pair_link(session, &base, "rover")?;
+    let lan = (!std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some())
+        .then(|| lan_pair_url(session).ok())
+        .flatten();
+
+    // The QR is for a phone, so it encodes whichever door a phone can currently walk through. A
+    // code that scans cleanly onto a blocked address is worse than no code: it looks like the
+    // machine is broken rather than the network.
+    let (qr_url, qr_note) = match (&tunnel_fault, &lan) {
+        (Some(_), Some(l)) => (l.clone(), "the LAN link — the tunnel is blocked from here"),
+        _ => (app_url.clone(), "the tunnel link — works from any network"),
+    };
+
     print_wordmark();
     println!();
-    print_qr(&app_url);
+    print_qr(&qr_url);
     println!();
     if reset {
         println!("  \x1b[38;5;208mRover\x1b[0m — QR reset · session \x1b[1m{session}\x1b[0m");
@@ -1285,9 +1310,32 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
     } else {
         println!("  \x1b[38;5;208mRover\x1b[0m — your sessions, on a screen  ·  session \x1b[1m{session}\x1b[0m");
         println!();
-        print_routes();
+        println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
+        println!("  \x1b[38;5;244mthe QR above is {qr_note}\x1b[0m");
+        print_scope_line();
+        println!();
     }
-    println!("  {app_url}");
+
+    // Ordered by what works from here. The one that cannot connect right now still gets printed,
+    // because "this machine is reachable, just not from this network" is a fact worth having.
+    let tunnel_caveat = match &tunnel_fault {
+        Some(_) => "\x1b[38;5;208mblocked on this network right now\x1b[0m",
+        None => "\x1b[38;5;244many network, any device\x1b[0m",
+    };
+    let lan_caveat = "\x1b[38;5;244msame wifi only · never leaves your network\x1b[0m";
+    let mut doors: Vec<(&str, String, &str)> = Vec::new();
+    if let Some(l) = &lan {
+        doors.push(("same wifi", l.clone(), lan_caveat));
+    }
+    doors.push(("anywhere ", app_url.clone(), tunnel_caveat));
+    if tunnel_fault.is_none() {
+        doors.reverse(); // a working tunnel is the better default; lead with it
+    }
+    for (label, url, caveat) in doors {
+        println!("  \x1b[1m{label}\x1b[0m  {caveat}");
+        println!("  {url}");
+        println!();
+    }
     Ok(())
 }
 
