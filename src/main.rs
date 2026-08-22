@@ -1006,7 +1006,17 @@ fn main() -> Result<()> {
             return if reset { serve::reset_main(session) } else { serve::serve_main(session) };
         }
         #[cfg(feature = "web")]
-        Some("qr") => return serve::qr_main(args.next()),
+        // `--all` belongs here too. It was parsed only in the `pair` arm, so `mars qr --all` took
+        // "--all" as the SESSION NAME and went looking for a session called that — the flag that
+        // shares the machine was unavailable on the one screen built for handing a link to a
+        // phone, which is where sharing the machine is most likely to be what you want.
+        Some("qr") => {
+            let rest: Vec<String> = args.collect();
+            if rest.iter().any(|a| a == "--all") {
+                std::env::set_var("MARS_PAIR_ALL", "1");
+            }
+            return serve::qr_main(rest.into_iter().find(|a| !a.starts_with('-')));
+        }
         #[cfg(not(feature = "web"))]
         Some("pair") | Some("serve") | Some("qr") => {
             eprintln!(
