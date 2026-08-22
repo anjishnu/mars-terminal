@@ -103,7 +103,22 @@ pub enum ClientFrame {
     /// right for "I moved to another terminal" and catastrophic for "I opened a browser tab".
     /// A mirror renders the same frames to another screen and owns nothing: no ownership, no
     /// eviction, no `Exit` to anybody.
-    Mirror { cols: u16, rows: u16 },
+    Mirror {
+        cols: u16,
+        rows: u16,
+        /// WHICH SURFACE this mirror is, so the size policy can tell them apart.
+        ///
+        /// `"desk"` is a browser being worked in and may claim the grid; `"phone"` is a second
+        /// pair of eyes and must not — "the target that typed last decides" is right between a
+        /// terminal and a desktop browser and a footgun with a phone in it, because answering one
+        /// prompt from a pocket would reshape a 211-column session down to 40 and reflow every
+        /// full-screen program in it.
+        ///
+        /// Absent means a client that predates this field. Those are treated as a plain terminal
+        /// — the behaviour they were written against — rather than guessed at.
+        #[serde(default)]
+        surface: Option<String>,
+    },
     /// Keystrokes from a mirror, as the bytes a terminal would send.
     ///
     /// A mirror types without owning: no gen, no ownership check, no eviction. That is not a new
@@ -855,7 +870,7 @@ enum SrvEvent {
     },
     /// A second render target joined. Carries its own stream and size: one `Terminal` has one
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
-    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64 },
+    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64, surface: Option<String> },
     MirrorKeys { data: String, id: u64 },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
@@ -1040,6 +1055,9 @@ static MIRROR_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// A second render target. Owns nothing — not the session, and not its size.
 struct MirrorTarget {
+    /// Which surface this mirror is — see `ClientFrame::Mirror::surface`. `None` for a client
+    /// older than the field, which is treated as a plain terminal.
+    surface: Option<String>,
     id: u64,
     term: Terminal<CrosstermBackend<FrameWriter>>,
     /// A private handle on the same socket, for the frames that are not rendered bytes.
@@ -1081,11 +1099,22 @@ fn grid_size(
         return fallback();
     }
     match last {
-        // The mirror that was typed into, if it is still attached. A mirror that has since gone
-        // decides nothing — falling back is not a lost preference, it is the absence of a target.
+        // The mirror that was typed into, if it is still attached AND is a surface allowed to
+        // claim the grid. A mirror that has since gone decides nothing — falling back is not a
+        // lost preference, it is the absence of a target.
+        //
+        // NOT EVERY SURFACE MAY RESHAPE THE SESSION. "The target typed into last decides" is
+        // right between a terminal and a desktop browser, which are comparable screens, and a
+        // footgun with a phone in it: answering one `[y/N]` from a pocket would drag a
+        // 211-column session down to 40 and reflow every full-screen program running in it. A
+        // phone is a second pair of eyes and one thumb, not a new window size.
+        //
+        // `None` — a client older than the field — keeps the old behaviour rather than being
+        // guessed at, because that is what it was written against.
         Some(LastInput::Mirror(id)) => mirrors
             .iter()
             .find(|m| m.id == id)
+            .filter(|m| m.surface.as_deref() != Some("phone"))
             .map(|m| (m.cols, m.rows))
             .or_else(fallback),
         Some(LastInput::Owner) | None => fallback(),
@@ -1375,11 +1404,24 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     // mirror that is not the grid's size is seeing a crop, and it cannot work
                     // that out from bytes that are a valid frame of a screen it has never been
                     // told the size of.
+                    // WHOSE SIZE THIS IS, from THIS mirror's point of view.
+                    //
+                    // It reported `client_size.is_some()` — "a TUI client exists somewhere" — which
+                    // is true for the entire life of a normal session and says nothing about whose
+                    // shape the grid currently has. A mirror that had just claimed the grid by
+                    // being typed into was still told the size was the desk's, so it went on
+                    // letterboxing a grid that was already its own: the fit stayed inexact no
+                    // matter what the client did, because the fact it was reacting to was a
+                    // different fact than the one it needed.
+                    //
+                    // The question a mirror is actually asking is "is this MY size" — so the
+                    // answer is computed against the same `last` that decided the grid.
+                    let mine = matches!(last_input, Some(LastInput::Mirror(id)) if id == m.id);
                     if m.announced != Some(grid_dims) {
                         let frame = ServerFrame::GridSize {
                             cols: grid_dims.0,
                             rows: grid_dims.1,
-                            desk: client_size.is_some(),
+                            desk: !mine,
                         };
                         if write_frame(&mut m.sock, &frame).is_err() {
                             return false;
@@ -1488,7 +1530,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 push_mobile(&mut app, &mut subscribers);
                 last_mobile_push = Some(std::time::Instant::now());
             }
-            Ok(SrvEvent::Mirror { stream, cols, rows, id }) => {
+            Ok(SrvEvent::Mirror { stream, cols, rows, id, surface }) => {
                 // NOTHING IS EVICTED. No `client` assignment, no `send_exit`, no `attached` flag.
                 // That is the whole property, and the selfcheck asserts it by watching the
                 // client's socket rather than by reading this code.
@@ -1500,6 +1542,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     Ok(mut m) => {
                         let _ = m.clear();
                         mirrors.push(MirrorTarget {
+                            surface,
                             id,
                             term: m,
                             sock,
@@ -1997,7 +2040,7 @@ fn client_connection(
             let _ = send_exit(&stream, &format!("drafting {title:?} in pane {pane}"));
             return;
         }
-        Ok(ClientFrame::Mirror { cols, rows }) => {
+        Ok(ClientFrame::Mirror { cols, rows, surface }) => {
             // Non-takeover, exactly like `Subscribe` — it registers a stream and never touches
             // client ownership. The difference is what it receives: rendered frames, not board
             // JSON.
@@ -2005,7 +2048,7 @@ fn client_connection(
             let mid = MIRROR_IDS.fetch_add(1, Ordering::SeqCst);
             let Ok(render_stream) = stream.try_clone() else { return };
             let _ = render_stream.set_write_timeout(Some(Duration::from_secs(2)));
-            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows, id: mid }).is_err() {
+            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows, id: mid, surface: surface.clone() }).is_err() {
                 return;
             }
             // Held open — dropping here would close the socket the daemon is drawing to — and

@@ -2419,6 +2419,9 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some("mirror") => {
             let cols = v.get("cols").and_then(|x| x.as_u64()).unwrap_or(120).clamp(20, 400) as u16;
             let rows = v.get("rows").and_then(|x| x.as_u64()).unwrap_or(32).clamp(8, 200) as u16;
+            // WHERE THIS MIRROR IS. Forwarded verbatim; the daemon decides what it means. An
+            // absent field is a client older than it, not a phone.
+            let surface = v.get("surface").and_then(|x| x.as_str()).map(|x| x.to_string());
             // ONE MIRROR PER BROWSER, REPLACED RATHER THAN STACKED.
             //
             // A resize re-sends `mirror` at the new size, and the daemon's handshake is once per
@@ -2436,7 +2439,7 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 return;
             };
             let mut w = match sock.try_clone() { Ok(w) => w, Err(_) => return };
-            if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows }).is_err() {
+            if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows, surface: surface.clone() }).is_err() {
                 return;
             }
             // Kept so `mirror.key` can write to the same connection the frames come from — a

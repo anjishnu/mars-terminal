@@ -3350,7 +3350,7 @@ fn selfcheck() -> Result<()> {
                 // The owner is 100x30 (see `TestClient::connect`).
                 let mirror = crate::sys::control::connect(&bpath)?;
                 let mut mw = mirror.try_clone()?;
-                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 64, rows: 20 })?;
+                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 64, rows: 20 , surface: None })?;
                 std::thread::sleep(std::time::Duration::from_millis(400));
 
                 // 1. The owner was not told to go away.
