@@ -63,12 +63,6 @@ pub fn dir() -> Option<PathBuf> {
     crate::sys::paths::home_dir().map(|h| h.join(".mars").join("briefs"))
 }
 
-/// Where a worker's standing orders live. Assignment points at this path and says nothing else
-/// about how we work, so that every rule in it is versioned rather than retyped.
-pub fn working_model_path() -> Option<PathBuf> {
-    dir().map(|d| d.join("WORKING-MODEL.md"))
-}
-
 /// Timestamp plus a semantic suffix, never derived from the title alone.
 ///
 /// A name is a mutable value — retitle the brief and an id derived from it would point somewhere

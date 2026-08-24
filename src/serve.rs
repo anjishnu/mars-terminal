@@ -223,12 +223,11 @@ pub enum Reach<'a> {
 /// a fragment format, a route and a protocol version will eventually not, and the one that drifts
 /// is the one nobody is looking at.
 ///
-/// The reach is the only real difference, so it is the only parameter.
-pub fn build_pair_link(session: &str, reach: Reach<'_>) -> Result<String> {
-    build_pair_link_all(session, reach, false)
-}
-
-/// The same link, optionally offering the WHOLE MACHINE rather than one session.
+/// The consolidation left a `build_pair_link` wrapper behind that hardcoded `all = false`, and
+/// with the last caller gone it was a second builder again — carrying, on its own doc comment, the
+/// argument for why a second builder is a bug.
+///
+/// Optionally offers the WHOLE MACHINE rather than one session.
 ///
 /// A token has always been host-wide — one `~/.mars/serve.token`, one endpoint, and
 /// `sessions.list` will name every session to anyone holding it. So `all` grants no access that
@@ -263,19 +262,6 @@ pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String
         Reach::Tunnel { base: tunnel_base, route },
         std::env::var_os("MARS_PAIR_ALL").is_some(),
     )
-}
-
-/// The three routes in, named by where the reader is standing rather than by mechanism.
-///
-/// Printed wherever the link is, so the terminal says the same thing every time. It used to open
-/// with a QR — which answers "how" before anyone has decided "which", and serves the one case a
-/// person sitting at this machine is least likely to be in.
-pub fn print_routes() {
-    println!("  \x1b[1mOn this machine\x1b[0m      mars pair --open        opens a browser, already paired");
-    println!("  \x1b[1mOn your phone\x1b[0m        scan the code below     camera at the QR");
-    println!("  \x1b[1mAnother computer\x1b[0m     paste the link below    any network");
-    print_scope_line();
-    println!();
 }
 
 pub fn lan_pair_url(session: &str) -> Result<String> {

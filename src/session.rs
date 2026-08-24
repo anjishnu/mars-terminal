@@ -478,9 +478,6 @@ pub fn mint_hex(n: usize) -> Result<String> {
 ///
 /// Not the hostname, not an env var, not the socket path: all three change or vanish, which is
 /// exactly how this broke. A minted value is the only kind that cannot.
-pub fn machine_id_for_test() -> String { machine_id() }
-pub fn daemon_fingerprint_for_test(s: &str) -> String { daemon_fingerprint(s) }
-
 pub fn machine_id() -> String {
     let Some(dir) = crate::sys::paths::home_dir().map(|h| h.join(".mars")) else {
         return "mars".into();
