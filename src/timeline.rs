@@ -468,9 +468,9 @@ fn project_slug(cwd: &str) -> String {
 }
 
 /// A conversation the captain could bind to a pane: what it is called, and when it was last
-/// touched. The title is Claude Code's own (`aiTitle`, else `customTitle`) — a generated summary is
-/// a far better thing to choose from than a uuid, and reading the file's HEAD for it costs nothing
-/// even on a 200 MB transcript.
+/// touched. The title is Claude Code's own — the name the captain set with `/rename` if there is
+/// one, else the generated `aiTitle` — which is a far better thing to choose from than a uuid, and
+/// reading one bounded window for it costs nothing even on a 200 MB transcript.
 pub fn candidates(cwd: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
     let Some(home) = crate::sys::paths::home_dir() else { return Vec::new() };
     let root = home.join(".claude").join("projects");
@@ -523,21 +523,45 @@ pub fn candidates(cwd: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The conversation's own title, from the first 64 KB. Claude Code writes `ai-title` /
-/// `custom-title` records as it goes; the LAST one in that window is the freshest opinion.
-fn title_of(path: &std::path::Path) -> String {
-    use std::io::Read;
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = std::fs::File::open(path)
-        .and_then(|mut f| f.read(&mut buf))
-        .unwrap_or(0);
-    let head = String::from_utf8_lossy(&buf[..n]);
-    let mut title = String::new();
-    for line in head.lines() {
+/// The conversation's own title, from the LAST 64 KB.
+///
+/// Two faults lived here and either one alone hid a rename completely.
+///
+/// The window was the file's HEAD. A transcript is an APPEND-ONLY log, so its head holds the name
+/// the conversation was born with and can never hold any later one: on a 200 MB transcript a
+/// `/rename` was invisible forever, and the picker went on offering a name the captain had already
+/// replaced. The comment claimed to take "the freshest opinion in that window", which was true and
+/// useless — the freshest opinion in the oldest window is still the oldest opinion.
+///
+/// And `aiTitle` was allowed to win. It is the model's generated summary, rewritten as the
+/// conversation drifts; `/rename` writes `customTitle` and `agentName` and deliberately leaves
+/// `aiTitle` alone. Last-record-wins therefore handed the host's guess the final say over the
+/// captain's answer, which inverts the one rule this surface exists to honour.
+///
+/// So: read the tail, and let a name a PERSON set outrank one the host guessed regardless of which
+/// came last. The tail is the same single `read` the head cost, and a file shorter than the window
+/// is read whole.
+pub(crate) fn title_of(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 64 * 1024;
+    let mut buf = Vec::new();
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(WINDOW)));
+        let _ = f.take(WINDOW).read_to_end(&mut buf);
+    }
+    // Seeking to a byte offset lands mid-line unless we are at the start of the file; that first
+    // partial line fails to parse and is skipped, which is all the trimming it needs.
+    let tail = String::from_utf8_lossy(&buf);
+    let (mut title, mut set_by_hand) = (String::new(), false);
+    for line in tail.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
-        for k in ["customTitle", "aiTitle"] {
-            if let Some(t) = v.get(k).and_then(|x| x.as_str()).filter(|t| !t.is_empty()) {
-                title = clean(t, 80);
+        for (key, by_hand) in [("customTitle", true), ("agentName", true), ("aiTitle", false)] {
+            if let Some(t) = v.get(key).and_then(|x| x.as_str()).filter(|t| !t.is_empty()) {
+                if by_hand || !set_by_hand {
+                    title = clean(t, 80);
+                    set_by_hand |= by_hand;
+                }
             }
         }
     }
