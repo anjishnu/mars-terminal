@@ -110,20 +110,27 @@ SESSIONS  (work survives closed windows and disconnects)
   Reattach greets you with a \"while away\" line if anything happened;
   C-x g opens the full Away Digest (timeline + durations).
 
-ROVER  (BETA — your sessions on your phone; needs the `web` feature)
+ROVER  (BETA — your sessions on a phone or a second screen; needs the `web` feature)
   mars pair                      print the QR, start the bridge, print the link
                                  (alias: serve)
+  mars pair --desk               the same link aimed at the desktop shell
+  mars pair --open               open it here, already paired
+  mars pair --all                offer the whole machine, not just this session
   mars pair --check              what's set up and what isn't, with the fix for each
   mars pair --link               reprint the link for a bridge already running
   mars pair --domain <d>         pin the tunnel URL so the QR survives restarts
-  mars serve --reset             rotate the pairing token — drops every paired phone
+  mars qr [--all]                just the code, for a phone camera
+  mars serve --reset             rotate the pairing token — drops every paired client
+
+  One link, two shells: it opens the phone column on a phone and the three-pane
+  desk on anything with a pointer. /desk and /rover force one, and the choice sticks.
 
   mars manager                   run one manager turn now — read what the panes did,
                                  write the briefing and any memos
   mars snapshot                  the same board and briefing WITHOUT a model
                                  (deterministic; what the phone falls back to)
 
-  The QR is a credential for code execution as you: a phone that can type into
+  The QR is a credential for code execution as you: anything that can type into
   your terminal can run anything you can. Treat it like a private key, and keep
   the bridge up only while you are using it. See SECURITY.md.
 

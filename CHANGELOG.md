@@ -2,45 +2,132 @@
 
 ## 0.7.1
 
-A second render target stops fighting the first. The web terminal shipped in 0.7.0 could
-draw MARS into a browser; what it also did, silently, was resize the session twice a frame
-for as long as the tab was open. This release makes the session own its own size, and makes
-everything watching it a viewport that copies rather than a client that decides.
+Rover grows a desk. 0.7.0 put your running sessions on a phone, which is the right
+answer to "has it stopped" and the wrong shape for "now help me with it" — one column,
+one thumb, and a design budget spent entirely on not having room. This release gives
+the same sessions a second shell built for a screen with a keyboard: every paired
+session down the left, one workspace in the middle, and Rover itself on the right,
+all visible at once. Same bridge, same protocol, same components — a different frame.
 
-### Fixed
-- **A browser tab no longer garbles the session.** `ui::render` writes the size of every
-  pane's PTY, which was safe while there was one render target and "the size I am drawing
-  at" and "the size the session is" were the same fact. A mirror made them two facts and
-  left one variable, so the two targets resized the panes against each other on every
-  frame. A shell prompt shrugs that off; a full-screen TUI re-lays-out on each SIGWINCH and
-  emits diffs against a width that already moved, which is why agent panes turned to
-  confetti while shells only looked slightly wrong. The session now renders once into a
-  grid that belongs to no target — tmux's arrangement — and the owner's terminal decides
-  the size. A mirror is told the real size so it can fit the whole screen rather than show
-  the top-left corner of one.
-- **Resizing a browser stopped reporting the session as ended.** Re-mirroring drops the
-  previous connection, whose reader dutifully announced `mirror.gone` to a page that had
-  merely been resized. Only the current mirror reports a death now.
-- **Dead render targets are collected.** `FrameWriter::flush` swallowed write errors and
-  returned `Ok`, so closed browser tabs stayed in the mirror list forever and were drawn
-  to on every frame.
-- **The conversation window stopped spending itself on harness noise.** Claude Code files
-  `<system-reminder>` injections as ordinary user messages, so three of the six rows in an
-  agent pane's window could be reminders and slash commands. Filtered, and the filter
-  discriminates: a message that merely begins with a slash is still a message.
+It is one link. `mars pair` prints an address that opens the phone column on a phone
+and the desk on anything with a pointer, so nobody has to know which URL they wanted.
 
 ### Added
-- **`mars pair --desk` prints a link that can leave the machine.** It only ever emitted
-  loopback, so there was no `/desk` URL that worked from a phone. `pair_link` takes the
-  route now rather than hardcoding `/rover`.
-- **`ClientFrame::NewAgent`** — open a terminal and start a coding agent in it. Distinct
-  from `NewTerminal` because the two promise different things: a terminal is ready when it
-  exists, an agent pane is not ready until a line has been written into a shell that is
-  actually reading, and the host owns that wait.
+
+- **The desk — Rover on a screen with a keyboard.** Three panes that do not move:
+  a machine-wide, read-only rail of every paired session on the left; the centre
+  owning exactly one workspace, in either of its two forms — the live terminal you
+  type in, or the timeline of what the agent did in it; and Rover's own chat on the
+  right, narrating rather than transcribing. The phone's `fleet → mission →
+  workspace` depth was a space constraint wearing the clothes of a conceptual one;
+  with room, all three are simply on screen. Nothing here re-implements a surface —
+  the timeline, the brief strip, the file explorer and the chat are the phone's own
+  components in a different frame, because a second desktop copy of any of them is a
+  second copy that drifts.
+- **One address, three outcomes.** `/rover` used to be one of three URLs the reader
+  was expected to choose between, and a link printed by `mars pair` had to guess the
+  reader's hardware at the moment it was printed. It now decides for itself: nothing
+  paired yet gets the connect screen, a coarse pointer on a small screen gets the
+  phone, and anything else gets the desk. Pointer first, width only as a tie-break —
+  the question is not "how wide" but "what is driving this", and a tablet has plenty
+  of exactly what the phone shell spends its budget working around. `/desk` and
+  `/rover` still force one by name, and that choice is remembered, because somebody
+  who opens `/desk` on a phone meant it.
+- **Sideways navigation in the breadcrumb.** Holding a crumb has always meant "take
+  me there", which left the crumb you are standing on inert — the one place where
+  the useful move is obvious, and it is across rather than up. Holding it now opens
+  its siblings, so changing session or workspace is one gesture instead of climbing
+  to the parent and diving down another branch.
+- **`mars pair --desk`** aims the printed link at the desktop shell, and
+  **`mars pair --open`** opens it here, already paired.
+- **`mars pair --all` and `mars qr --all`** offer the whole machine rather than one
+  session. A token has always been host-wide, so this grants no access the link did
+  not already carry — it says the person who ran it MEANT to share the machine, and
+  the client adopts every session instead of making somebody find and tap each one.
+  The two readings had different blast radii and produced an identical-looking link.
+- **`ClientFrame::NewAgent`** — open a terminal and start a coding agent in it.
+  Distinct from `NewTerminal` because the two promise different things: a terminal
+  is ready when it exists, an agent pane is not ready until a line has been written
+  into a shell that is actually reading, and the host owns that wait.
+- **A brief can be archived**, and a brief now leads with its idea rather than with
+  its rulings.
+
+### Fixed
+
+- **A browser tab no longer garbles the session.** `ui::render` writes the size of
+  every pane's PTY, which was safe while there was one render target and "the size I
+  am drawing at" and "the size the session is" were the same fact. A mirror made them
+  two facts and left one variable, so the two targets resized the panes against each
+  other on every frame. A shell prompt shrugs that off; a full-screen TUI re-lays-out
+  on each SIGWINCH and emits diffs against a width that already moved, which is why
+  agent panes turned to confetti while shells only looked slightly wrong. The session
+  renders once into a grid that belongs to no target — tmux's arrangement — and the
+  target you are typing in decides the size. A mirror is told the real size so it can
+  fit the whole screen rather than show the top-left corner of one.
+- **Resizing a browser stopped reporting the session as ended.** Re-mirroring drops
+  the previous connection, whose reader dutifully announced `mirror.gone` to a page
+  that had merely been resized. Only the current mirror reports a death now.
+- **Dead render targets are collected.** `FrameWriter::flush` swallowed write errors
+  and returned `Ok`, so closed browser tabs stayed in the mirror list forever and
+  were drawn to on every frame.
+- **Two machines are no longer the same machine.** The host id was derived from
+  `$HOSTNAME`, which is unset on macOS — so every Mac fell to the same `lan` fallback
+  and every session called `mars-dev` was indistinguishable from every other one. The
+  client groups paired rows by host and shares a token and an endpoint across a
+  group, so that grouping spanned MACHINES: one machine's sessions could be silently
+  repointed at another machine's bridge, and it looked like success. The id is now
+  minted once into `~/.mars/machine-id`, because a value that is derived is a value
+  that can change.
+- **The pairing link has one builder.** `mars pair` and `mars qr` each grew their
+  own, and the divergence was not cosmetic: the QR's copy minted a token the bridge
+  had never stored, so every scan was refused.
+- **The LAN door is only offered when there is an app behind it.** A LAN link is a
+  page URL, and without a built bundle the bridge answers every path with its own
+  placeholder — so the code scanned, the page loaded, returned 200, and was not
+  Rover, which reads as the app being broken rather than as nothing having been
+  built. Both doors are now printed, ordered by which one actually works from where
+  you are standing, and a missing one says why it is missing.
+- **A blocked tunnel says so instead of blaming ngrok.** A network that filters by
+  SNI returns a plaintext redirect, which is a perfectly good HTTP response and
+  reads exactly like a tunnel whose agent has died — so the advice was "restart it",
+  which loops forever. The bridge stamps a header only it sends, which is what makes
+  the probe conclusive.
+- **A token is refused out loud**, and `mars attach` uses the same link the browser
+  does, so the two cannot disagree about what a session is called.
+- **The conversation window stopped spending itself on harness noise.** Claude Code
+  files `<system-reminder>` injections as ordinary user messages, so three of the six
+  rows in an agent pane's window could be reminders and slash commands. Filtered, and
+  the filter discriminates: a message that merely begins with a slash is still a
+  message.
+- **A renamed conversation is finally visible.** The title was read from the first
+  64 KB of a transcript, and a transcript is an append-only log — so its head holds
+  the name the conversation was born with and can never hold a later one. On a long
+  session `/rename` was invisible forever. The tail is read instead, and a name a
+  person set now outranks the model's generated one regardless of which came last.
+- **A failed read no longer reports silence.** "No file for this id" and "the file is
+  right there and could not be read" were answered identically, and the reader was
+  told the agent had not spoken when the truth was that we could not look.
+- **The picker admits when it widened.** When no conversation matches the workspace,
+  it offers every conversation on the machine — the right fallback, since a
+  wrong-looking list is choosable and an empty one is a dead end wearing an
+  explanation — but it now says so, and each row shows which project it came from.
+  The timeline also names the conversation it is showing, and flags it when the
+  transcript's own directory disagrees with the workspace's.
+- **The memo archive is scoped to its session**, and fails closed when unsure.
+
+### Known limitations
+
+- **The LAN route needs a built bundle.** The bridge serves the Rover app from
+  `MARS_WEB_DIR`; without it, only the tunnel route — which is served by the hosted
+  app — reaches a working client. `mars pair` says which doors are available and why.
+- **Structured intents are recorded, not executed.** `run` and `jump` from the client
+  land in the worklog and wait for the daemon to grow a JSON action sink. They are
+  never silently dropped.
 
 ### Note
-`SESSION_PROTOCOL_VERSION` carries the crate version, so a 0.7.1 client will not attach to
-a 0.7.0 daemon. Run `mars upgrade --yes` after installing.
+
+`SESSION_PROTOCOL_VERSION` carries the crate version, so a 0.7.1 client will not
+attach to a 0.7.0 daemon. Run `mars upgrade --yes` after installing.
 
 ## 0.7.0
 

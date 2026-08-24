@@ -75,16 +75,19 @@ carries a `cfg` and both builds pass the same suite (§9).
 
 | Layer | Files | Lines |
 |---|---|---:|
-| Entry & test harness | `main.rs` (~88% of it is `selfcheck`) | 4,817 |
-| Application core | `app.rs` | 6,215 |
-| Rendering | `ui.rs` | 2,321 |
-| Data model | `buffer.rs`, `pane.rs`, `layout.rs`, `tab.rs`, `mode.rs` | 505 |
-| Command surface | `palette.rs`, `config.rs`, `tuning.rs`, `themes.rs` | 1,792 |
-| Terminal & session | `terminal.rs`, `session.rs`, `osc133.rs` | 1,914 |
-| Agent stack | `agent.rs`, `tiers.rs`, `prompts.rs`, `persona.rs` | 1,723 |
-| Journal & briefing | `worklog.rs`, `briefing.rs`, `llm_log.rs` | 1,178 |
-| Platform abstraction | `sys/mod.rs`, `sys/unix.rs`, `sys/windows.rs` | 713 |
-| Remote (feature `ssh`) | `broker.rs`, `ssh.rs`, `fleet.rs` (`broker_stub.rs` when off) | 1,151 |
+| Entry & test harness | `main.rs` (most of it is `selfcheck`) | 9,705 |
+| Application core | `app.rs` | 8,345 |
+| Rendering | `ui.rs` | 2,605 |
+| Data model | `buffer.rs`, `pane.rs`, `layout.rs`, `tab.rs`, `mode.rs` | 538 |
+| Command surface | `palette.rs`, `config.rs`, `tuning.rs`, `themes.rs` | 2,012 |
+| Terminal & session | `terminal.rs`, `session.rs`, `osc133.rs` | 4,572 |
+| Agent stack | `agent.rs`, `tiers.rs`, `prompts.rs`, `persona.rs` | 2,024 |
+| Journal & briefing | `worklog.rs`, `briefing.rs`, `llm_log.rs` | 1,252 |
+| Manager & briefs | `manager.rs`, `briefs.rs`, `health.rs` | 6,606 |
+| The conversation | `timeline.rs`, `conv.rs` | 870 |
+| Rover bridge (feature `web`) | `serve.rs` | 3,459 |
+| Platform abstraction | `sys/mod.rs`, `sys/unix.rs`, `sys/windows.rs` | 847 |
+| Remote (feature `ssh`) | `broker.rs`, `ssh.rs`, `fleet.rs` (`broker_stub.rs` when off) | 1,211 |
 | Memory (feature `memory`) | `retrieval.rs` (`retrieval_stub.rs` when off) | 524 |
 | Highlighting (feature `syntax`) | `syntax.rs` (`syntax_stub.rs` when off) | 195 |
 | Misc | `project.rs`, `banner.rs` | 100 |
@@ -515,6 +518,74 @@ protocol-qualified version handshake plus optional live SSH broker handoff),
 - **TTY hygiene**: `sanitize_tty` (idempotent raw-mode repair) and a panic hook
   that restores the terminal before the panic message prints.
 
+### `manager.rs` + `briefs.rs` + `health.rs` — the machine's own supervisor
+
+The manager is a Claude session like any other: `run.sh` cds into `~/.mars/manager`
+and runs `claude` there, so its turns land in `~/.claude/projects/<encoded dir>/` in
+exactly the format an agent pane's conversation uses. Nothing had to be built to
+watch it — only found.
+
+- **`manager.rs`** — one turn reads what the panes did and writes the briefing and
+  any memos. Every judgement it publishes carries how it was reached, which the
+  selfcheck enforces; the deterministic floor (`mars snapshot`) never counts as
+  model coverage. Text the manager issues is watermarked so it can be told from a
+  person's.
+- **`briefs.rs`** — a brief is a unit of delegated work: an idea, the decisions
+  behind it, and a verification step. State is *which files exist*, never liveness,
+  and `verify` runs argv rather than a shell. The planner and the worker differ by
+  exactly one deny-list entry, which the selfcheck asserts, because a partial
+  worker deny-list is not a worker.
+- **`health.rs`** — whether the run happened at all, distinct from whether it
+  found anything.
+
+### `timeline.rs` + `conv.rs` — one transcript, two readers
+
+Both read the same Claude Code JSONL and share nothing else, which is why they are
+siblings rather than modes of one module: a gist wants meaning and drops detail, a
+timeline wants the sequence and keeps it.
+
+- **`conv.rs`** produces prose for a model to fold. It keeps a **gist** (what the
+  conversation is about), a **delta** (exchanges since the gist was written) and a
+  **cursor** (how far the gist accounts for), so cost stays flat however long a
+  conversation runs. The transcript is found BY ID, never by rebuilding Claude
+  Code's directory naming from a path.
+- **`timeline.rs`** produces typed rows for a person to skim. **Nothing here fails
+  on unfamiliar input** — an unknown record becomes `Row::Unknown` carrying its own
+  type name, never a parse error and never a dropped line, because the transcript
+  belongs to another program that changes on its own schedule. Reads are bounded to
+  the file's tail: the live transcript of a long session on this machine is 188 MB.
+
+Both read the tail rather than the head, which is not an optimisation — a transcript
+is append-only, so its head can only ever hold the name a conversation was born with.
+
+### `serve.rs` — the Rover bridge (feature `web`)
+
+A second client of the existing session socket. The daemon protocol is unchanged;
+`web` is off by default so the base binary pays nothing for it.
+
+- **One port, two protocols.** `handle_conn` peeks at the request: a
+  `Sec-WebSocket-Key` gets `bridge_ws` (the WS ⇄ session-socket pump), anything else
+  gets `serve_static`. A LAN link is a *page* URL, so the bridge must serve an app as
+  well as a socket.
+- **`serve_static`** serves the built Rover bundle from `$MARS_WEB_DIR`, falling back
+  to `index.html` for unknown paths because the router is client-side. Without a
+  bundle it answers a placeholder — which is why `serves_app()` exists and why the
+  LAN door is only offered when there is something behind it. A 200 that is not the
+  app is the most convincing kind of broken.
+- **Pairing** has one builder (`build_pair_link_all`) reached by every caller, because
+  two functions that must agree about a token, a fragment format, a route and a
+  protocol version eventually will not. Tokens are read from the file the bridge
+  validates against, never minted at link time.
+- **Reach** is either a tunnel (hosted page, `wss://`) or the LAN (page and socket
+  both from this bridge). The hosted app is HTTPS and may not dial `ws://192.168.x.x`,
+  which is the whole reason the LAN copy exists.
+- **`BRIDGE_HEADER`** is stamped on every static reply — a header only this bridge
+  sends. It is what makes a tunnel probe conclusive, since a filtering network's
+  redirect and a dead edge session are both perfectly good HTTP responses.
+- **Client intents** are JSON frames translated to `ClientFrame`s. Structured intents
+  (`run`, `jump`) are recorded and not yet executed, pending a daemon-side JSON action
+  sink — recorded rather than silently dropped.
+
 ### `sys/` — the platform abstraction layer
 
 The ONE place the operating system leaks in. Every capability is reached as
@@ -545,15 +616,28 @@ hand.
 
 ## 9. Feature flags and the deletion-proof seams
 
-Three capabilities are cargo features, all default-on. Each has an inert twin
-selected by `#[path]` in `main.rs`, so **call sites carry no `cfg`** and never learn
-the capability is missing — at runtime they simply see neutral values:
+Three capabilities are default-on cargo features with an inert twin selected by
+`#[path]` in `main.rs`, so **call sites carry no `cfg`** and never learn the
+capability is missing — at runtime they simply see neutral values:
 
 | Feature | Real | Stub | Covers |
 |---|---|---|---|
 | `memory` | `retrieval.rs` | `retrieval_stub.rs` | command memory, docs corpus, redaction |
 | `ssh` | `broker.rs`, `ssh.rs` | `broker_stub.rs` | `mars keyd`, `mars ssh` |
 | `syntax` | `syntax.rs` | `syntax_stub.rs` | highlighting (drops the syntect dep entirely) |
+
+**`web` is the exception, twice over.** It is off by default, and it has no twin:
+
+| Feature | Real | Stub | Covers |
+|---|---|---|---|
+| `web` (off) | `serve.rs` | *none* | `mars pair`, `mars serve`, `mars qr` — the Rover bridge |
+
+There is nothing to stub because the bridge is *additive* rather than replaceable —
+no editor path calls into it, so absence is a missing verb rather than a neutral
+value. The cost is that its ten `#[cfg(feature = "web")]` sites in `main.rs` are real
+`cfg`s at call sites, and that **serve.rs is not compiled at all in a default build**.
+A `--features web` build is therefore a separate verification obligation, not a
+variation on the usual one.
 
 `cargo build --no-default-features` must also pass `--selfcheck`. Changing a real
 module's public surface means mirroring it in the stub in the same commit.

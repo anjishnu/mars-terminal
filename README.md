@@ -146,8 +146,8 @@ different-sized terminal just reflows.
 > have been through enough releases to be treated as part of the product rather than an
 > experiment. What has not changed is the posture: the agent is an assistant, not an
 > authority, so review what it proposes before running it. Destructive actions are gated,
-> and you should still read them. **Rover** (phone) and the **Windows** port are the only
-> beta surfaces left.
+> and you should still read them. **Rover** (phone and desk) and the **Windows** port are
+> the only beta surfaces left.
 
 Works out of the box with a free-tier key from any of:
 
@@ -286,31 +286,61 @@ With an agent connected, tabs you haven't named get a quiet auto-generated label
 from their content (rename one yourself and it's yours forever; `auto_name_secs = 0`
 turns it off).
 
-## Rover — your sessions on your phone
+## Rover — your sessions, off this machine
 
-> **Beta.** Rover is new in 0.7.0. The bridge, the tunnel and the phone client are the
-> least-travelled paths in Mars, and the failure mode that matters — a laptop that closed
-> while you were out — is the hardest to test. Expect rough edges there and report them.
+> **Beta.** Rover is new in 0.7.0 and the desk is new in 0.7.1. The bridge, the tunnel
+> and the browser clients are the least-travelled paths in Mars, and the failure mode
+> that matters — a laptop that closed while you were out — is the hardest to test.
+> Expect rough edges there and report them.
 
 Long agent runs don't need you at the keyboard; they need you to *notice* when
-something stops. Rover is a phone client for the sessions already running on your
-machine: scan a QR once, and the work you left behind is readable from a pocket —
+something stops. Rover is a browser client for the sessions already running on your
+machine: pair once, and the work you left behind is readable from somewhere else —
 with the ability to answer a prompt, run a command, or point a worker at a problem
-without going back to the desk.
+without going back to this terminal.
 
 ```bash
 mars pair               # print the QR, start the bridge, print the link
+mars pair --desk        # the same link, aimed at the desktop shell
+mars pair --open        # open it here, already paired
+mars pair --all         # offer the whole machine, not just this session
 mars pair --check       # what's set up and what isn't, with the fix for each
 mars pair --link        # reprint the link for an already-running bridge
-mars serve --reset      # rotate the pairing token (drops every paired phone)
+mars serve --reset      # rotate the pairing token (drops every paired client)
 ```
 
-Scan the code and the phone is linked. There is no account, no cloud service holding
+Scan the code and the device is linked. There is no account, no cloud service holding
 your data, and nothing to sign up for: the QR carries a one-time link to *your*
-machine, and the phone talks to your daemon over a tunnel that closes when you stop
+machine, and the client talks to your daemon over a tunnel that closes when you stop
 the bridge.
 
-**What you get on the phone:**
+### One link, two shells
+
+There is one address. It opens the **phone** column on a phone and the **desk** on
+anything with a pointer, so nobody has to know which URL they wanted — the link
+printed by `mars pair` cannot guess the reader's hardware at the moment it is printed,
+so it doesn't try.
+
+The rule is *pointer first, width only as a tie-break*: the question is not "how wide"
+but "what is driving this". A coarse pointer on a small screen is a phone. A trackpad
+is a desk at any width. A tablet gets the desk too, because the thing it has plenty of
+is exactly what the phone shell spends its design budget working around. `/desk` and
+`/rover` force one by name, and that choice is remembered — somebody who opens `/desk`
+on a phone meant it.
+
+**The desk is three panes that do not move.** Every paired session down the left, as a
+read-only list: selecting a row changes the centre and never writes anything. One
+workspace in the centre, in either of its two forms — the live terminal you type in, or
+the timeline of what the agent did in it. And Rover's own chat on the right, narrating
+rather than transcribing, because the record is already in the middle.
+
+The phone's `fleet → mission → workspace` depth is a space constraint wearing the
+clothes of a conceptual one. With a screen, all three are simply visible at once — the
+strongest version of that design rather than a stretched one. Nothing in the desk
+re-implements a surface: the timeline, the brief strip, the file explorer and the chat
+are the phone's own components in a different frame.
+
+**What you get on either:**
 
 - **Mission Briefing** — the same situation report `mars attach` shows, in the
   mission-control voice, typed out as it loads. What broke, what finished, what is
@@ -330,7 +360,10 @@ the bridge.
   note. Each offer is a card you press. It never acts on its own.
 
 One pairing covers the whole host: every session on that machine shows up in the
-fleet list, and you switch between them without re-scanning.
+fleet list, and you switch between them without re-scanning. `mars pair --all` says so
+explicitly — the token was always host-wide, so it grants nothing new; it means the
+person who ran it intended to share the machine, and the client adopts every session
+instead of making you find and tap each one.
 
 **Naming what you are looking at.** A workspace called `terminal 3` that has spent the
 morning on a migration tells you nothing from a phone, so three things can rename one:
@@ -369,8 +402,8 @@ and a tunnel binary on PATH for access from outside your LAN; `mars pair` walks 
 through the setup and tells you which piece is missing rather than failing quietly.
 
 **[`ROVER.md`](./ROVER.md) is the full manual** — setup, how to link Claude Code (and the
-one environment variable that silently breaks it), the gesture grammar, what the agent may
-and may not do, and troubleshooting.
+one environment variable that silently breaks it), the desk's three panes, the phone's
+gesture grammar, what the agent may and may not do, and troubleshooting.
 
 ## Keys you already know
 
@@ -437,6 +470,6 @@ anything that reads wrong (especially on the light theme).
 - [`DESIGN.md`](./DESIGN.md) — architecture rationale, tradeoffs, and how the pieces fit.
 - [`key_design.md`](./key_design.md) — the design doctrine and product vision
   (why the keys are what they are, and where Mars is going).
-- [`ROVER.md`](./ROVER.md) — the Rover manual: pairing, Claude Code, and the phone UI.
+- [`ROVER.md`](./ROVER.md) — the Rover manual: pairing, Claude Code, and both shells.
 - [`SECURITY.md`](./SECURITY.md) — the security boundary and how to report a vulnerability.
 - [`AGENTS.md`](./AGENTS.md) — instructions for AI coding agents working on Mars.

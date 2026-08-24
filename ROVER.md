@@ -1,10 +1,13 @@
-# Rover — your sessions on your phone
+# Rover — your sessions, off this machine
 
 Long agent runs don't need you at the keyboard. They need you to *notice* when something stops.
 
-Rover is a phone client for the Mars sessions already running on your machine. Scan a QR once and
-the work you left behind is readable from a pocket — with enough control to answer a prompt, run a
-command, or point a worker at a problem without going back to the desk.
+Rover is a browser client for the Mars sessions already running on your machine. Pair once and the
+work you left behind is readable from somewhere else — with enough control to answer a prompt, run
+a command, or point a worker at a problem without coming back to this terminal.
+
+It has **two shells from one link**: a column built for one thumb, and a three-pane desk built for
+a keyboard. The link decides which you get; see [Two shells](#two-shells).
 
 There is no account and no cloud service holding your data. The QR carries a one-time link to
 **your** machine, over a tunnel that closes when you stop the bridge.
@@ -12,6 +15,7 @@ There is no account and no cloud service holding your data. The QR carries a one
 - [What you need](#what-you-need)
 - [Setup](#setup)
 - [Linking Claude Code](#linking-claude-code)
+- [Two shells](#two-shells)
 - [Using Rover](#using-rover)
 - [Rover chat](#rover-chat)
 - [The manager agent](#the-manager-agent)
@@ -185,7 +189,64 @@ sonnet-5 at low 2.6s, at medium 3.6s, haiku-4.5 3–7s with a weaker answer.
 
 ---
 
+## Two shells
+
+One address serves both. `mars pair` cannot know what you will open its link on, so the link does
+not try to guess — the page decides when it loads.
+
+The rule is **pointer first, width only as a tie-break**. The question is not "how wide is this"
+but "what is driving it": the air gap disappears, the ergonomics invert, attention goes from
+interstitial to ambient, and typing goes from expensive to free. A breakpoint cannot express any
+of that.
+
+| What you open it on | What you get |
+|---|---|
+| Coarse pointer, screen under 900px | **Phone** — the sliding column |
+| Any fine pointer (mouse, trackpad) | **Desk** — three panes, at any width |
+| Tablet — coarse pointer, lots of room | **Desk** |
+
+`/desk` and `/rover` force one by name, and the choice is remembered: somebody who opens `/desk` on
+a phone meant it, and should not be bounced back on the next visit by a rule that thinks it knows
+better. `mars pair --desk` prints a link aimed straight at the desk; `mars pair --open` opens one
+here, already paired.
+
+### The desk
+
+Three panes that do not move, because all three questions are live at once and there is room to
+answer them:
+
+- **Left — the rail.** Every paired session on the machine, always visible, always just a list.
+  Selecting a row changes the centre. It never writes anything.
+- **Centre — one workspace, and the record.** Either the live terminal you type in or the timeline
+  of what the agent did in it. These are two views of the same workspace, not two places.
+- **Right — Rover.** The chat, narrating. It is deliberately *not* the transcript: the record is
+  already in the centre, and putting the timeline here with Rover behind a button makes two visual
+  grammars fight over one job while hiding the thing you actually talk to.
+
+The phone's `fleet → mission → workspace` depth is a space constraint wearing the clothes of a
+conceptual one. On a screen all three are simply visible, which is the strongest version of that
+design rather than a stretched one.
+
+Nothing in the desk re-implements a surface. The timeline, the brief strip, the file explorer and
+the chat are the phone's own components in a different frame — a second desktop copy of any of them
+would be a second copy that drifts.
+
+**Holding a crumb you are already on** opens its siblings, so switching session or workspace is one
+gesture rather than climbing to the parent and diving back down another branch.
+
+**The conversation names itself.** Above the timeline, the desk says which conversation it is
+showing and which project that conversation belongs to. When the transcript's own directory
+disagrees with the workspace's, it says so in accent colour — nothing between a pane and a
+transcript verifies that the conversation belongs to the pane holding it, so the line is there to
+be read. Pressing it re-opens the picker.
+
+---
+
 ## Using Rover
+
+Everything from here describes the **phone** shell unless it says otherwise. The desk shows the
+same surfaces in the frame described above, so the behaviour of the board, the panes, chat and the
+manager is identical — only the navigation differs.
 
 ### Three levels
 
@@ -436,9 +497,13 @@ fresh, once.
 
 ```bash
 mars pair                      # QR + bridge + link
+mars pair --desk               # the same link, aimed at the desk
+mars pair --open               # open it here, already paired
+mars pair --all                # offer the machine, not one session
 mars pair --check              # preflight, with fixes
 mars pair --link               # reprint the link
 mars pair --domain <d>         # pin the tunnel URL
+mars qr [--all]                # just the code, for a camera
 mars pair --supervise          # hand the bridge to launchd
 mars serve --reset             # rotate the token
 mars manager                   # run one manager turn now
@@ -464,3 +529,22 @@ mars reboot [name]             # restart onto the installed binary
 | `MARS_NGROK_DOMAIN` | overrides the configured stable domain |
 | `MARS_ROVER_MODEL` | model for Rover chat (default `claude-sonnet-5`) |
 | `MARS_ROVER_EFFORT` | effort for Rover chat (default `medium`) |
+| `MARS_WEB_DIR` | directory holding a built Rover bundle — **what makes the LAN door work** |
+| `MARS_BRIDGE_PORT` | port the bridge listens on (default `8787`; values ≤1024 ignored) |
+| `MARS_BRIDGE_LOOPBACK` | if set, bind `127.0.0.1` only — no LAN access at all |
+| `MARS_PAIR_ALL` | if set, `mars pair` offers the whole machine by default |
+
+**`MARS_WEB_DIR` is the one to know about.** A LAN link is a *page* URL: the browser fetches HTML
+from the bridge and the page then opens the socket. The hosted app cannot serve that role, because
+it is HTTPS and a page served over HTTPS may not dial `ws://192.168.x.x` — so the copy that can
+talk to your bridge is the copy your bridge hands out. Without this set, the bridge answers every
+path with its own placeholder, the QR resolves, the page returns 200, and it is not Rover.
+
+Point it at a directory containing `index.html`:
+
+```bash
+MARS_WEB_DIR=/path/to/rover/.output/public mars pair
+```
+
+`mars pair` checks this for you and will not offer a LAN door it knows is empty. The tunnel route
+needs none of this — it is served by the hosted app.

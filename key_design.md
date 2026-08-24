@@ -240,6 +240,16 @@ the substrates listed in §6.
   "you've done this 4 times, want a macro?" — the graduation engine generalized from
   teaching keybindings to teaching *automations*.
 
+**Shipped from this horizon (0.7.0–0.7.1).** The manager is the proactivity strand
+made real: it watches the panes, writes a briefing and memos, and — critically — is
+rationed by the interruption budget rather than by what it happens to notice. Rover
+carries that off the machine, first to a phone and now to a second screen. The
+doctrine held on contact: everything the client can do is something a person presses,
+the agent behind Rover chat is read-only and every effect is a proposal, and nothing
+renames, runs or ends anything on its own. What is still open from H3 is the
+*transactional* half — plan preview → transactional run → one-chunk undo is still the
+per-action gate described in §3, not yet a journal (§6).
+
 ---
 
 ## 5. The keymap zoning law

@@ -85,21 +85,27 @@ Everything under `src/` is declared as a module here, including the three
 
 | File | Lines | What it is |
 |---|---:|---|
-| `terminal.rs` | 367 | PTY panes. `spawn` a shell, parse output with `vt100`, emit `TermEvent`. |
-| `session.rs` | 1,358 | The daemon. `ClientFrame`/`ServerFrame` JSON-lines protocol, `server_main`/`client_main`, socket paths, name validation, `ls`/`kill`/`rename`/`killall`. |
-| `agent.rs` | 1,389 | LLM layer. Provider detection and env precedence, `chat`/`chat_with_id_streaming`, per-task builders (`ask`, `translate_shell`, `watch_summary`, `auto_name`, `infer_mission`, `capture_goals`, `shift_brief`), `RUN:`/`TYPE:` directive parsing, rate-limit rotation. |
+| `terminal.rs` | 821 | PTY panes. `spawn` a shell, parse output with `vt100`, emit `TermEvent`. |
+| `session.rs` | 3,562 | The daemon. `ClientFrame`/`ServerFrame` JSON-lines protocol, `server_main`/`client_main`, socket paths, name validation, `ls`/`kill`/`rename`/`killall`. |
+| `agent.rs` | 1,662 | LLM layer. Provider detection and env precedence, `chat`/`chat_with_id_streaming`, per-task builders (`ask`, `translate_shell`, `watch_summary`, `auto_name`, `infer_mission`, `capture_goals`, `shift_brief`), `RUN:`/`TYPE:` directive parsing, rate-limit rotation. |
 | `tiers.rs` | 219 | Model-tier ring: `task → tier → model` per provider, editable at `~/.config/mars/tiers.json`. Explicit `MARS_LLM_MODEL` always wins. |
-| `prompts.rs` | 28 | `include_str!` consts for the 18 `.md` files in `src/prompts/`. **No prompt text lives in code.** |
+| `prompts.rs` | 56 | `include_str!` consts for the 20 `.md` files in `src/prompts/`. **No prompt text lives in code.** |
 | `persona.rs` | 87 | User voice file (`~/.mars/persona.md`) injected as the final system message for VOICE tasks only. |
 | `retrieval.rs` | 524 | Memory: BM25 over command memory + docs corpus, redaction, denylist. Feature-gated. |
 | `syntax.rs` | 195 | syntect highlighting, colors synthesized from the active theme; background streaming worker. Feature-gated. |
-| `worklog.rs` | 489 | The work journal — watch verdicts, missions, goals, briefings as JSONL. Substrate for `mars ls` and the shift report. |
-| `briefing.rs` | 334 | The shift report. Deterministic tier-0 triage (exit codes, tail shape); the LLM only replaces a defensible placeholder, never blocks a frame. |
-| `llm_log.rs` | 355 | LLM call observability (`MARS_LLM_DEBUG`), plus `mars llm-stats` aggregation. |
+| `worklog.rs` | 493 | The work journal — watch verdicts, missions, goals, briefings as JSONL. Substrate for `mars ls` and the shift report. |
+| `briefing.rs` | 358 | The shift report. Deterministic tier-0 triage (exit codes, tail shape); the LLM only replaces a defensible placeholder, never blocks a frame. |
+| `llm_log.rs` | 401 | LLM call observability (`MARS_LLM_DEBUG`), plus `mars llm-stats` aggregation. |
 | `osc133.rs` | 189 | Shell-integration marker scanner (OSC 133/633/7) → exact command boundaries for the ledger. Purely additive. |
-| `broker.rs` | 514 | `mars keyd` — the key-never-leaves-home broker and the remote-side proxy call. Feature-gated. |
+| `broker.rs` | 574 | `mars keyd` — the key-never-leaves-home broker and the remote-side proxy call. Feature-gated. |
 | `ssh.rs` | 514 | `mars ssh` — system-OpenSSH orchestration, remote bootstrap, capability relay. Feature-gated. |
 | `fleet.rs` | 123 | The host registry behind `mars ls` (portable, so it survives a no-`ssh` build). |
+| `manager.rs` | 4,417 | The machine's supervisor. One turn reads what the panes did and writes the briefing and any memos; every judgement carries how it was reached. |
+| `briefs.rs` | 1,950 | Delegated work: an idea, its decisions, a verification step. State is which files exist, never liveness; `verify` runs argv, never a shell. |
+| `health.rs` | 239 | Whether a manager run happened at all — distinct from whether it found anything. |
+| `timeline.rs` | 619 | A transcript as typed rows for a person to skim. Unknown records become `Row::Unknown`, never a parse error; reads are bounded to the file's tail. |
+| `conv.rs` | 251 | The same transcript as prose for a model to fold: gist + delta + cursor, so cost stays flat however long a conversation runs. Found by id, never by rebuilding a path. |
+| `serve.rs` | 3,459 | The Rover bridge (feature `web`, **off by default**). One port, two protocols: a WS upgrade gets the session-socket pump, anything else gets the built Rover bundle from `$MARS_WEB_DIR`. Pairing links have exactly one builder. |
 | `project.rs` | 61 | Bounded lazy file index behind the `@` picker. |
 | `banner.rs` | 39 | Generated splash art (truecolor SGR + a plain block wordmark for themes). |
 
@@ -156,15 +162,28 @@ is why the destructive-action gate covers agents for free.
 
 ## 4. Feature flags and the stub seams
 
-Three optional capabilities, all default-on. Each has an inert twin selected by
-`#[path]` in `main.rs`, so **call sites carry no `cfg`** and never learn the
-capability is missing:
+Three optional capabilities are default-on with an inert twin selected by `#[path]`
+in `main.rs`, so **call sites carry no `cfg`** and never learn the capability is
+missing:
 
 | Feature | Real | Stub | Covers |
 |---|---|---|---|
 | `memory` | `retrieval.rs` | `retrieval_stub.rs` | command memory, docs corpus, redaction |
 | `ssh` | `broker.rs`, `ssh.rs` | `broker_stub.rs` | `mars keyd`, `mars ssh` |
 | `syntax` | `syntax.rs` | `syntax_stub.rs` | syntect highlighting (drops the dep entirely) |
+
+A fourth, `web`, breaks both halves of that pattern — it is **off** by default and has
+no twin:
+
+| Feature | Real | Stub | Covers |
+|---|---|---|---|
+| `web` (off) | `serve.rs` | *none* | `mars pair`, `mars serve`, `mars qr` |
+
+Nothing to stub, because the bridge is additive rather than replaceable: no editor
+path calls into it, so its absence is a missing verb rather than a neutral value. The
+consequences are worth knowing — ten real `#[cfg(feature = "web")]` sites in
+`main.rs`, and **`serve.rs` is not compiled at all in a default build**. Verifying it
+means `cargo run --features web -- --selfcheck`, which is a separate obligation.
 
 `cargo build --no-default-features` must also pass `--selfcheck`. If you touch a real
 module's public surface, mirror it in the stub in the same commit.
@@ -183,6 +202,8 @@ module's public surface, mirror it in the stub in the same commit.
 | Change how something looks | `ui.rs` for layout/structure; `themes.rs` + `src/themes/*.json` for color. Read semantic tokens from `Palette` — never a raw `Color::`. |
 | Add a color to the palette | `tuning.rs` `Palette` + every `src/themes/*.json`. |
 | Add a CLI subcommand | `main.rs` `match first.as_deref()` + the `HELP` const at :67. |
+| Change what Rover shows | the client lives in a separate repo; the host side is `serve.rs` (frames), `timeline.rs` (rows), `manager.rs` (board and briefing). Build with `--features web` or none of it compiles. |
+| Change how a pairing link is built | `serve.rs::build_pair_link_all` — the only builder, deliberately. Never mint a token at link time. |
 | Touch OS behavior | `src/sys/` only. Anything else fails `tools/check-platform-isolation.sh`. |
 | Add a test | extend `selfcheck()` in `main.rs`. Do not add a separate harness. |
 
@@ -203,6 +224,14 @@ module's public surface, mirror it in the stub in the same commit.
 | `logs/calls.jsonl` | LLM call log when `MARS_LLM_DEBUG=1` |
 | `themes/*.json`, `syntaxes/*.sublime-syntax` | Runtime extension points — no rebuild |
 | `auth.sock`, `keyd.log` | Broker socket and log |
+| `machine-id` | This machine, **minted once and never derived** — see `session.rs::machine_id` |
+| `serve.token` | The pairing credential the bridge validates against. Code execution as you |
+| `serve.url`, `serve.pid`, `serve.session`, `serve.instance` | The running bridge: where it is, what it is, which session it fronts |
+| `tunnel.log`, `serve-agent.log` | Tunnel and bridge logs |
+| `manager/` | The manager's own working directory — it is a Claude session, so its turns land in `~/.claude/projects/` like any other |
+| `briefs/` | Delegated work. `WORKING-MODEL.md` holds the standing orders, versioned rather than retyped |
+| `sessions/<name>/` | Per-session state: `restore.json`, `conv/` cursors, memos, snapshots, workspaces |
+| `briefings.jsonl`, `mission.json`, `goals.json` | What the manager has concluded |
 
 `~/.config/mars/` — config written with annotated defaults on first run:
 `keys.json`, `tuning.json`, `tiers.json`.

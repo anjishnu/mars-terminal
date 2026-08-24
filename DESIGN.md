@@ -120,6 +120,17 @@ retrieval.rs The whole memory subsystem behind a ten-symbol facade: command
 session.rs   The client/server split: ClientFrame/ServerFrame protocol over a
              platform-local control channel, FrameWriter (ratatui output → stream),
              server_main/client_main, session lifecycle CLI.
+serve.rs     The Rover bridge (cargo feature `web`, OFF by default): a second
+             client of the session socket, plus a static server for the browser
+             app, on one port distinguished by whether the request is a WS
+             upgrade. Nothing in the editor calls into it — see §7.
+manager.rs   The machine's supervisor: one turn reads what the panes did and
+             writes the briefing and any memos, every judgement carrying how it
+             was reached. briefs.rs holds delegated work; health.rs holds whether
+             a run happened at all.
+timeline.rs  A Claude Code transcript as typed rows for a person to skim. conv.rs
+             reads the same file as prose for a model to fold (gist + delta +
+             cursor). Two readers, one source, deliberately not one module.
 ui.rs        ratatui rendering: layout, panes, status/control bars, dropdown,
              which-key panel, travel-mode panel, ask panel — all read live state
              (tuning, keymap) rather than baking in constants.
@@ -221,6 +232,22 @@ only a new input/output boundary around the already-decoupled `App` (see
 `App::apply_input`/`App::tick` in `app.rs`, shared verbatim by standalone mode and
 the session server).
 
+**A second render target, and the invariant it forced (0.7.1).** The Rover bridge
+attaches to the same socket as any other client, which made "how big is this session"
+a question with two askers for the first time. `ui::render` used to write every pane's
+PTY size as it drew, which is correct while "the size I am drawing at" and "the size
+the session is" are the same fact — and is a race the moment they are not. Two targets
+then resized the panes against each other every frame: a shell shrugs that off, a
+full-screen TUI re-lays-out on each SIGWINCH and emits diffs against a width that has
+already moved.
+
+The rule now is that **the session owns its own size and every target is a viewport
+that copies it**. The session renders once into a grid belonging to no target, the
+target you are typing in decides the dimensions, and a mirror is told the real size so
+it can fit the whole screen rather than crop to its own corner of one. Adding a third
+target changes nothing about this; that is the point of stating it as an invariant
+rather than as a fix.
+
 ## 8. Configuration & tuning — agent-editable by design
 
 Two JSON files, same lifecycle (defaults written on first run, user values layered
@@ -273,16 +300,20 @@ check the *parsed screen contents*, not `bytes.contains(needle)`.
 | Non-modal core | Vim-modal (composable operator·motion grammar) | Explicit user ruling: Emacs/Mac/Claude-Code feel over Vim recall cost; composability argument preserved one layer up (macros over actions, not keystrokes) |
 | Chords kept (`C-x C-s`, etc.) | Spacemacs-style leader-only | Emacs-compatibility / day-one productivity outweighs the documented RSI cost; mitigated by single-chord high-frequency routes and full mouse/bar alternatives |
 | Server renders ANSI | Structured (tmux-style) client/server protocol | Reuses the entire existing ratatui pipeline; no second renderer to build/maintain |
-| One client per session | N simultaneous mirrored clients | Simplest correct model; deferred until real demand (pair-programming-style sharing) |
+| One client per session | N simultaneous mirrored clients | Held until 0.7.1, when Rover supplied the real demand. Resolved by making the session own its size and every target copy it (§7) — not by letting targets negotiate |
 | Per-buffer snapshot undo | Global transaction journal | Ships today; explicitly flagged as insufficient for multi-file agent actions — journal is a planned substrate, not an oversight |
 | `C-c`/`C-v` = copy/paste | Emacs `C-c` as a prefix | Modern-editor muscle memory wins for this audience; Emacs never used `C-c` as a live prefix in this keymap, so nothing is actually lost |
 
 ## 11. Non-goals (for now)
 
-Multiple simultaneous clients per session; cross-crash session save/restore (a
-separate feature from live detach); OSC-52 clipboard forwarding for remote/SSH
-attach; Windows as an SSH remote; a Vim-grammar compatibility layer. See
-`key_design.md` §4 "Deliberately deferred" for the reasoning behind each.
+Cross-crash session save/restore (a separate feature from live detach); OSC-52
+clipboard forwarding for remote/SSH attach; Windows as an SSH remote; a Vim-grammar
+compatibility layer. See `key_design.md` §4 "Deliberately deferred" for the reasoning
+behind each.
+
+*Multiple simultaneous clients per session left this list in 0.7.1* — the Rover
+mirror is a second render target, and §7's "the session owns its own size" exists
+precisely because that stopped being hypothetical.
 
 ## 12. Where to go next
 
