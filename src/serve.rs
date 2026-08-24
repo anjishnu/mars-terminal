@@ -2426,11 +2426,16 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
         Some("agent.candidates") => {
             let cwd = v.get("cwd").and_then(|x| x.as_str()).filter(|c| !c.is_empty());
             let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(12).min(40) as usize;
+            let (list, scoped) = crate::timeline::candidates(cwd, limit);
             let _ = tx.send(
                 serde_json::json!({
                     "t": "agent.candidates",
                     "paneId": v.get("paneId").and_then(|x| x.as_str()).unwrap_or_default(),
-                    "candidates": crate::timeline::candidates(cwd, limit),
+                    "candidates": list,
+                    // Whether these are THIS workspace's conversations or every one on the machine.
+                    // The list looks identical either way, and binding a stranger's conversation to
+                    // a pane is the failure the picker exists to prevent.
+                    "scoped": scoped,
                 })
                 .to_string(),
             );
@@ -2459,10 +2464,19 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 })
             } else {
                 match crate::timeline::rows_for(&chat, limit) {
-                    Some(rows) => serde_json::json!({
-                        "t": "agent.timeline", "paneId": pane, "chat": chat,
-                        "rows": crate::timeline::rows_json(&rows),
-                    }),
+                    Some(rows) => {
+                        // WHOSE conversation this is, read off the transcript's own location rather
+                        // than off anything the caller believes. Sent every poll because it costs
+                        // one directory read, and because the moment it disagrees with the pane the
+                        // reader is looking at is the moment they need to be told.
+                        let (dir, title) = crate::timeline::identity_of(&chat)
+                            .unwrap_or_else(|| (String::new(), String::new()));
+                        serde_json::json!({
+                            "t": "agent.timeline", "paneId": pane, "chat": chat,
+                            "dir": dir, "title": title,
+                            "rows": crate::timeline::rows_json(&rows),
+                        })
+                    }
                     None => serde_json::json!({
                         "t": "agent.timeline", "paneId": pane, "chat": chat, "rows": [],
                         "reason": "no transcript found for this conversation yet",

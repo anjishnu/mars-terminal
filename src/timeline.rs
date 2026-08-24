@@ -418,21 +418,44 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
 /// is watching. The first line of the window is usually a fragment, and `rows_from_str` drops
 /// unparseable lines, so the cost of the cheap read is at most one lost row at the top of a window
 /// the reader is scrolling anyway.
+///
+/// `None` means ONE thing: no file on this machine carries that id. Every other failure happens
+/// after the file has been found, and answering those with `None` too made the caller report "no
+/// transcript found for this conversation yet" — the single claim we know to be false, because the
+/// file is right there and could not be read. A transcript nobody has started and one this process
+/// cannot open look identical to a reader and deserve different answers, so the second becomes a
+/// row that says so.
 pub fn rows_for(chat: &str, limit: usize) -> Option<Vec<Row>> {
-    let path = crate::conv::transcript_for(chat)?;
-    let len = std::fs::metadata(&path).ok()?.len();
-    let from = len.saturating_sub(TAIL_BYTES);
-    let bytes = if from == 0 {
-        std::fs::read(&path).ok()?
-    } else {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(&path).ok()?;
-        f.seek(SeekFrom::Start(from)).ok()?;
-        let mut buf = Vec::new();
-        f.take(TAIL_BYTES + 1).read_to_end(&mut buf).ok()?;
-        buf
-    };
-    Some(rows_from_str(&String::from_utf8_lossy(&bytes), limit))
+    Some(rows_for_path(&crate::conv::transcript_for(chat)?, limit))
+}
+
+/// The rows of a transcript already located, which is where the reading actually happens.
+///
+/// Separate from `rows_for` so the failure above can be exercised at all: `rows_for` finds its file
+/// by searching `~/.claude/projects`, and a check that has to plant a file in the developer's real
+/// Claude Code directory to prove anything is a check nobody will keep.
+pub(crate) fn rows_for_path(path: &std::path::Path, limit: usize) -> Vec<Row> {
+    match read_tail(path) {
+        Ok(bytes) => rows_from_str(&String::from_utf8_lossy(&bytes), limit),
+        Err(e) => vec![Row::Error { message: format!("this conversation could not be read: {e}") }],
+    }
+}
+
+/// The last `TAIL_BYTES` of a file, or the whole of one shorter than that.
+///
+/// Split out so the failures above are one `?`-chain rather than five `.ok()?`s that all mean
+/// different things and collapse to the same answer.
+fn read_tail(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let from = std::fs::metadata(path)?.len().saturating_sub(TAIL_BYTES);
+    if from == 0 {
+        return std::fs::read(path);
+    }
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::new();
+    f.take(TAIL_BYTES + 1).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// Rows as the phone receives them. A flat `kind` rather than a nested enum, because the client
@@ -471,8 +494,14 @@ fn project_slug(cwd: &str) -> String {
 /// touched. The title is Claude Code's own — the name the captain set with `/rename` if there is
 /// one, else the generated `aiTitle` — which is a far better thing to choose from than a uuid, and
 /// reading one bounded window for it costs nothing even on a 200 MB transcript.
-pub fn candidates(cwd: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
-    let Some(home) = crate::sys::paths::home_dir() else { return Vec::new() };
+///
+/// Returns the list AND whether it is scoped to the directory that was asked about, because the
+/// fallback below silently changes what the list MEANS. "Conversations from this workspace" and
+/// "every conversation on this machine" are different offers, and a reader shown the second while
+/// expecting the first will bind a stranger's conversation to their pane and have no way to know.
+/// The caller says which one it handed over; only the picker can say it out loud.
+pub fn candidates(cwd: Option<&str>, limit: usize) -> (Vec<serde_json::Value>, bool) {
+    let Some(home) = crate::sys::paths::home_dir() else { return (Vec::new(), cwd.is_none()) };
     let root = home.join(".claude").join("projects");
     let want = cwd.map(project_slug);
 
@@ -502,13 +531,16 @@ pub fn candidates(cwd: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
             found.push((mtime, path, dname.clone()));
         }
     }
+    // WIDENED, AND SAID SO. The fallback is still right — a wrong-looking list is choosable and an
+    // empty one is a dead end wearing an explanation — but it is no longer silent, because the
+    // reader is the only one who can tell a stranger's conversation from theirs.
     if found.is_empty() && want.is_some() {
-        return candidates(None, limit);
+        return (candidates(None, limit).0, false);
     }
 
     found.sort_by(|a, b| b.0.cmp(&a.0));
     found.truncate(limit);
-    found
+    let list: Vec<serde_json::Value> = found
         .into_iter()
         .filter_map(|(mtime, path, dname)| {
             let id = path.file_stem()?.to_string_lossy().to_string();
@@ -520,7 +552,24 @@ pub fn candidates(cwd: Option<&str>, limit: usize) -> Vec<serde_json::Value> {
             })
             .into()
         })
-        .collect()
+        .collect();
+    (list, want.is_some())
+}
+
+/// WHICH conversation a pane is showing: the project it belongs to, and its name.
+///
+/// The timeline could always render the right rows and still not say whose they were, and a
+/// transcript of the wrong conversation reads as "my pane stopped updating" rather than as "you
+/// are looking at something else". Nothing on this path ever checks that a bound conversation
+/// belongs to the pane holding it, so the reader is the last line of defence — and they cannot be
+/// that while the surface stays silent about what it picked.
+///
+/// The directory comes from the transcript's own location rather than from anything the caller
+/// believes, which is the point: it is the one fact that can DISAGREE with the pane.
+pub fn identity_of(chat: &str) -> Option<(String, String)> {
+    let path = crate::conv::transcript_for(chat)?;
+    let dir = path.parent()?.file_name()?.to_string_lossy().to_string();
+    Some((dir, title_of(&path)))
 }
 
 /// The conversation's own title, from the LAST 64 KB.

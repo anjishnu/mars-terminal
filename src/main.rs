@@ -7577,8 +7577,31 @@ fn selfcheck() -> Result<()> {
                 assert_eq!(timeline::title_of(&auto), "generated-name",
                     "an unrenamed conversation still shows its generated title");
             }
+
+            // AN UNREADABLE TRANSCRIPT IS NOT AN UNSTARTED ONE. `rows_for` answered both with
+            // `None`, and the caller renders that as "no transcript found for this conversation
+            // yet" — the one claim we know to be false when the file is sitting right there. The
+            // reader is told the agent has not spoken; the truth is that we could not look.
+            {
+                let broken = sdir.join("unreadable.jsonl");
+                std::fs::write(&broken, "{}\n")?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o000))?;
+                    // Running as root defeats the mode bits entirely, and a check that silently
+                    // proves nothing is worse than one that is not run.
+                    if std::fs::read(&broken).is_err() {
+                        let rows = timeline::rows_for_path(&broken, 0);
+                        assert!(matches!(rows.as_slice(), [timeline::Row::Error { .. }]),
+                            "an unreadable transcript must say so, not render as empty");
+                    }
+                    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o644))?;
+                }
+            }
         }
         println!("[selfcheck] timeline: a transcript becomes rows, and bookkeeping leaves no trace ... PASS");
+        println!("[selfcheck] timeline: an unreadable transcript says so, never 'not started' ... PASS");
         println!("[selfcheck] manager: a workspace id outlives the daemon that minted it ... PASS");
         println!("[selfcheck] manager: a name is suggested once, then the rename itself silences it ... PASS");
         // Timing is derived from artifact mtimes, so a run's phases can be read off without the
