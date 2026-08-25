@@ -7590,21 +7590,16 @@ fn selfcheck() -> Result<()> {
             // yet" — the one claim we know to be false when the file is sitting right there. The
             // reader is told the agent has not spoken; the truth is that we could not look.
             {
+                // A DIRECTORY WHERE A TRANSCRIPT SHOULD BE. `metadata` succeeds and the read fails,
+                // which is the same branch a permission error takes — without a mode bit, so this
+                // needs no platform primitive, holds on Windows, and cannot be defeated by running
+                // as root the way `chmod 000` silently is.
                 let broken = sdir.join("unreadable.jsonl");
-                std::fs::write(&broken, "{}\n")?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o000))?;
-                    // Running as root defeats the mode bits entirely, and a check that silently
-                    // proves nothing is worse than one that is not run.
-                    if std::fs::read(&broken).is_err() {
-                        let rows = timeline::rows_for_path(&broken, 0);
-                        assert!(matches!(rows.as_slice(), [timeline::Row::Error { .. }]),
-                            "an unreadable transcript must say so, not render as empty");
-                    }
-                    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o644))?;
-                }
+                std::fs::create_dir_all(&broken)?;
+                let rows = timeline::rows_for_path(&broken, 0);
+                assert!(matches!(rows.as_slice(), [timeline::Row::Error { .. }]),
+                    "an unreadable transcript must say so, not render as empty");
+                std::fs::remove_dir(&broken)?;
             }
         }
         println!("[selfcheck] timeline: a transcript becomes rows, and bookkeeping leaves no trace ... PASS");
