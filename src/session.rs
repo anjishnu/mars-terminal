@@ -1799,7 +1799,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         let agent = term.foreground_command().as_deref() == Some("claude");
                         // The conversation id, while the process is still alive to be asked. After
                         // the reboot there is nothing left to ask.
-                        let chat = agent.then(|| term.foreground_pid().and_then(claude_session_of)).flatten();
+                        let chat = agent
+                            .then(|| term.foreground_pid().and_then(|p| claude_session_of(p, &cwd)))
+                            .flatten();
                         // Only a name a PERSON set. `settle()` marks a tab as manually named —
                         // the same flag that stops auto-naming from overwriting it here — so the
                         // two agree about what "named" means instead of guessing from the string.
@@ -2620,11 +2622,35 @@ pub fn restore_path(name: &str) -> Option<std::path::PathBuf> {
 /// is keyed to `Mars-Mission` while its panes restore into `Mars-Mission/mars-terminal`, so a
 /// reboot would have resumed something else entirely and looked like it worked.
 /// The daemon is the only process that can answer this — it holds the pane's pid.
-pub fn claude_session_of_pub(pid: i32) -> Option<String> {
-    claude_session_of(pid)
+pub fn claude_session_of_pub(pid: i32, cwd: &str) -> Option<String> {
+    claude_session_of(pid, cwd)
 }
 
-fn claude_session_of(pid: i32) -> Option<String> {
+/// Does this conversation belong to the pane asking about it?
+///
+/// **Nothing on the path from a pane to a transcript used to ask.** Discovery handed back whatever
+/// id the process table produced, restore wrote it down, and the reader rendered it — so a pane
+/// could hold a real transcript of somebody else's work, which from the outside is
+/// indistinguishable from a pane that has stopped updating.
+///
+/// Rejects only on POSITIVE disagreement. A conversation Claude Code has not filed yet cannot
+/// disagree with anything, and refusing it would put a picker in front of every agent pane during
+/// the seconds before its first write. Absence of evidence is not evidence here; a directory that
+/// says a different name is.
+pub(crate) fn conversation_belongs(id: &str, recorded_cwd: Option<&str>, pane_cwd: &str) -> bool {
+    let want = crate::conv::project_slug(pane_cwd);
+    // The session file records the cwd itself, which is cheaper and available before the
+    // transcript exists.
+    if let Some(c) = recorded_cwd.filter(|c| !c.is_empty()) {
+        return crate::conv::project_slug(c) == want;
+    }
+    // The roster carries no cwd worth trusting — see below — so ask Claude Code's own filing.
+    crate::conv::transcript_dir(id).is_none_or(|d| d == want)
+}
+
+/// `cwd` is the pane's own directory, and every id below is checked against it before it is
+/// returned — a pid alone cannot say whether the conversation it names is this pane's.
+fn claude_session_of(pid: i32, cwd: &str) -> Option<String> {
     let home = crate::sys::paths::home_dir()?;
 
     // Two sources, because neither is complete on its own. Measured on this machine: of five live
@@ -2632,12 +2658,16 @@ fn claude_session_of(pid: i32) -> Option<String> {
     // ids for pids that file was missing. Checking one and trusting it would silently fall back to
     // `--continue` for the rest, which is the wrong-conversation risk this exists to remove.
     let direct = home.join(".claude").join("sessions").join(format!("{pid}.json"));
-    if let Some(id) = std::fs::read_to_string(&direct).ok()
+    if let Some(v) = std::fs::read_to_string(&direct).ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v["sessionId"].as_str().map(String::from))
-        .filter(|s| !s.is_empty())
     {
-        return Some(id);
+        if let Some(id) = v["sessionId"].as_str().filter(|s| !s.is_empty()) {
+            // FAIL CLOSED. The file carries the cwd beside the id and nothing used to read it, so a
+            // pid that resolved to another project's session was adopted in silence. Returning
+            // `None` here puts the picker in front of the reader, which is the honest answer to
+            // "we cannot tell", and one they can correct once.
+            return conversation_belongs(id, v["cwd"].as_str(), cwd).then(|| id.to_string());
+        }
     }
 
     // The roster records the same thing per worker, and reaches processes the file above does not.
@@ -2668,7 +2698,8 @@ fn claude_session_of(pid: i32) -> Option<String> {
             _ => None,
         }
     }
-    find(&roster, &want)
+    let id = find(&roster, &want)?;
+    conversation_belongs(&id, None, cwd).then_some(id)
 }
 
 /// Whether the restore manifest is still read-only: a reboot promised `want` agent panes and

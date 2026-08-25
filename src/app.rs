@@ -1267,9 +1267,14 @@ impl App {
                             // first and was wrong: the previous daemon's dying agent flushes its
                             // last lines seconds AFTER the new daemon starts, which is enough to
                             // make a stopped thread look live. Growth has no such window.
+                            let pane_cwd = term
+                                .spawn_cwd
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default();
                             let id = term
                                 .foreground_pid()
-                                .and_then(crate::session::claude_session_of_pub)
+                                .and_then(|p| crate::session::claude_session_of_pub(p, &pane_cwd))
                                 .or_else(|| {
                                     term.assigned_chat.clone().filter(|c| {
                                         crate::conv::transcript_len(c) > term.assigned_chat_len

@@ -482,14 +482,6 @@ pub fn rows_json(rows: &[Row]) -> Vec<Value> {
         .collect()
 }
 
-/// Claude Code files a conversation under a slug of the directory it was started in:
-/// `/Users/x/Mars-Mission` becomes `-Users-x-Mars-Mission`. Derived rather than stored, which is
-/// normally a smell — but this one belongs to another program and is the only key it exposes, so
-/// the alternative is not a better key, it is no key at all.
-fn project_slug(cwd: &str) -> String {
-    cwd.replace('/', "-")
-}
-
 /// A conversation the captain could bind to a pane: what it is called, and when it was last
 /// touched. The title is Claude Code's own — the name the captain set with `/rename` if there is
 /// one, else the generated `aiTitle` — which is a far better thing to choose from than a uuid, and
@@ -503,7 +495,7 @@ fn project_slug(cwd: &str) -> String {
 pub fn candidates(cwd: Option<&str>, limit: usize) -> (Vec<serde_json::Value>, bool) {
     let Some(home) = crate::sys::paths::home_dir() else { return (Vec::new(), cwd.is_none()) };
     let root = home.join(".claude").join("projects");
-    let want = cwd.map(project_slug);
+    let want = cwd.map(crate::conv::project_slug);
 
     let mut found: Vec<(u64, std::path::PathBuf, String)> = Vec::new();
     for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {

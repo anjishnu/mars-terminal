@@ -48,14 +48,7 @@ pub struct Conv {
 /// that last ran hours ago is a lie of exactly the kind this surface exists to stop telling.
 pub fn newest_for_dir(dir: &Path) -> Option<(String, u64)> {
     let root = projects_root()?;
-    // Claude Code's encoding: every `/` and `.` becomes `-`. `/Users/x/.mars/manager` →
-    // `-Users-x--mars-manager`, which is why the double dash is not a typo.
-    let encoded: String = dir
-        .display()
-        .to_string()
-        .chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
-        .collect();
+    let encoded = project_slug(&dir.display().to_string());
     let mut best: Option<(std::time::SystemTime, String)> = None;
     for e in std::fs::read_dir(root.join(encoded)).ok()?.flatten() {
         let p = e.path();
@@ -75,6 +68,28 @@ pub fn newest_for_dir(dir: &Path) -> Option<(String, u64)> {
             .unwrap_or(0);
         (id, secs)
     })
+}
+
+/// Claude Code's filing name for a directory: every `/` and `.` becomes `-`.
+///
+/// `/Users/x/.mars/manager` → `-Users-x--mars-manager`, which is why the double dash is not a typo.
+///
+/// **One copy, because there were two and they disagreed.** `timeline.rs` grew its own that mapped
+/// `/` and left `.` alone, so any path containing a dot produced a name matching no directory —
+/// and the candidate list, finding nothing there, silently widened to every conversation on the
+/// machine. A derived key that belongs to another program is exactly the kind that must be derived
+/// in one place: the alternative is not a better key, it is two keys right about different paths.
+pub fn project_slug(dir: &str) -> String {
+    dir.trim_end_matches('/')
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
+/// Which project directory Claude Code filed this conversation under — `None` until it has written
+/// the transcript at all.
+pub fn transcript_dir(chat: &str) -> Option<String> {
+    Some(transcript_for(chat)?.parent()?.file_name()?.to_string_lossy().to_string())
 }
 
 fn projects_root() -> Option<PathBuf> {

@@ -7608,7 +7608,34 @@ fn selfcheck() -> Result<()> {
             }
         }
         println!("[selfcheck] timeline: a transcript becomes rows, and bookkeeping leaves no trace ... PASS");
+        // A CONVERSATION FROM ANOTHER DIRECTORY IS REFUSED. Discovery reads an id out of the
+        // process table and nothing downstream ever asked whether it belonged to the pane — so a
+        // pane could hold a real transcript of somebody else's work, which from the outside looks
+        // exactly like a pane that has stopped updating.
+        {
+            use session::conversation_belongs as belongs;
+            let here = "/Users/x/Mars-Mission";
+            assert!(belongs("id", Some(here), here), "the pane's own conversation must be kept");
+            assert!(!belongs("id", Some("/Users/x/Nourish"), here),
+                "a conversation recorded against another directory must be refused");
+            // Sibling, not parent: Claude Code files these separately and so must we.
+            assert!(!belongs("id", Some("/Users/x/Mars-Mission/mars-rover"), here),
+                "a subdirectory is a different project, not the same one");
+            // Not yet filed: absence of evidence is not evidence, or every agent pane would meet a
+            // picker in the seconds before its first write.
+            assert!(belongs("no-such-conversation-id", None, here),
+                "an unfiled conversation cannot disagree and must not be refused");
+            // THE DOT. `timeline.rs` mapped `/` and left `.` alone, so any dotted path produced a
+            // name matching no directory — and the candidate list, finding nothing, widened to
+            // every conversation on the machine.
+            assert_eq!(crate::conv::project_slug("/Users/x/.mars/manager"), "-Users-x--mars-manager",
+                "a dot is encoded like a slash; the double dash is not a typo");
+            assert_eq!(crate::conv::project_slug("/Users/x/Mars-Mission/"),
+                crate::conv::project_slug("/Users/x/Mars-Mission"),
+                "a trailing slash must not make a directory a different project");
+        }
         println!("[selfcheck] timeline: an unreadable transcript says so, never 'not started' ... PASS");
+        println!("[selfcheck] conv: a conversation from another directory is refused ... PASS");
         println!("[selfcheck] manager: a workspace id outlives the daemon that minted it ... PASS");
         println!("[selfcheck] manager: a name is suggested once, then the rename itself silences it ... PASS");
         // Timing is derived from artifact mtimes, so a run's phases can be read off without the
