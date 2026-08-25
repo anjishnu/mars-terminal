@@ -529,22 +529,30 @@ mars reboot [name]             # restart onto the installed binary
 | `MARS_NGROK_DOMAIN` | overrides the configured stable domain |
 | `MARS_ROVER_MODEL` | model for Rover chat (default `claude-sonnet-5`) |
 | `MARS_ROVER_EFFORT` | effort for Rover chat (default `medium`) |
-| `MARS_WEB_DIR` | directory holding a built Rover bundle — **what makes the LAN door work** |
 | `MARS_BRIDGE_PORT` | port the bridge listens on (default `8787`; values ≤1024 ignored) |
-| `MARS_BRIDGE_LOOPBACK` | if set, bind `127.0.0.1` only — no LAN access at all |
+| `MARS_BRIDGE_LOOPBACK` | if set, bind `127.0.0.1` only |
 | `MARS_PAIR_ALL` | if set, `mars pair` offers the whole machine by default |
+| `MARS_WEB_DIR` | serve the app from a local build — **development only**, see below |
 
-**`MARS_WEB_DIR` is the one to know about.** A LAN link is a *page* URL: the browser fetches HTML
-from the bridge and the page then opens the socket. The hosted app cannot serve that role, because
-it is HTTPS and a page served over HTTPS may not dial `ws://192.168.x.x` — so the copy that can
-talk to your bridge is the copy your bridge hands out. Without this set, the bridge answers every
-path with its own placeholder, the QR resolves, the page returns 200, and it is not Rover.
+### The LAN route is a development path
 
-Point it at a directory containing `index.html`:
+**Use the tunnel. `mars pair` prints a link that works from anywhere and needs nothing set up.**
+Everything above describes it.
+
+There is a second route — the browser loading Rover directly from your machine over the LAN — and
+it is deliberately not a product surface. The reason is a browser rule rather than a missing
+feature: a LAN link is a *page* URL, the hosted app is HTTPS, and a page served over HTTPS may not
+open `ws://192.168.x.x`. So the only copy of the app that can talk to your bridge over the LAN is
+one your bridge serves itself, which means having built the client locally.
+
+If you have:
 
 ```bash
-MARS_WEB_DIR=/path/to/rover/.output/public mars pair
+MARS_WEB_DIR=/path/to/rover/.output/public mars pair   # the LAN door now appears
+mars qr                                                # a LAN QR, which never leaves your network
 ```
 
-`mars pair` checks this for you and will not offer a LAN door it knows is empty. The tunnel route
-needs none of this — it is served by the hosted app.
+If you have not, the LAN door is not mentioned and `mars qr` points you at `mars pair`. This is on
+purpose: a door that is named and then withdrawn is worse than one that was never named, and the
+placeholder page a bundle-less bridge returns is a 200 that is not Rover — the most convincing kind
+of broken.

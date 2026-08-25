@@ -123,12 +123,17 @@ fn live_session_count() -> usize {
 /// Can this bridge actually serve the Rover app, or only the socket?
 ///
 /// A LAN link is a page URL: the browser fetches HTML from this bridge and the page then opens the
-/// socket. Without a built bundle the bridge answers every path with its own placeholder — "the
-/// WebSocket bridge is live" — so the link resolves, returns 200, and shows a stub. The socket was
-/// never the problem; there was no app at that address.
+/// socket. Without a built bundle the bridge answers every path with its own placeholder, so the
+/// link resolves, returns 200, and shows a stub. The socket was never the problem; there was no
+/// app at that address.
 ///
-/// Checked rather than assumed, because I shipped a screen that offered the LAN door while this
-/// was false, and a 200 that is not the app is the most convincing kind of broken.
+/// **This is what makes the LAN route a development path rather than a product one.** The hosted
+/// app cannot fill the gap — it is https, and a page served over https may not dial
+/// `ws://192.168.x.x`, so the only copy that can talk to this bridge is one this bridge hands out.
+/// Shipping that would mean shipping the built client inside the binary. Until it does, the tunnel
+/// is the door for everybody, and this predicate gates whether the LAN one is mentioned AT ALL —
+/// not whether its absence is explained. A door offered and then withdrawn is worse than one that
+/// was never named, and a 200 that is not the app is the most convincing kind of broken.
 ///
 /// `index.html` specifically: this server matches exact files and has no SPA fallback, so a
 /// directory without an entry document cannot answer `/rover` whatever else is in it.
@@ -461,11 +466,11 @@ pub fn qr_main(session_arg: Option<String>) -> Result<()> {
     // reads as the app being broken rather than as nothing having been built.
     if !serves_app() {
         println!();
-        println!("  This bridge has no app to serve, so a LAN QR would open a placeholder page");
-        println!("  rather than Rover — the socket is live, but a QR is a page URL.");
+        println!("  \x1b[1mmars pair\x1b[0m is the one you want — it prints a link that works from anywhere.");
         println!();
-        println!("  Point MARS_WEB_DIR at a directory containing index.html, or use");
-        println!("  `mars pair` for the hosted link, which brings its own app.");
+        println!("  \x1b[38;5;244m`mars qr` prints a LAN link, which the bridge can only serve from a locally");
+        println!("  built copy of the app (MARS_WEB_DIR). That is a development path; the tunnel");
+        println!("  link brings its own app and needs nothing set up.\x1b[0m");
         println!();
         return Ok(());
     }
@@ -1212,10 +1217,15 @@ fn tunnel_answers(base: &str) -> Result<(), TunnelFault> {
                             "   RESTARTING WILL NOT HELP — a new tunnel gets a new ngrok name and the".into(),
                             "   same block. What does work:".into(),
                             "     · this machine     mars attach '<link>'   no tunnel involved".into(),
+                            // Only when this bridge can actually serve the app; otherwise it is a
+                            // remedy the reader cannot take, offered at their least patient moment.
                             "     · same wifi        `mars qr` — a LAN link, which never leaves the network".into(),
                             "     · a phone          turn wifi off; cellular is a different network".into(),
                             "     · everywhere       allow ngrok on the router, or use a custom domain".into(),
-                        ],
+                        ]
+                        .into_iter()
+                        .filter(|l: &String| serves_app() || !l.contains("mars qr"))
+                        .collect(),
                     });
                 }
                 return Err(TunnelFault {
@@ -1358,15 +1368,12 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
         println!("  {url}");
         println!();
     }
-    // LABELLED ABSENCE. A door that is missing for a fixable reason should say the reason; leaving
-    // it out entirely is how somebody concludes the LAN path does not exist.
-    if lan.is_none() && !std::env::var_os("MARS_BRIDGE_LOOPBACK").is_some() {
-        println!("  \x1b[1msame wifi\x1b[0m  \x1b[38;5;208mnot available — this bridge has no app to serve\x1b[0m");
-        println!("  \x1b[38;5;244mThe socket is live, but a LAN link is a page URL and there is no built");
-        println!("  bundle behind it. Point MARS_WEB_DIR at a directory containing index.html");
-        println!("  and this door appears.\x1b[0m");
-        println!();
-    }
+    // NO LABELLED ABSENCE ANY MORE. A missing door used to explain itself and name the variable
+    // that would summon it, which is right for a feature that is merely unconfigured and wrong for
+    // one that is not shipped. The LAN route needs a locally built bundle, so it is a development
+    // convenience rather than a product surface — and telling every reader how to chase it sends
+    // them after a build they have no reason to have. It appears when it works and is silent when
+    // it does not; the tunnel is the door.
     Ok(())
 }
 
@@ -1542,8 +1549,10 @@ fn serve_static(mut stream: TcpStream) -> Result<()> {
             "<!doctype html><meta charset=utf-8><title>Rover bridge</title>\
              <body style=\"font-family:monospace;background:#0a0a0a;color:#f5f2f0;padding:2rem\">\
              <h1 style=\"color:#ea5a3a\">Rover bridge</h1>\
-             <p>The WebSocket bridge is live. Point the Rover PWA here, or set \
-             <code>MARS_WEB_DIR</code> to serve the built app.</p></body>"
+             <p>The socket is live — this address serves no app.</p>\
+             <p>Run <code>mars pair</code> on the host and open the link it prints.</p>\
+             <p style=\"color:#8a8580\">Serving the app from here is a development path: it needs a \
+             local build on <code>MARS_WEB_DIR</code>.</p></body>"
                 .to_string()
         });
     // A header only this bridge sends. It is what makes a tunnel probe conclusive: ngrok's own

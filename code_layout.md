@@ -105,7 +105,7 @@ Everything under `src/` is declared as a module here, including the three
 | `health.rs` | 239 | Whether a manager run happened at all — distinct from whether it found anything. |
 | `timeline.rs` | 619 | A transcript as typed rows for a person to skim. Unknown records become `Row::Unknown`, never a parse error; reads are bounded to the file's tail. |
 | `conv.rs` | 251 | The same transcript as prose for a model to fold: gist + delta + cursor, so cost stays flat however long a conversation runs. Found by id, never by rebuilding a path. |
-| `serve.rs` | 3,459 | The Rover bridge (feature `web`, **off by default**). One port, two protocols: a WS upgrade gets the session-socket pump, anything else gets the built Rover bundle from `$MARS_WEB_DIR`. Pairing links have exactly one builder. |
+| `serve.rs` | 3,459 | The Rover bridge (feature `web`, **off by default**). One port, two protocols: a WS upgrade gets the session-socket pump, anything else gets the built Rover bundle from `$MARS_WEB_DIR` (a development path — the tunnel is the shipped route). Pairing links have exactly one builder. |
 | `project.rs` | 61 | Bounded lazy file index behind the `@` picker. |
 | `banner.rs` | 39 | Generated splash art (truecolor SGR + a plain block wordmark for themes). |
 

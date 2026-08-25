@@ -398,8 +398,10 @@ do, what someone without one can't, and how text an agent reads is treated as
 untrusted input.
 
 Rover needs the `web` feature (`cargo install mars-terminal --features web --locked`)
-and a tunnel binary on PATH for access from outside your LAN; `mars pair` walks you
-through the setup and tells you which piece is missing rather than failing quietly.
+and a tunnel binary on PATH; `mars pair` walks you through the setup and tells you
+which piece is missing rather than failing quietly. The tunnel is the route — serving
+the app straight off your machine over the LAN is a development path and needs a
+locally built client (see `MARS_WEB_DIR` in [`ROVER.md`](./ROVER.md)).
 
 **[`ROVER.md`](./ROVER.md) is the full manual** — setup, how to link Claude Code (and the
 one environment variable that silently breaks it), the desk's three panes, the phone's

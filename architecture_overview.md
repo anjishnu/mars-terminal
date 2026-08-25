@@ -569,9 +569,12 @@ A second client of the existing session socket. The daemon protocol is unchanged
   well as a socket.
 - **`serve_static`** serves the built Rover bundle from `$MARS_WEB_DIR`, falling back
   to `index.html` for unknown paths because the router is client-side. Without a
-  bundle it answers a placeholder — which is why `serves_app()` exists and why the
-  LAN door is only offered when there is something behind it. A 200 that is not the
-  app is the most convincing kind of broken.
+  bundle it answers a placeholder, which is why `serves_app()` exists. **The LAN route
+  is a development path by decision**: the hosted app is https and may not dial
+  `ws://192.168.x.x`, so only a locally built copy can serve it, and `serves_app()`
+  gates whether that door is mentioned at all rather than whether its absence is
+  explained. A door named and then withdrawn is worse than one never named — and a
+  200 that is not the app is the most convincing kind of broken.
 - **Pairing** has one builder (`build_pair_link_all`) reached by every caller, because
   two functions that must agree about a token, a fragment format, a route and a
   protocol version eventually will not. Tokens are read from the file the bridge

@@ -85,8 +85,8 @@ and the desk on anything with a pointer, so nobody has to know which URL they wa
   page URL, and without a built bundle the bridge answers every path with its own
   placeholder — so the code scanned, the page loaded, returned 200, and was not
   Rover, which reads as the app being broken rather than as nothing having been
-  built. Both doors are now printed, ordered by which one actually works from where
-  you are standing, and a missing one says why it is missing.
+  built. Doors are printed in the order they actually work from where you are
+  standing, and the LAN one is simply absent when it cannot work.
 - **A blocked tunnel says so instead of blaming ngrok.** A network that filters by
   SNI returns a plaintext redirect, which is a perfectly good HTTP response and
   reads exactly like a tunnel whose agent has died — so the advice was "restart it",
@@ -117,9 +117,12 @@ and the desk on anything with a pointer, so nobody has to know which URL they wa
 
 ### Known limitations
 
-- **The LAN route needs a built bundle.** The bridge serves the Rover app from
-  `MARS_WEB_DIR`; without it, only the tunnel route — which is served by the hosted
-  app — reaches a working client. `mars pair` says which doors are available and why.
+- **The LAN route is a development path, by decision.** The tunnel is the door: it
+  works from anywhere and needs nothing configured. Serving the app straight off your
+  machine requires a locally built client on `MARS_WEB_DIR`, because the hosted app is
+  https and a page served over https may not dial `ws://192.168.x.x`. Rather than
+  advertise a door most readers cannot open, the LAN one now appears only when it
+  works and is silent when it does not.
 - **Structured intents are recorded, not executed.** `run` and `jump` from the client
   land in the worklog and wait for the daemon to grow a JSON action sink. They are
   never silently dropped.
