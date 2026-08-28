@@ -231,8 +231,10 @@ Nothing in the desk re-implements a surface. The timeline, the brief strip, the 
 the chat are the phone's own components in a different frame — a second desktop copy of any of them
 would be a second copy that drifts.
 
-**Holding a crumb you are already on** opens its siblings, so switching session or workspace is one
-gesture rather than climbing to the parent and diving back down another branch.
+**Tap any crumb** to see everywhere it can take you — up a level, or sideways to another session
+or workspace — then **hold a row to go**. The trail obeys the same rule as everything else: a tap
+reads, a hold commits. Switching session or workspace is one gesture rather than climbing to the
+parent and diving back down another branch.
 
 **The conversation names itself.** Above the timeline, the desk says which conversation it is
 showing and which project that conversation belongs to. When the transcript's own directory

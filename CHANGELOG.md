@@ -33,11 +33,14 @@ and the desk on anything with a pointer, so nobody has to know which URL they wa
   of exactly what the phone shell spends its budget working around. `/desk` and
   `/rover` still force one by name, and that choice is remembered, because somebody
   who opens `/desk` on a phone meant it.
-- **Sideways navigation in the breadcrumb.** Holding a crumb has always meant "take
-  me there", which left the crumb you are standing on inert — the one place where
-  the useful move is obvious, and it is across rather than up. Holding it now opens
-  its siblings, so changing session or workspace is one gesture instead of climbing
-  to the parent and diving down another branch.
+- **The breadcrumb opens instead of teleporting.** Pressing a crumb used to navigate,
+  so the trail took you out of the screen you were reading before you had seen what
+  else was on offer, and there was no way to look without going. A crumb is now a tap
+  that opens everywhere that step can reach — up a level, or sideways to another
+  session or workspace — and each row commits on a hold. That is the app's own rule,
+  tap reads and hold commits; the trail was the one surface disobeying it. Changing
+  session or workspace is one gesture rather than climbing to the parent and diving
+  down another branch.
 - **`mars pair --desk`** aims the printed link at the desktop shell, and
   **`mars pair --open`** opens it here, already paired.
 - **`mars pair --all` and `mars qr --all`** offer the whole machine rather than one
