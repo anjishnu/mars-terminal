@@ -9090,6 +9090,67 @@ fn selfcheck() -> Result<()> {
         let pick = push_candidate(&[a, b], false, &HashMap::new(), now, &t).unwrap();
         assert_eq!(pick.pane, "terminal 3", "oldest eligible stall wins the single interrupt");
         println!("[selfcheck] push: one interrupt per tick, to the longest wait ... PASS");
+
+        // THE PERSON, NOT THE PANE. The per-pane cooldown rations one workspace and boards
+        // arrive about once a second, so two stalled workspaces each pass their own gate and
+        // buzz seconds apart. What a reader experiences is the total.
+        {
+            let other = |name: &str, stall: u64| PaneFacts {
+                session: "mars-dev".into(),
+                pane: name.into(),
+                verdict: "stalled".into(),
+                cmd: Some("claude".into()),
+                stall_secs: stall,
+                prompt: Some("proceed?".into()),
+            };
+            let mut sent: HashMap<String, u64> = HashMap::new();
+            let a = push_candidate(&[other("terminal 2", 900)], false, &sent, now, &t)
+                .expect("the first eligible pane notifies");
+            sent.insert(a.key.clone(), now);
+            assert!(
+                push_candidate(&[other("terminal 3", 1200)], false, &sent, now + 5, &t).is_none(),
+                "a SECOND workspace must not buzz inside the machine-wide hour"
+            );
+            // And the ceiling is a rate, not a latch: past the window it opens again.
+            assert!(
+                push_candidate(&[other("terminal 3", 1200)], false, &sent, now + 3601, &t)
+                    .is_some(),
+                "the ceiling must expire, or one busy hour would silence the day"
+            );
+        }
+        println!("[selfcheck] push: a second workspace does not buzz inside the same hour ... PASS");
+
+        // The off switch. Everything else here tunes WHEN; this answers WHETHER, and a knob that
+        // only mostly works is worse than none.
+        {
+            let mut off = t.clone();
+            off.push_enabled = false;
+            assert!(
+                push_candidate(&[agent(900, Some("proceed?"))], false, &HashMap::new(), now, &off)
+                    .is_none(),
+                "push_enabled = false must silence an otherwise perfect candidate"
+            );
+        }
+        println!("[selfcheck] push: push_enabled is honoured ... PASS");
+
+        // THE KNOBS ARE LOAD-BEARING. `notify_for_board` passed `Tuning::default()`, so these
+        // three were documented, written into the user's config on first run, and ignored — and
+        // the floor being ten minutes with no way to lower it is also what made the feature
+        // impossible to test on a real phone.
+        {
+            let brief = agent(60, Some("proceed?"));
+            assert!(
+                push_candidate(&[brief.clone()], false, &HashMap::new(), now, &t).is_none(),
+                "60s of stall is under the default floor"
+            );
+            let mut eager = t.clone();
+            eager.push_min_stall_secs = 30;
+            assert!(
+                push_candidate(&[brief], false, &HashMap::new(), now, &eager).is_some(),
+                "lowering push_min_stall_secs must change what notifies, or the knob is a lie"
+            );
+        }
+        println!("[selfcheck] push: the stall floor is whatever the config says ... PASS");
     }
 
     // ── DOES A REAL BOARD REACH THE RULES ────────────────────────────────────────────────────

@@ -3343,6 +3343,24 @@ fn is_agent(cmd: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+/// Have we already spent the interrupts this hour, or this day, allows?
+///
+/// **A ceiling being reached is a defect signal, not a valve working.** If the classifier were
+/// right about what deserves a person it would not have four things to say in a day, so
+/// `mars manager health` reports how often this fired rather than letting it drop things
+/// quietly. Silent suppression would hide exactly the evidence that the gates upstream need
+/// rewriting.
+pub fn over_ceiling(
+    last_sent: &std::collections::HashMap<String, u64>,
+    ts: u64,
+    t: &crate::tuning::Tuning,
+) -> bool {
+    let within = |window: u64| {
+        last_sent.values().filter(|&&sent| ts.saturating_sub(sent) < window).count() as u64
+    };
+    within(3600) >= t.push_max_per_hour || within(86_400) >= t.push_max_per_day
+}
+
 /// N1 — *your agent is waiting on you*.
 ///
 /// `watched` is presence: you are already looking, so there is nothing to tell you. `last_sent`
@@ -3358,8 +3376,22 @@ pub fn push_candidate(
     ts: u64,
     t: &crate::tuning::Tuning,
 ) -> Option<Notification> {
+    // Gate 0 — the feature is on at all.
+    if !t.push_enabled {
+        return None;
+    }
     // Gate 4 — you are not already looking.
     if watched {
+        return None;
+    }
+    // Gate 7 — THE PERSON, not the pane. Every gate below rations one workspace, and three
+    // stalled workspaces each pass their own: the cooldown is keyed per pane, so a second
+    // workspace notifies on the very next board frame a second later. What a reader
+    // experiences is the total, so the total is what has to be bounded.
+    //
+    // Counted off `last_sent` rather than a new store, because the answer is already in it —
+    // a second piece of state tracking the same events is a second one to keep in step.
+    if over_ceiling(last_sent, ts, t) {
         return None;
     }
     let mut best: Option<(u64, Notification)> = None;
@@ -3587,9 +3619,17 @@ pub fn health_report(ts: u64) -> Result<String> {
     // What was SEEN: distinct versions of each target that reached a human.
     let mut seen: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
+    // Interrupts the machine-wide ceiling dropped. Counted in the same pass as impressions
+    // because it is the same file and a second read of it would drift.
+    let mut ceiling_hits = 0usize;
     if let Ok(body) = std::fs::read_to_string(repo.join("events.jsonl")) {
         for line in body.lines() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if v["kind"].as_str() == Some("push_ceiling")
+                && v["at_ts"].as_u64().unwrap_or(0) >= cutoff
+            {
+                ceiling_hits += 1;
+            }
             if v["kind"].as_str() != Some("seen") {
                 continue;
             }
@@ -3706,6 +3746,21 @@ pub fn health_report(ts: u64) -> Result<String> {
         if let Some(age) = m.modified().ok().and_then(|t| t.elapsed().ok()) {
             out.push_str(&format!("\n  briefing written {} ago\n", coarse_age(age.as_secs())));
         }
+    }
+
+    // LABELLED ABSENCE, like every other metric here: a zero that is printed is a measurement,
+    // and a line that is missing is indistinguishable from a feature that never ran.
+    out.push_str(&format!(
+        "\n  interrupts suppressed by the ceiling, last 24h: {ceiling_hits}\n"
+    ));
+    if ceiling_hits > 0 {
+        // Deliberately a defect rather than a note. The ceiling working is the classifier
+        // failing: if it were right about what deserves a person, it would not have had this
+        // much to say.
+        defects.push(format!(
+            "the interrupt ceiling dropped {ceiling_hits} notification(s) — the gates upstream \
+             are letting through more than a person should be asked to read"
+        ));
     }
 
     out.push('\n');

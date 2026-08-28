@@ -74,6 +74,14 @@ pub struct Tuning {
     pub push_stale_secs: u64,
     /// One notification per pane per this long, regardless of what the text says.
     pub push_cooldown_secs: u64,
+    /// The off switch. Every other knob tunes when to interrupt; this one answers whether.
+    pub push_enabled: bool,
+    /// Interrupts per hour across the WHOLE machine, not per pane. The per-pane cooldown
+    /// rations one workspace; this rations the person.
+    pub push_max_per_hour: u64,
+    /// And per day. A ceiling being reached is a bug report about the classifier, not a
+    /// valve doing its job — `mars manager health` says when it happens.
+    pub push_max_per_day: u64,
     pub max_panes: usize,
     pub scroll_margin: usize,
     pub page_overlap: usize,
@@ -208,6 +216,9 @@ impl Default for Tuning {
             push_min_stall_secs: 600,
             push_stale_secs: 3600,
             push_cooldown_secs: 3600,
+            push_enabled: true,
+            push_max_per_hour: 1,
+            push_max_per_day: 4,
             max_panes: 4,
             scroll_margin: 3,
             page_overlap: 2,
@@ -355,6 +366,21 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "One notification per pane per this long, REGARDLESS of whether the text changed. \
              This is the gate that would have stopped a memo that rewrote itself 50,570 times \
              with different words every time."
+        )),
+        ("push_enabled", knob(json!(d.push_enabled),
+            "Whether a stalled pane may raise a notification at all. Everything else here tunes \
+             WHEN; this answers WHETHER, and it is the knob to reach for before turning the \
+             feature off by ignoring it."
+        )),
+        ("push_max_per_hour", knob(json!(d.push_max_per_hour),
+            "Interrupts per hour across the whole machine. The per-pane cooldown rations one \
+             workspace; three stalled workspaces would still buzz three times without this, \
+             because each passes its own gate."
+        )),
+        ("push_max_per_day", knob(json!(d.push_max_per_day),
+            "The hard ceiling. Reaching it is a defect signal rather than a success: if the \
+             classifier were right it would not have this much to say. `mars manager health` \
+             reports how often it fired instead of dropping it silently."
         )),
         ("max_panes", knob(json!(d.max_panes),
             "Maximum panes per tab. Splits beyond this are refused.")),
@@ -671,6 +697,12 @@ pub fn load() -> Tuning {
         t.push_min_stall_secs   = get_u64(&map, "push_min_stall_secs", t.push_min_stall_secs);
         t.push_stale_secs       = get_u64(&map, "push_stale_secs", t.push_stale_secs);
         t.push_cooldown_secs    = get_u64(&map, "push_cooldown_secs", t.push_cooldown_secs);
+        t.push_max_per_hour     = get_u64(&map, "push_max_per_hour", t.push_max_per_hour);
+        t.push_max_per_day      = get_u64(&map, "push_max_per_day", t.push_max_per_day);
+        t.push_enabled = map
+            .get("push_enabled")
+            .and_then(|e| e.value.as_bool())
+            .unwrap_or(t.push_enabled);
         t.max_panes             = get_u64(&map, "max_panes", t.max_panes as u64) as usize;
         t.scroll_margin         = get_u64(&map, "scroll_margin", t.scroll_margin as u64) as usize;
         t.page_overlap          = get_u64(&map, "page_overlap", t.page_overlap as u64) as usize;

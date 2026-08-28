@@ -713,6 +713,30 @@ pub fn supervise_main(session_arg: Option<String>) -> Result<()> {
 /// Three states rather than a boolean, because "not ready yet" and "this will never work" are
 /// opposite facts that a boolean renders identically — and the phone has to draw them differently:
 /// one is worth waiting through, the other is worth explaining.
+/// When each pane last interrupted somebody, for the whole bridge process.
+///
+/// **Was one map per connection**, on the argument that "a reconnect is a new session and the
+/// phone's own 60s dedup covers the replay". The second half of that is the load-bearing part
+/// and still holds — a map that outlived the process would mean a notification nobody received
+/// still burning its hour, so this stays in memory and is deliberately NOT written to disk.
+///
+/// The first half does not hold. The phone's dedup window is 60 seconds; `push_cooldown_secs`
+/// is an hour. Any reconnect more than a minute apart therefore re-notified the same stalled
+/// pane, and reconnects are routine — a network change, a backgrounded tab, a tunnel blip. The
+/// promise of one interrupt per pane per hour quietly became one per minute under a flapping
+/// link, which is the regression the flap selfcheck exists to catch.
+///
+/// Process-wide is also what makes the machine-wide ceiling meaningful: two phones attached to
+/// one host are two connections, and a ceiling counted per connection would not be one.
+static NOTIFY_SENT: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Run `f` against the shared cooldown map.
+fn with_notify_sent<T>(f: impl FnOnce(&mut std::collections::HashMap<String, u64>) -> T) -> T {
+    let mut g = NOTIFY_SENT.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(std::collections::HashMap::new))
+}
+
 static ROVER_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static ROVER_RAMP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ROVER_DETAIL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -998,22 +1022,69 @@ const BRIDGE_HEADER: &str = "X-Mars-Bridge";
 ///
 /// `sent` is this connection's cooldown memory — keyed on `<session>:<pane>` rather than on
 /// content, because the failure it exists to prevent wrote different words every single time.
+/// THE READER'S OWN SETTINGS, not the compiled ones.
+///
+/// This passed `Tuning::default()`, so `push_min_stall_secs`, `push_stale_secs` and
+/// `push_cooldown_secs` did nothing on the one path that reads them — they are documented as
+/// editable, `tuning.rs` writes them into `~/.config/mars/tuning.json` on first run, and every
+/// install ran the built-in numbers regardless. It also made the feature untestable: the stall
+/// floor is ten minutes and there was no way to lower it.
+///
+/// `t` is threaded in rather than loaded here: boards arrive about once a second, and re-reading
+/// a config file at that rate to answer a question that changes when a person edits it would be
+/// a file read per second forever.
 fn notify_for_board(
     board_json: &str,
-    sent: &mut std::collections::HashMap<String, u64>,
+    t: &crate::tuning::Tuning,
 ) -> Option<String> {
     let session = serde_json::from_str::<serde_json::Value>(board_json)
         .ok()?["session"]
         .as_str()
         .unwrap_or("")
         .to_string();
-    notify_frame_from_board(
-        board_json,
-        crate::manager::presence_watched(&session),
-        sent,
-        crate::worklog::now_secs(),
-        &crate::tuning::Tuning::default(),
-    )
+    let watched = crate::manager::presence_watched(&session);
+    let ts = crate::worklog::now_secs();
+    with_notify_sent(|sent| {
+        let frame = notify_frame_from_board(board_json, watched, sent, ts, t);
+        // A CEILING THAT DROPS SOMETHING SHOULD SAY SO. Reaching it means the gates upstream
+        // found four things worth a person in a day, which is a claim about the classifier
+        // rather than about the day — and silent suppression hides the one piece of evidence
+        // that would correct it.
+        //
+        // Asked precisely: "would this have fired but for the ceiling?" A ceiling merely in
+        // force while nothing was eligible has suppressed nothing and is not worth reporting.
+        // The probe runs against a COPY of the cooldown map, so asking cannot itself record a
+        // send and burn the pane's hour.
+        if frame.is_none() && crate::manager::over_ceiling(sent, ts, t) {
+            let mut relaxed = t.clone();
+            relaxed.push_max_per_hour = u64::MAX;
+            relaxed.push_max_per_day = u64::MAX;
+            let mut probe = sent.clone();
+            if notify_frame_from_board(board_json, watched, &mut probe, ts, &relaxed).is_some() {
+                note_ceiling_hit(&session, ts);
+            }
+        }
+        frame
+    })
+}
+
+/// Record a suppressed interrupt, at most once an hour.
+///
+/// Boards arrive about once a second, so an unrationed note here would write the same fact
+/// thousands of times — the exact write-amplification shape `mars manager health` exists to
+/// catch. One an hour is enough to see it in the report and cheap enough to leave on.
+fn note_ceiling_hit(session: &str, ts: u64) {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let prev = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if ts.saturating_sub(prev) < 3600 {
+        return;
+    }
+    LAST.store(ts, std::sync::atomic::Ordering::Relaxed);
+    crate::manager::record_event(
+        "push_ceiling",
+        ts,
+        serde_json::json!({ "session": session, "target": "push" }),
+    );
 }
 
 /// The reader, separated from the I/O so a selfcheck can drive it.
@@ -1711,10 +1782,14 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     thread::spawn(move || {
         let mut lines = BufReader::new(reader_stream);
         let mut line = String::new();
-        // Cooldown memory, one map per connection. Deliberately not persisted: a reconnect is a
-        // new session and the phone's own 60s dedup covers the replay. Persisting it would mean a
-        // notification you never received still burning its hour.
-        let mut notify_sent: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        // Cooldown memory lives in `NOTIFY_SENT`, shared by the process — it was a map per
+        // connection, which meant every reconnect re-armed every pane.
+        //
+        // Settings are read ONCE here rather than per board frame: boards arrive about once a
+        // second, and a config file read at that rate answers a question that only changes when
+        // somebody edits it. Reconnecting picks up an edit, which is the same granularity the
+        // rest of the bridge already has.
+        let tuning = crate::tuning::load();
         loop {
             line.clear();
             match lines.read_line(&mut line) {
@@ -1733,8 +1808,13 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                         // The phone is a renderer. It never re-judges: a second copy of the rules
                         // on the client is two copies that will disagree, and the client is the
                         // one that cannot see a stall age or a foreground command.
-                        if let Some(n) = notify_for_board(&json, &mut notify_sent) {
-                            let _ = tx.send(n);
+                        // Checked like every other send in this loop. It was the one that
+                        // discarded its result, so a dead channel swallowed the notification
+                        // and the reader went on writing frames nobody would receive.
+                        if let Some(n) = notify_for_board(&json, &tuning) {
+                            if tx.send(n).is_err() {
+                                break;
+                            }
                         }
                         let wrapped = format!("{{\"t\":\"snapshot\",{}", &json[1..]);
                         if tx.send(wrapped).is_err() {
