@@ -2443,8 +2443,8 @@ pub fn emit(
                     "cmd": p.cmd,
                     "chat": p.chat,
                     "conversation": p.chat.as_deref()
-                        .and_then(|c| crate::timeline::rows_for(c, CHAT_WINDOW))
-                        .map(|rows| clamp_conversation(crate::timeline::rows_json(&rows)))
+                        .and_then(|c| crate::timeline::rows_for(c, CHAT_WINDOW, crate::timeline::TAIL_BYTES))
+                        .map(|w| clamp_conversation(crate::timeline::rows_json(&w.rows)))
                         .unwrap_or_default(),
                     "output": { "tail": tail, "delta": delta, "signals": sig },
                 })

@@ -2530,6 +2530,14 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let pane = v.get("paneId").and_then(|x| x.as_str()).unwrap_or_default().to_string();
             let chat = v.get("chat").and_then(|x| x.as_str()).unwrap_or_default().to_string();
             let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(60).min(300) as usize;
+            // HOW FAR BACK, in bytes. `limit` caps rows and was never the thing that bound: on a
+            // long transcript the byte tail runs out first and the row cap is unreachable. A
+            // reader who pulls at the top is asking for a deeper window, not more rows.
+            let depth = v
+                .get("bytes")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(crate::timeline::TAIL_BYTES)
+                .clamp(crate::timeline::TAIL_BYTES, crate::timeline::MAX_DEPTH_BYTES);
             let reply = if !crate::session::valid_chat_id(&chat) {
                 // Not an error to report loudly: a shell pane simply has no conversation, and the
                 // client says so rather than rendering an empty list that looks like a hung fetch.
@@ -2538,8 +2546,8 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                     "reason": "this workspace is not running a coding agent",
                 })
             } else {
-                match crate::timeline::rows_for(&chat, limit) {
-                    Some(rows) => {
+                match crate::timeline::rows_for(&chat, limit, depth) {
+                    Some(w) => {
                         // WHOSE conversation this is, read off the transcript's own location rather
                         // than off anything the caller believes. Sent every poll because it costs
                         // one directory read, and because the moment it disagrees with the pane the
@@ -2549,7 +2557,11 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                         serde_json::json!({
                             "t": "agent.timeline", "paneId": pane, "chat": chat,
                             "dir": dir, "title": title,
-                            "rows": crate::timeline::rows_json(&rows),
+                            // WHERE THIS WINDOW STARTS, so "you have reached the beginning" is
+                            // something the host knows rather than something the client infers
+                            // from a row count that never described the byte window anyway.
+                            "from": w.from, "total": w.total,
+                            "rows": crate::timeline::rows_json(&w.rows),
                         })
                     }
                     None => serde_json::json!({

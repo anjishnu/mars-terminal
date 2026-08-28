@@ -1238,6 +1238,7 @@ fn ask_cli(question: String) -> Result<()> {
 
 /// Headless verification of the core paths, runnable without a real terminal.
 fn selfcheck() -> Result<()> {
+
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use ratatui::backend::TestBackend;
 
@@ -7596,10 +7597,55 @@ fn selfcheck() -> Result<()> {
                 // as root the way `chmod 000` silently is.
                 let broken = sdir.join("unreadable.jsonl");
                 std::fs::create_dir_all(&broken)?;
-                let rows = timeline::rows_for_path(&broken, 0);
-                assert!(matches!(rows.as_slice(), [timeline::Row::Error { .. }]),
+                let w = timeline::rows_for_path(&broken, 0, timeline::TAIL_BYTES);
+                assert!(matches!(w.rows.as_slice(), [timeline::Row::Error { .. }]),
                     "an unreadable transcript must say so, not render as empty");
+                assert_eq!(w.from, u64::MAX,
+                    "a window that could not be read must not claim to start at the beginning");
                 std::fs::remove_dir(&broken)?;
+            }
+
+            // A DEEPER WINDOW IS THE SAME TAIL WITH MORE IN FRONT OF IT. That is the property the
+            // whole feature rests on: the window grows backwards and its end stays at EOF, so the
+            // parser never meets a tool call whose result lies below what it can see — and nothing
+            // downstream has to reconcile a historic page against the live one.
+            {
+                let deep = sdir.join("deep.jsonl");
+                let line = |i: usize| format!(
+                    "{{\"type\":\"user\",\"message\":{{\"content\":\"message {i} {}\"}}}}",
+                    "x".repeat(400)
+                );
+                let body: String = (0..400).map(|i| line(i) + "\n").collect();
+                std::fs::write(&deep, &body)?;
+                let len = std::fs::metadata(&deep)?.len();
+                assert!(len > 64 * 1024, "fixture must exceed the shallow window or it proves nothing");
+
+                let shallow = timeline::rows_for_path(&deep, 0, 16 * 1024);
+                let deeper = timeline::rows_for_path(&deep, 0, 64 * 1024);
+                let whole = timeline::rows_for_path(&deep, 0, len * 2);
+
+                assert!(shallow.rows.len() < deeper.rows.len(),
+                    "a deeper window must reach further back");
+                assert_eq!(shallow.rows.last(), deeper.rows.last(),
+                    "every window ends at EOF, so they must agree about the newest row");
+                assert_eq!(
+                    deeper.rows[deeper.rows.len() - shallow.rows.len()..],
+                    shallow.rows[..],
+                    "the shallow window must be a SUFFIX of the deeper one, not a different slice"
+                );
+
+                // `from` is the honest end-stop. The client used to infer it from a row count,
+                // which describes the row cap and can say nothing about the byte window.
+                assert!(shallow.from > 0, "a partial window must not claim to start at the file's start");
+                assert_eq!(whole.from, 0, "a window covering the file must say it reached the beginning");
+                assert_eq!(whole.total, len, "total is the file, so a reader can be told how far back they are");
+                assert_eq!(whole.rows.len(), 400, "the whole file is 400 readable lines");
+
+                // The first line of a mid-file window is a fragment and dies in the parser; that
+                // is the entire cost of seeking to a byte rather than to a line boundary.
+                let ragged = timeline::rows_for_path(&deep, 0, len - 10);
+                assert_eq!(ragged.rows.len(), 399, "a mid-line start costs exactly one row");
+                std::fs::remove_file(&deep)?;
             }
         }
         println!("[selfcheck] timeline: a transcript becomes rows, and bookkeeping leaves no trace ... PASS");
@@ -7630,6 +7676,7 @@ fn selfcheck() -> Result<()> {
                 "a trailing slash must not make a directory a different project");
         }
         println!("[selfcheck] timeline: an unreadable transcript says so, never 'not started' ... PASS");
+        println!("[selfcheck] timeline: a deeper window is the same tail, reaching further ... PASS");
         println!("[selfcheck] conv: a conversation from another directory is refused ... PASS");
         println!("[selfcheck] manager: a workspace id outlives the daemon that minted it ... PASS");
         println!("[selfcheck] manager: a name is suggested once, then the rename itself silences it ... PASS");

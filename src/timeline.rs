@@ -101,9 +101,33 @@ const PROSE_CHARS: usize = 24_000;
 /// the budget goes: recent messages arrive whole, older ones keep the clip they always had, and
 /// what you are actually reading is never the truncated one.
 const FULL_PROSE_ROWS: usize = 8;
-/// How much of the file's tail to read. The live transcript of a long session on this machine is
-/// 188 MB; reading it whole to show the last twenty rows would stall the bridge every poll.
-const TAIL_BYTES: u64 = 512 * 1024;
+/// How much of the file's tail to read when the caller does not say. The live transcript of a long
+/// session on this machine is 221 MB; reading it whole to show the last twenty rows would stall
+/// the bridge every poll.
+///
+/// **This, not `limit`, is what a reader actually hits.** Measured on that 221 MB transcript: its
+/// last 512 KB holds 71 lines, so a `limit` of 300 rows is unreachable there by a factor of five
+/// and the reader can see roughly 0.1% of the conversation. Worse, how much 512 KB buys swings
+/// about fourfold between files depending on how verbose the tool output happened to be, so the
+/// wall arrives at an unpredictable place. A reader who wants more asks for a deeper window.
+pub const TAIL_BYTES: u64 = 512 * 1024;
+
+/// The deepest window a client may ask for.
+///
+/// **8 MB is where the row cap takes over, measured rather than chosen.** Against the 221 MB
+/// transcript on this machine, `rows_for_path` at a 300-row limit returns:
+///
+/// ```text
+///   0.5 MB ->  12 rows,  2.8 ms      4 MB -> 212 rows, 17.6 ms
+///     1 MB ->  24 rows,  3.6 ms      8 MB -> 300 rows, 27.8 ms   <- limit binds here
+///     2 MB ->  67 rows,  6.6 ms     16 MB -> 300 rows, 59.2 ms   <- twice the work, no more rows
+/// ```
+///
+/// Past 8 MB the window stops being what bounds the answer, so a deeper read costs parse time and
+/// returns nothing for it. 27.8 ms against a 3-second poll is about a 1% duty cycle, and the
+/// client drops back to `TAIL_BYTES` once the reader returns to the live end, so that cost is only
+/// paid while somebody is actually reading history.
+pub const MAX_DEPTH_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Strip anything that would scramble a phone's layout. Newline and tab survive in detail text
 /// because they carry structure; every other control character is removed rather than escaped,
@@ -425,8 +449,22 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
 /// file is right there and could not be read. A transcript nobody has started and one this process
 /// cannot open look identical to a reader and deserve different answers, so the second becomes a
 /// row that says so.
-pub fn rows_for(chat: &str, limit: usize) -> Option<Vec<Row>> {
-    Some(rows_for_path(&crate::conv::transcript_for(chat)?, limit))
+pub fn rows_for(chat: &str, limit: usize, depth: u64) -> Option<Window> {
+    Some(rows_for_path(&crate::conv::transcript_for(chat)?, limit, depth))
+}
+
+/// A slice of a transcript, and enough about the file to say where the slice sits in it.
+///
+/// `from` is what makes "you have reached the beginning" the HOST's answer rather than the
+/// client's guess. The client used to infer it from `rows.len() >= limit`, which is only ever a
+/// statement about the row cap — it cannot see the byte window, and the byte window is what binds.
+/// `from == 0` means the whole file was read and there is nothing above.
+pub struct Window {
+    /// Byte offset the window starts at. `0` means the beginning of the file.
+    pub from: u64,
+    /// The whole file's length, so a reader can be told how far back they have got.
+    pub total: u64,
+    pub rows: Vec<Row>,
 }
 
 /// The rows of a transcript already located, which is where the reading actually happens.
@@ -434,28 +472,46 @@ pub fn rows_for(chat: &str, limit: usize) -> Option<Vec<Row>> {
 /// Separate from `rows_for` so the failure above can be exercised at all: `rows_for` finds its file
 /// by searching `~/.claude/projects`, and a check that has to plant a file in the developer's real
 /// Claude Code directory to prove anything is a check nobody will keep.
-pub(crate) fn rows_for_path(path: &std::path::Path, limit: usize) -> Vec<Row> {
-    match read_tail(path) {
-        Ok(bytes) => rows_from_str(&String::from_utf8_lossy(&bytes), limit),
-        Err(e) => vec![Row::Error { message: format!("this conversation could not be read: {e}") }],
+pub(crate) fn rows_for_path(path: &std::path::Path, limit: usize, depth: u64) -> Window {
+    match read_tail(path, depth) {
+        Ok((from, bytes)) => Window {
+            from,
+            total: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            rows: rows_from_str(&String::from_utf8_lossy(&bytes), limit),
+        },
+        Err(e) => Window {
+            // A window that could not be read starts nowhere and ends nowhere. Reporting `from: 0`
+            // would tell the reader they had reached the beginning, which is the one thing an
+            // unreadable file cannot establish.
+            from: u64::MAX,
+            total: 0,
+            rows: vec![Row::Error { message: format!("this conversation could not be read: {e}") }],
+        },
     }
 }
 
-/// The last `TAIL_BYTES` of a file, or the whole of one shorter than that.
+/// The last `depth` bytes of a file, or the whole of one shorter than that, with the offset it
+/// started at.
+///
+/// **The window always ends at EOF, and that is the property the whole feature rests on.** A
+/// window that stopped short could contain a `tool_use` whose `tool_result` lay below it, and that
+/// row would render as `Running` for ever — true at the live end, a lie on a page from last week.
+/// Growing the window backwards instead of sliding it means the parser never sees a call whose
+/// result it cannot reach, so nothing downstream has to reconcile anything.
 ///
 /// Split out so the failures above are one `?`-chain rather than five `.ok()?`s that all mean
 /// different things and collapse to the same answer.
-fn read_tail(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+fn read_tail(path: &std::path::Path, depth: u64) -> std::io::Result<(u64, Vec<u8>)> {
     use std::io::{Read, Seek, SeekFrom};
-    let from = std::fs::metadata(path)?.len().saturating_sub(TAIL_BYTES);
+    let from = std::fs::metadata(path)?.len().saturating_sub(depth.max(1));
     if from == 0 {
-        return std::fs::read(path);
+        return Ok((0, std::fs::read(path)?));
     }
     let mut f = std::fs::File::open(path)?;
     f.seek(SeekFrom::Start(from))?;
     let mut buf = Vec::new();
-    f.take(TAIL_BYTES + 1).read_to_end(&mut buf)?;
-    Ok(buf)
+    f.take(depth + 1).read_to_end(&mut buf)?;
+    Ok((from, buf))
 }
 
 /// Rows as the phone receives them. A flat `kind` rather than a nested enum, because the client
