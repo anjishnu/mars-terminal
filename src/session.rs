@@ -124,6 +124,22 @@ pub enum ClientFrame {
     /// A mirror types without owning: no gen, no ownership check, no eviction. That is not a new
     /// privilege — anything that can reach this socket could already `Attach` and take the session
     /// outright — it is the same authority by a path that does not throw anyone off.
+    /// A wheel turn from a mirror.
+    ///
+    /// Separate from `Mouse` for the same reason `MirrorKeys` is separate from `Key`: it carries
+    /// no ownership and cannot evict anybody. Separate from `MirrorKeys` because a wheel is not
+    /// text — the browser's terminal turns an unhandled wheel into arrow keys, which arrives here
+    /// as a burst of Up/Down and moves the selection in MARS. A read gesture with a write effect
+    /// is worse than a dead one, which is why the client suppressed the wheel entirely rather
+    /// than send that; this is the channel that lets it stop suppressing.
+    MirrorWheel {
+        /// True for a scroll up.
+        up: bool,
+        /// Where the pointer was, in cells, so the wheel reaches the pane under it rather than
+        /// whichever one happens to be focused.
+        col: u16,
+        row: u16,
+    },
     MirrorKeys {
         data: String,
         /// A monotonic stamp from the client, echoed back on the frame that answers it.
@@ -882,6 +898,7 @@ enum SrvEvent {
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
     Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64, surface: Option<String> },
     MirrorKeys { data: String, id: u64, seq: Option<u64> },
+    MirrorWheel { up: bool, col: u16, row: u16, id: u64 },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
     Subscribe { stream: crate::sys::control::Stream },
@@ -1604,6 +1621,24 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     Err(e) => debug_log(&format!("srv: mirror terminal: {e}")),
                 }
             }
+            Ok(SrvEvent::MirrorWheel { up, col, row, id }) => {
+                // The wheel claims the grid the same way typing does — it is input, and the
+                // target being read is the target being scrolled.
+                last_input = Some(LastInput::Mirror(id));
+                last_input_at = std::time::Instant::now();
+                let kind = if up {
+                    crossterm::event::MouseEventKind::ScrollUp
+                } else {
+                    crossterm::event::MouseEventKind::ScrollDown
+                };
+                let _ = app.apply_input(InputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind,
+                    column: col,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                }));
+                app.needs_redraw = true;
+            }
             Ok(SrvEvent::MirrorKeys { data, id, seq }) => {
                 // Held until the next frame is drawn for this mirror, which is the frame that
                 // carries the echo. Overwriting rather than queueing: typing faster than the
@@ -2122,10 +2157,18 @@ fn client_connection(
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                if let Ok(ClientFrame::MirrorKeys { data, seq }) = serde_json::from_str(line.trim()) {
-                    if tx.send(SrvEvent::MirrorKeys { data, id: mid, seq }).is_err() {
-                        break;
+                match serde_json::from_str(line.trim()) {
+                    Ok(ClientFrame::MirrorKeys { data, seq }) => {
+                        if tx.send(SrvEvent::MirrorKeys { data, id: mid, seq }).is_err() {
+                            break;
+                        }
                     }
+                    Ok(ClientFrame::MirrorWheel { up, col, row }) => {
+                        if tx.send(SrvEvent::MirrorWheel { up, col, row, id: mid }).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
             }
             return;

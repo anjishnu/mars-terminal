@@ -2800,6 +2800,17 @@ fn handle_client_msg(
                 }
             }
         }
+        // THE WHEEL, as a wheel. The browser terminal turns an unhandled wheel into arrow keys,
+        // so the client had to suppress it entirely rather than move MARS's selection every time
+        // somebody read the screen. This gives it somewhere real to go.
+        Some("mirror.wheel") => {
+            if let Some(w) = MIRROR_IN.lock().unwrap().as_mut() {
+                let up = v.get("up").and_then(|x| x.as_bool()).unwrap_or(false);
+                let col = v.get("col").and_then(|x| x.as_u64()).unwrap_or(0).min(u16::MAX as u64) as u16;
+                let row = v.get("row").and_then(|x| x.as_u64()).unwrap_or(0).min(u16::MAX as u64) as u16;
+                let _ = session::write_frame(w, &ClientFrame::MirrorWheel { up, col, row });
+            }
+        }
         // Same, for the planner scope — the one role allowed to write a brief.
         Some("brief.planner") => {
             if let Some(pane) = v.get("paneId").and_then(|x| x.as_str()).and_then(|s| s.parse::<usize>().ok()) {
