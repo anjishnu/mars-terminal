@@ -17,6 +17,7 @@
 //!    is the same bridge reached differently (the `Transport` seam is the deploy story).
 
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
@@ -736,6 +737,19 @@ fn with_notify_sent<T>(f: impl FnOnce(&mut std::collections::HashMap<String, u64
     let mut g = NOTIFY_SENT.lock().unwrap_or_else(|e| e.into_inner());
     f(g.get_or_insert_with(std::collections::HashMap::new))
 }
+
+/// The tag on a binary frame.
+///
+/// Mirror bytes travel as a BINARY WebSocket frame; everything else on this socket stays JSON
+/// text. A repaint of a 200×50 grid is ~45 KB of ANSI, which base64 inflates by a third and the
+/// client then walks character by character to undo — about 250 KB of garbage per frame, and at
+/// ten frames a second of heavy output that is the GC pause people read as a terminal being
+/// unreliable rather than merely slow. There is no cheap partial win: `atob` and the character
+/// loop are small next to `JSON.parse` of a multi-kilobyte string, so it is binary or nothing.
+///
+/// One byte, because there is exactly one kind of binary frame — and a tag with room to grow is a
+/// tag somebody will grow into a second protocol.
+const BIN_MIRROR: u8 = 1;
 
 static ROVER_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static ROVER_RAMP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1688,6 +1702,8 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     // older phone sends no `s` and gets the bridge's own session, exactly as before.
     let valid = read_token();
     let mut wanted: Option<String> = None;
+    // Whether this client said it can read binary mirror frames. See `BIN_MIRROR`.
+    let mut client_bin = false;
     let auth_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if Instant::now() > auth_deadline {
@@ -1698,6 +1714,14 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
                     if v.get("t").and_then(|t| t.as_str()) == Some("hello") {
                         wanted = v.get("s").and_then(|s| s.as_str()).map(String::from).filter(|s| !s.is_empty());
+                        // OPT-IN, and base64 stays for a release. A client that predates binary
+                        // frames says nothing here and keeps the old path; one that has been
+                        // updated says so and gets bytes. Two-sided changes that assume the far
+                        // side moved are how a working pairing becomes a blank screen.
+                        client_bin = v
+                            .get("bin")
+                            .and_then(|b| b.as_bool())
+                            .unwrap_or(false);
                     }
                 }
                 match auth_result(&txt, valid.as_deref()) {
@@ -1776,6 +1800,10 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
 
     // Daemon-reader thread → channel of already-JSON output frames for the WS.
     let (tx, rx) = mpsc::channel::<String>();
+    // MIRROR BYTES GO THEIR OWN WAY. A second channel rather than a sum type on the first,
+    // because every one of the thirty-odd senders on `tx` is text and would otherwise have to say
+    // so at each call site — thirty edits to express one fact about one frame.
+    let (btx, brx) = mpsc::channel::<Vec<u8>>();
     // A clone for async results (the LLM proxy) pushed from the inbound handler.
     let action_tx = tx.clone();
     let reader_stream = daemon.try_clone()?;
@@ -1913,13 +1941,17 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
         while let Ok(msg) = rx.try_recv() {
             ws.send(Message::Text(msg))?;
         }
+        // And the mirror's bytes, which never became text.
+        while let Ok(b) = brx.try_recv() {
+            ws.send(Message::Binary(b))?;
+        }
         // Read one inbound WS message (times out via the socket read timeout).
         match ws.read() {
             Ok(Message::Text(txt)) => {
-                handle_client_msg(&mut writer, &action_tx, socket, &txt);
+                handle_client_msg(&mut writer, &action_tx, &btx, client_bin, socket, &txt);
             }
             Ok(Message::Binary(b)) => {
-                handle_client_msg(&mut writer, &action_tx, socket, &String::from_utf8_lossy(&b));
+                handle_client_msg(&mut writer, &action_tx, &btx, client_bin, socket, &String::from_utf8_lossy(&b));
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
@@ -2080,7 +2112,14 @@ static MIRROR_IN: std::sync::Mutex<Option<crate::sys::control::Stream>> = std::s
 /// told, correctly, about the end of something it no longer cared about.
 static MIRROR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket: &std::path::Path, txt: &str) {
+fn handle_client_msg(
+    writer: &mut impl Write,
+    tx: &mpsc::Sender<String>,
+    btx: &mpsc::Sender<Vec<u8>>,
+    bin: bool,
+    socket: &std::path::Path,
+    txt: &str,
+) {
     let v: serde_json::Value = match serde_json::from_str(txt) {
         Ok(v) => v,
         Err(_) => return,
@@ -2678,6 +2717,7 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                 *MIRROR_IN.lock().unwrap() = Some(w2);
             }
             let out = tx.clone();
+            let bout = btx.clone();
             std::thread::spawn(move || {
                 let mut lines = BufReader::new(sock);
                 let mut line = String::new();
@@ -2691,7 +2731,35 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
                         // Same envelope the pane path uses, under its own name so a desk shell and
                         // a pane view can be open at once without reading each other's bytes.
                         Ok(ServerFrame::Output { b64 }) => {
-                            if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
+                            // The decode happens here either way — the daemon hands us base64. On
+                            // the binary path it happens ONCE, in Rust, instead of once per frame
+                            // in the browser as a character loop over a JSON string.
+                            if bin {
+                                match B64.decode(&b64) {
+                                    Ok(bytes) => {
+                                        let mut framed = Vec::with_capacity(bytes.len() + 1);
+                                        framed.push(BIN_MIRROR);
+                                        framed.extend_from_slice(&bytes);
+                                        if bout.send(framed).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    // Undecodable base64 from our own daemon is not a thing to
+                                    // paper over, but it is also not worth dropping the mirror
+                                    // for: fall back to the text path and let the client see it.
+                                    Err(_) => {
+                                        if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
+                                break;
+                            }
+                        }
+                        // The keystroke the next frame answers — see `ServerFrame::MirrorAck`.
+                        Ok(ServerFrame::MirrorAck { seq }) => {
+                            if out.send(serde_json::json!({"t": "mirror.ack", "seq": seq}).to_string()).is_err() {
                                 break;
                             }
                         }
@@ -2722,7 +2790,13 @@ fn handle_client_msg(writer: &mut impl Write, tx: &mpsc::Sender<String>, socket:
             let data = v.get("data").and_then(|x| x.as_str()).unwrap_or("");
             if !data.is_empty() {
                 if let Some(w) = MIRROR_IN.lock().unwrap().as_mut() {
-                    let _ = session::write_frame(w, &ClientFrame::MirrorKeys { data: data.to_string() });
+                    // Carried straight through. The bridge does not read it — it belongs to the
+                    // two ends that can actually time anything.
+                    let seq = v.get("seq").and_then(|x| x.as_u64());
+                    let _ = session::write_frame(
+                        w,
+                        &ClientFrame::MirrorKeys { data: data.to_string(), seq },
+                    );
                 }
             }
         }

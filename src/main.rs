@@ -3087,6 +3087,7 @@ fn selfcheck() -> Result<()> {
                     match self.reader.read_line(&mut line) {
                         Ok(0) => break,
                         Ok(_) => match serde_json::from_str::<session::ServerFrame>(line.trim()) {
+                            Ok(session::ServerFrame::MirrorAck { .. }) => {}
                             Ok(session::ServerFrame::Output { b64 }) => {
                                 if let Ok(bytes) = B64.decode(b64) {
                                     self.screen.process(&bytes);
@@ -3438,7 +3439,7 @@ fn selfcheck() -> Result<()> {
                 //    it a desk terminal 239 columns wide pinned a browser to a 3.6px cell for as
                 //    long as an idle window stayed attached, which is the bug this pair of
                 //    assertions exists to keep apart from the one above.
-                session::write_frame(&mut mw, &session::ClientFrame::MirrorKeys { data: "x".into() })?;
+                session::write_frame(&mut mw, &session::ClientFrame::MirrorKeys { data: "x".into(), seq: None })?;
                 let mut moved: Option<(u16, u16)> = None;
                 let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(6);
                 while std::time::Instant::now() < deadline2 {

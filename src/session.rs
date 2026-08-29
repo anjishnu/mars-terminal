@@ -124,7 +124,16 @@ pub enum ClientFrame {
     /// A mirror types without owning: no gen, no ownership check, no eviction. That is not a new
     /// privilege — anything that can reach this socket could already `Attach` and take the session
     /// outright — it is the same authority by a path that does not throw anyone off.
-    MirrorKeys { data: String },
+    MirrorKeys {
+        data: String,
+        /// A monotonic stamp from the client, echoed back on the frame that answers it.
+        ///
+        /// This is the whole instrument: the client knows when it sent `seq`, the host says which
+        /// frame carried its echo, and the difference is keystroke-to-paint measured end to end
+        /// rather than estimated from component costs that were never timed.
+        #[serde(default)]
+        seq: Option<u64>,
+    },
     /// Mint an empty brief and set the planner in a pane drafting it. Same argument as
     /// `AssignBrief` for why the daemon does this rather than the bridge: the scope check needs a
     /// pid. The title travels because it is the one thing only the person pressing knows.
@@ -184,6 +193,10 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     /// One rendered frame's ANSI bytes (base64).
     Output { b64: String },
+    /// The keystroke stamp this mirror's latest frame answers. Sent immediately BEFORE the frame
+    /// it refers to, so a client that reads in order can stamp the arrival without needing the
+    /// frame to grow a field every reader would have to skip.
+    MirrorAck { seq: u64 },
     /// The size the session is actually being drawn at, sent to a mirror whose own size is not
     /// it. Without this a smaller mirror has no way to know it is seeing the top-left corner of
     /// a bigger screen — the frame it receives is a perfectly valid frame of the wrong grid. With
@@ -868,7 +881,7 @@ enum SrvEvent {
     /// A second render target joined. Carries its own stream and size: one `Terminal` has one
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
     Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64, surface: Option<String> },
-    MirrorKeys { data: String, id: u64 },
+    MirrorKeys { data: String, id: u64, seq: Option<u64> },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
     /// to this stream. Does NOT touch client ownership (non-takeover glance).
     Subscribe { stream: crate::sys::control::Stream },
@@ -1064,6 +1077,8 @@ struct MirrorTarget {
     /// The grid size last announced to this mirror, so an unchanged size is not re-sent every
     /// frame. `None` until the first announcement, which is therefore always made.
     announced: Option<(u16, u16)>,
+    /// A keystroke stamp waiting for the frame that answers it. See `ServerFrame::MirrorAck`.
+    pending_ack: Option<u64>,
 }
 
 /// The one size the session draws itself at.
@@ -1150,6 +1165,14 @@ fn blit(frame: &mut Frame, src: &Buffer, cursor: Option<Position>) {
 /// The daemon: owns the App, keeps running with or without a client.
 /// `name`/`path` are mutable: live rename moves the socket file (the bound
 /// listener follows the inode, so clients keep connecting — verified).
+/// How long after a keystroke the loop polls tightly for the echo, and how tightly.
+///
+/// 50 ms covers a shell echo with room to spare — the echo itself is about 0.1 ms — and 2 ms is
+/// fine enough that the wait stops being what a reader notices. Widening the window costs idle
+/// CPU for nothing; narrowing it starts missing echoes on a loaded machine.
+const ECHO_WINDOW_MS: u64 = 50;
+const ECHO_POLL_MS: u64 = 2;
+
 pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     crate::broker::reset_session_broker();
     let _broker_route_reset = BrokerRouteReset;
@@ -1280,6 +1303,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // Who typed most recently. `None` until somebody does, which is why merely attaching moves
     // nothing: with no input recorded the owner decides, exactly as before.
     let mut last_input: Option<LastInput> = None;
+    // WHEN SOMEBODY LAST TYPED, for the adaptive poll below. An `Instant` rather than a flag,
+    // because the window has to close on its own — a flag would need clearing from wherever the
+    // last keystroke happened to be handled.
+    let mut last_input_at = std::time::Instant::now() - Duration::from_secs(3600);
     let mut latest_client_gen = 0;
     // Read-only mobile subscribers (the Rover phone bridge). Separate from the
     // owning client so a glance never takes over; board/briefing frames are
@@ -1425,12 +1452,35 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         }
                         m.announced = Some(grid_dims);
                     }
+                    // BEFORE the bytes, so a client reading in order stamps arrival against the
+                    // frame that actually carried the echo rather than the one after it.
+                    if let Some(seq) = m.pending_ack.take() {
+                        let _ = write_frame(&mut m.sock, &ServerFrame::MirrorAck { seq });
+                    }
                     m.term.draw(|f| blit(f, &src.buf, cursor)).is_ok()
                 });
             }
         }
 
-        match rx.recv_timeout(Duration::from_millis(app.tuning.poll_interval_ms)) {
+        // THE ECHO WAS WAITING A WHOLE POLL INTERVAL, not half of one.
+        //
+        // `app.tick()` drains PTY output by polling; nothing wakes the loop when a PTY becomes
+        // readable. The keystroke IS an event, so it wakes the loop and resets the timer — and
+        // then the shell echoes about 0.1 ms later, which is not an event, so the echo sits until
+        // the full interval times out. The naive reading of a 16 ms poll is a mean 8 ms wait; the
+        // real one is 16 ms every time, because typing always restarts the clock immediately
+        // before the byte it is waiting for arrives.
+        //
+        // So the loop polls tightly for a moment after input and idles at its normal cadence
+        // otherwise. Idle CPU is untouched — the window only opens after somebody types, and the
+        // worst case is 50 ms of 500 Hz polling per keystroke, which is what a terminal emulator
+        // does continuously.
+        let wait = if last_input_at.elapsed() < Duration::from_millis(ECHO_WINDOW_MS) {
+            ECHO_POLL_MS
+        } else {
+            app.tuning.poll_interval_ms
+        };
+        match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(SrvEvent::Attach {
                 stream,
                 cols,
@@ -1488,6 +1538,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                                 app.mobile_reflow = None;
                                 // …and the desk is where the work is, so the grid is its shape.
                                 last_input = Some(LastInput::Owner);
+                                last_input_at = std::time::Instant::now();
                             }
                             let _ = app.apply_input(ev);
                             if visible {
@@ -1546,15 +1597,27 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                             cols,
                             rows,
                             announced: None, // so the first frame always carries the grid size
+                            pending_ack: None,
                         });
                         app.needs_redraw = true; // a fresh target needs a full frame
                     }
                     Err(e) => debug_log(&format!("srv: mirror terminal: {e}")),
                 }
             }
-            Ok(SrvEvent::MirrorKeys { data, id }) => {
+            Ok(SrvEvent::MirrorKeys { data, id, seq }) => {
+                // Held until the next frame is drawn for this mirror, which is the frame that
+                // carries the echo. Overwriting rather than queueing: typing faster than the
+                // session redraws means the intervening stamps were answered by the same frame,
+                // and reporting the newest is what makes the number a latency rather than a
+                // backlog.
+                if let Some(q) = seq {
+                    if let Some(m) = mirrors.iter_mut().find(|m| m.id == id) {
+                        m.pending_ack = Some(q);
+                    }
+                }
                 // Typing here makes this the target the session is drawn for. Attaching did not.
                 last_input = Some(LastInput::Mirror(id));
+                last_input_at = std::time::Instant::now();
                 // Applied exactly like a client's keys, minus the ownership gate — a mirror types
                 // without owning. Anything that reaches this socket could already `Attach` and
                 // take the session outright, so this is the same authority by a path that throws
@@ -2059,8 +2122,8 @@ fn client_connection(
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
-                if let Ok(ClientFrame::MirrorKeys { data }) = serde_json::from_str(line.trim()) {
-                    if tx.send(SrvEvent::MirrorKeys { data, id: mid }).is_err() {
+                if let Ok(ClientFrame::MirrorKeys { data, seq }) = serde_json::from_str(line.trim()) {
+                    if tx.send(SrvEvent::MirrorKeys { data, id: mid, seq }).is_err() {
                         break;
                     }
                 }
@@ -2314,6 +2377,8 @@ pub fn client_main(name: &str) -> Result<()> {
                         break;
                     }
                     Ok(_) => match serde_json::from_str::<ServerFrame>(line.trim()) {
+                        // A terminal attach has no browser to time; the stamp is for the mirror.
+                        Ok(ServerFrame::MirrorAck { .. }) => {}
                         Ok(ServerFrame::Output { b64 }) => {
                             if let Ok(bytes) = B64.decode(b64) {
                                 let mut so = io::stdout().lock();
