@@ -2,7 +2,7 @@
 # `mars` is taken on crates.io, so the package/crate name is `mars-terminal`.
 # The installed binary stays `mars` regardless (see [[bin]] below).
 name = "mars-terminal"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 # The dependency tree pulls edition2024 crates → a modern toolchain is required.
 # Declaring it makes cargo say "requires rustc 1.85" instead of a cryptic dep error.
@@ -10,8 +10,8 @@ rust-version = "1.85"
 description = "A terminal editor, multiplexer, and built-in AI agent in one binary — non-modal and Emacs-compatible, with tmux-style persistent sessions."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/anjishnu/mars"
-homepage = "https://github.com/anjishnu/mars"
+repository = "https://github.com/anjishnu/mars-terminal"
+homepage = "https://github.com/anjishnu/mars-terminal"
 authors = ["Anjishnu Kumar <anjishnu.kr@gmail.com>"]
 keywords = ["cli", "ai", "llm", "terminal", "tui"]
 categories = ["command-line-utilities", "text-editors"]

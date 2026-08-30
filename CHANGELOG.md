@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.7.2
+
+The desk gets faster, and the parts of Rover that were guessing start
+measuring. 0.7.1 put a second shell on a screen; this release is about what
+that shell costs — keystroke latency, repaint cost, and the two places the
+host was quietly ignoring what it had been told.
+
+Nothing here changes how you connect. The remote route is unchanged.
+
+### Fixed
+
+- **A keystroke echo was waiting a whole poll interval, not half of one.**
+  `app.tick()` drains PTY output by polling and nothing wakes the loop when a
+  PTY becomes readable. The keystroke IS an event, so it wakes the loop and
+  resets the timer — and the shell then echoes about 0.1 ms later, which is
+  not an event, so the echo sits until the full interval times out. The naive
+  reading of a 16 ms poll is a mean 8 ms wait; the real one was 16 ms every
+  time, because typing always restarted the clock immediately before the byte
+  it was waiting for arrived. The loop now polls tightly for 50 ms after
+  input and idles at its normal cadence otherwise, so idle CPU is untouched.
+- **The push gates ignored your configuration.** `push_min_stall_secs`,
+  `push_stale_secs` and `push_cooldown_secs` are documented as editable and
+  written into `~/.config/mars/tuning.json` on first run — and the one code
+  path that reads them passed the compiled defaults instead. Every install
+  ran the built-in numbers, and the ten-minute stall floor could not be
+  lowered even to test the feature.
+- **The notification cooldown re-armed on every reconnect.** It was held per
+  connection, on the argument that the phone's own 60-second dedup covered
+  the replay. That window is 60 seconds and the cooldown is an hour, so any
+  reconnect more than a minute apart re-notified the same stalled pane — and
+  reconnects are routine. One interrupt per pane per hour quietly became one
+  per minute under a flapping link.
+- **Nothing bounded interrupts across the machine.** The per-pane cooldown
+  rations one workspace; three stalled workspaces each passed their own gate
+  and buzzed seconds apart, because boards arrive about once a second. What a
+  reader experiences is the total, so the total is now bounded — and a
+  ceiling that drops something says so in `mars manager health` rather than
+  suppressing it silently, because reaching it is a claim about the
+  classifier rather than about the day.
+- **The conversation could only be read from its end.** The pull at the top
+  of the timeline grew a row count, which was never what ran out: the host
+  reads a byte window, and 512 KB of a long transcript is a handful of rows.
+  Measured on a 221 MB session here, that was twelve rows — about 0.1% of the
+  conversation, with the 300-row cap unreachable by a factor of twenty-five.
+
+### Added
+
+- **Pull earlier conversation in, a megabyte at a time.** The window grows
+  backwards and always ends at the live end, which is what keeps it simple: a
+  window that stopped short could hold a tool call whose result lay below it,
+  and that row would report "running" for ever. The reply now carries where
+  the window began and how long the file is, so "you have reached the
+  beginning" is something the host knows rather than something the client
+  infers from a row count.
+- **Keystroke-to-paint, measured.** A keystroke carries a stamp and the host
+  echoes it on the frame that answers it, so the diagnostics overlay shows
+  real p50/p99 latency instead of an estimate. Optional on the wire: a client
+  that says nothing is answered as before.
+- **Mirror frames travel as bytes.** A repaint of a 200×50 grid is ~45 KB of
+  ANSI, which base64 inflated by a third and the browser then walked
+  character by character to undo — about 250 KB of garbage per frame, and at
+  ten frames a second that is the GC pause people read as a terminal being
+  unreliable rather than merely slow. Opt-in from the client, with base64
+  kept for a release.
+- **A mirror can scroll.** The web terminal suppressed the mouse wheel
+  outright, and the reason was sound — a browser terminal encodes an
+  unhandled wheel as arrow keys, which arrived here as a burst of Up/Down and
+  moved the selection. What was missing was never the handling but a channel;
+  the wheel now travels as a wheel, carrying the pointer's position so it
+  reaches the pane under it.
+- **`push_enabled`, `push_max_per_hour` and `push_max_per_day`** — the off
+  switch and the two ceilings, in `tuning.json` with the rest.
+
+### On the desk, via the hosted app
+
+The browser client updates independently of this crate: the desk mirror now
+renders on the GPU, its resize negotiation waits for the drag to settle
+rather than asking the daemon to re-render fifty times, and typing at a
+prompt draws ahead of the round trip. Pressing a breadcrumb opens the places
+it can take you rather than navigating on the press — a tap reads, a hold
+commits, which is the rule every other surface already followed.
+
+### Note
+
+`SESSION_PROTOCOL_VERSION` carries the crate version, so a 0.7.2 client will
+not attach to a 0.7.1 daemon. Run `mars upgrade --yes` after installing.
+
 ## 0.7.1
 
 Rover grows a desk. 0.7.0 put your running sessions on a phone, which is the right
