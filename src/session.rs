@@ -1940,6 +1940,54 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                         }
                     }
                 }
+
+                // ── THE DAY SHIFT ────────────────────────────────────────────────────────
+                //
+                // Deliberately on the SNAPSHOT cadence rather than the agent's: none of this
+                // spends a token, and the agent floor exists to ration model calls. Tying
+                // deterministic work to it would make landing a finished brief wait twenty
+                // minutes for a reason that does not apply to it.
+                //
+                // Off unless `policy.md` says otherwise, and `autopilot_tick` re-reads that file
+                // every pass — so the phone's Self-driving switch stops the next tick, not the
+                // next restart, and it stops it BETWEEN items rather than mid-brief.
+                if let Some(repo) = crate::manager::repo_dir() {
+                    let pol = crate::manager::read_policy(&repo);
+                    // THE TRIGGER, CONSUMED. Removed before the run rather than after: a planning
+                    // pass takes minutes, and a request still on disk when the next tick comes
+                    // round would start a second one on top of the first.
+                    let req = crate::manager::plan_request(&repo);
+                    if req.exists() {
+                        let _ = std::fs::remove_file(&req);
+                        let model = std::env::var("MARS_PLANNER_MODEL")
+                            .unwrap_or_else(|_| "claude-opus-5".into());
+                        let drafted = crate::manager::plan_night(&pol, now, &model);
+                        crate::manager::record_event("plan_run", now, serde_json::json!({
+                            "target": "plan.now",
+                            "drafted": drafted.iter().filter(|r| r.is_ok()).count(),
+                            "failed": drafted.iter().filter(|r| r.is_err()).count(),
+                        }));
+                    }
+                    if crate::manager::autopilot_on(&repo) {
+                        let plan = crate::manager::autopilot_tick(&pol, now);
+                        // Assigning is the one step that needs a live pane, so it comes back
+                        // here to be done. One per tick: a worker takes minutes, and starting
+                        // three at once into whatever panes happen to be free is how two of
+                        // them end up on the same working tree.
+                        if let Some(id) = plan.to_assign.first() {
+                            if let Some(pane) = app.free_worker_pane() {
+                                match app.assign_brief_to_pane(pane, id) {
+                                    Ok(()) => crate::manager::record_event("brief_assigned", now,
+                                        serde_json::json!({ "target": id, "by": "autopilot" })),
+                                    // A refusal here is the scope gate doing its job. Recorded
+                                    // rather than retried: the same pane would refuse again.
+                                    Err(why) => crate::manager::record_event("brief_assign_refused", now,
+                                        serde_json::json!({ "target": id, "why": why })),
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

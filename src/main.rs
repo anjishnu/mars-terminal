@@ -325,7 +325,53 @@ fn main() -> Result<()> {
                 // that explains why the agent is or is not running — this answers the next
                 // question, which is whether what it produces is worth anything.
                 "health" => print!("{}", manager::health_report(ts)?),
-                other => anyhow::bail!("unknown: mars manager {other} (status | run [--force] | snapshot)"),
+                // THE NIGHT SHIFT, on demand. The phone's trigger writes `plan.now` and the tick
+                // runs this; the verb exists so the same thing can be driven from a keyboard, and
+                // so that working on the planner costs one command rather than a wait.
+                "plan" => {
+                    let Some(repo) = manager::repo_dir() else { anyhow::bail!("no manager repo") };
+                    let pol = manager::read_policy(&repo);
+                    let model = std::env::var("MARS_PLANNER_MODEL").unwrap_or_else(|_| "claude-opus-5".into());
+                    let obs = briefs::observations();
+                    println!("  {} cited observation(s)", obs.len());
+                    for o in &obs {
+                        println!("    · {}\n        cited: {}", o.headline, o.cite);
+                    }
+                    if obs.is_empty() {
+                        println!();
+                        println!("  Nothing to plan against. An idea with no citation is a wish — leave one");
+                        println!("  under `## Notes for later` in a report, or nominate from a pane.");
+                        return Ok(());
+                    }
+                    // THE CAP HAS TO SAY IT STOPPED THINGS. `plan_night` takes `room` items and
+                    // silently takes none when the queue is full, which renders as a planning run
+                    // that found six things to do and then did nothing — indistinguishable from a
+                    // failure. The whole point of the cap is that it is a decision somebody made,
+                    // so it says so, with the number and the way out.
+                    let drafts = briefs::list().iter()
+                        .filter(|b| b.state == briefs::State::Draft).count();
+                    if drafts >= pol.awaiting_human_max {
+                        println!();
+                        println!("  Not planning: {drafts} draft(s) already waiting on you, and");
+                        println!("  awaiting_human_max is {}. Work in progress is capped for rot —", pol.awaiting_human_max);
+                        println!("  an unlanded brief decays against a moving main.");
+                        println!();
+                        println!("  Approve or archive some, or raise the cap in policy.md.");
+                        return Ok(());
+                    }
+                    println!();
+                    println!("  planning with {model} (this takes a minute per brief) ...");
+                    for r in manager::plan_night(&pol, ts, &model) {
+                        match r {
+                            Ok(id) => println!("  DRAFTED  {id}"),
+                            Err(e) => println!("  FAILED   {e}"),
+                        }
+                    }
+                    println!();
+                    println!("  Nothing is approved. `mars brief ls` to read them, then");
+                    println!("  `mars brief approve <id>` — that press is what lets anything start.");
+                }
+                other => anyhow::bail!("unknown: mars manager {other} (status | run [--force] | snapshot | plan | health)"),
             }
             return Ok(());
         }
@@ -720,6 +766,71 @@ fn main() -> Result<()> {
                         println!("  `mars brief supersede {id}` mints the next brief from {:?}.", unmet);
                     }
                 }
+                // THE PRESS, MADE DURABLE. Assigning by hand is itself an approval and always
+                // has been; this exists because autopilot assigns later, from a list, with
+                // nobody there — so the consent has to be carried forward in time from the
+                // moment a person actually gave it.
+                "approve" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    if !briefs::safe_id(&id) || !dir.join("brief.md").exists() {
+                        anyhow::bail!("usage: mars brief approve <brief-id>");
+                    }
+                    let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+                    briefs::approve(&dir, &who, worklog::now_secs())?;
+                    let b = briefs::read(&dir);
+                    println!("  approved by {who}");
+                    println!("  {}", dir.join("approved.md").display());
+                    if let Some(b) = b {
+                        if b.verify.is_empty() {
+                            println!("  NOTE: no verify: commands — nothing can decide this brief but a person.");
+                        } else {
+                            println!("  verify: {}", b.verify.join(" · "));
+                        }
+                    }
+                    println!("  eligible for assignment. Autopilot will only pick it up if policy.md says so.");
+                }
+                // THE END OF THE LOOP, and the only verb here that changes a repository without
+                // being asked at the moment it does it. Everything it refuses, it refuses out
+                // loud and with the reason — a silent decline is indistinguishable from a bug.
+                "land" => {
+                    let id = args.next().unwrap_or_default();
+                    let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
+                        anyhow::bail!("no home directory")
+                    };
+                    if !briefs::safe_id(&id) || !dir.join("brief.md").exists() {
+                        anyhow::bail!("usage: mars brief land <brief-id>");
+                    }
+                    let Some(b) = briefs::read(&dir) else { anyhow::bail!("unreadable brief") };
+                    // TYPING THIS IS THE PRESS. `policy.md`'s autopilot switch answers "may the
+                    // machine do this while nobody is here" — a different question from "may I
+                    // do it", and gating a hand-typed command on it conflated the two: there was
+                    // no way to make the press the design says a human makes.
+                    //
+                    // Every other gate still applies. Presence is not permission to skip the
+                    // classifier, the self-grading guard, or a red verify — a person running
+                    // `land` has not thereby LOOKED at anything, and `must be seen` still means
+                    // what it says.
+                    let l = briefs::land(&b, &dir, true, std::time::Duration::from_secs(600));
+                    if l.merged {
+                        println!("  LANDED — {}", l.why);
+                        if let Some(u) = &l.undo {
+                            // Printed, not described. An undo you have to look up is one you will
+                            // not run in the ten seconds you have decided to spend on it.
+                            println!("  undo:  {u}");
+                        }
+                        crate::manager::record_event("brief_landed", worklog::now_secs(),
+                            serde_json::json!({ "target": id, "why": l.why, "undo": l.undo }));
+                    } else {
+                        println!("  not landed [{}] — {}", l.autonomy.label(), l.why);
+                        for w in &l.weakened {
+                            println!("    removed check:  {w}");
+                        }
+                        println!("  nothing was changed.");
+                    }
+                }
                 "supersede" => {
                     let id = args.next().unwrap_or_default();
                     let Some(dir) = briefs::dir().map(|d| d.join(&id)) else {
@@ -763,6 +874,25 @@ fn main() -> Result<()> {
                     }
                     println!("\n  {} objection(s) → {}", objections.len(), dir.join("review.md").display());
                     println!("  it annotates; it does not gate.");
+
+                    // TRIAGE RIDES ALONG, because both are the same act: the two deterministic
+                    // reads of a brief nobody has built yet. The planner writes them at drafting
+                    // time; this is how a brief drafted before they existed — or by a run that
+                    // died between writing the file and reading it back — gets them without
+                    // paying for the planner again.
+                    if let Some(b) = briefs::read(&dir) {
+                        let body = std::fs::read_to_string(dir.join("brief.md")).unwrap_or_default();
+                        let t = briefs::triage(&b, &body);
+                        std::fs::write(dir.join("triage.md"), format!(
+                            "---\nautonomy: {}\n---\n# Triage\n\n{}\n\nAn estimate from what the brief SAYS it \
+                             will touch, made before anything was built. The diff decides at landing time and may \
+                             only be more cautious than this.\n",
+                            t.autonomy.label(), t.why,
+                        ))?;
+                        println!();
+                        println!("  triage: [{}] {}", t.autonomy.label(), t.why);
+                        println!("  {}", dir.join("triage.md").display());
+                    }
                 }
                 "nominate" => {
                     let session = args.next().unwrap_or_default();
@@ -893,7 +1023,7 @@ fn main() -> Result<()> {
                     println!("{ack}. Any refusal appears in the pane itself.");
                 }
                 other => anyhow::bail!(
-                    "unknown: mars brief {other}   (try: ls | new | show | verify | worker | planner | draft | assign)"
+                    "unknown: mars brief {other}   (try: ls | new | show | decisions | review | verify | audit | approve | land | supersede | archive | worker | planner | draft | assign)"
                 ),
             }
             return Ok(());
@@ -9181,6 +9311,60 @@ fn selfcheck() -> Result<()> {
         }
         println!("[selfcheck] push: push_enabled is honoured ... PASS");
 
+        // ── N2: A FILED REPORT ASKS FOR A PERSON ─────────────────────────────────────────────
+        //
+        // Drawn from recorded behaviour, like the flapping case above. One brief was built end to
+        // end — 11 of 11 criteria met, both verify commands green — and its PR sat open for
+        // twelve days while `main` moved 64 commits underneath it. Every gate was green. Nothing
+        // had failed. No surface ever said it was waiting, so nobody landed it.
+        {
+            use crate::manager::{brief_push_candidate, ReportFacts};
+            let report = |id: &str, outcome: &str, met: usize, total: usize| ReportFacts {
+                id: id.into(),
+                title: "mars ls does not show which directory".into(),
+                outcome: outcome.into(),
+                met,
+                total,
+            };
+
+            let n = brief_push_candidate(&[report("b-1", "done", 11, 11)], false, &HashMap::new(), now, &t)
+                .expect("a report with every criterion met must ask to be landed");
+            assert_eq!(n.key, "brief:b-1", "the cooldown identity is the brief, not a pane");
+            assert!(n.pane.is_empty(), "a brief is not a pane — an invented one deep-links a tap at whatever is in that slot");
+            assert!(n.stakes.as_deref().unwrap_or("").contains("ages against main"),
+                "the stake of an unlanded branch is rot, and it is derivable rather than invented");
+
+            // ONCE PER BRIEF, EVER. A report does not change once written, so re-announcing it
+            // would be the 50,570-rewrite failure in another costume.
+            let mut sent: HashMap<String, u64> = HashMap::new();
+            sent.insert("brief:b-1".into(), now);
+            assert!(
+                brief_push_candidate(&[report("b-1", "done", 11, 11)], false, &sent, now + 86_400 * 7, &t).is_none(),
+                "a report already announced must stay quiet — a week later included"
+            );
+
+            // The four outcomes are four different errands, and `rejected` is the one most
+            // systems have no channel for: the premise is wrong and nothing was built.
+            let r = brief_push_candidate(&[report("b-2", "rejected", 0, 4)], false, &HashMap::new(), now, &t).unwrap();
+            assert!(r.title.contains("rejected") && r.body.contains("premise"),
+                "a rejection must not read as a completion");
+            let p = brief_push_candidate(&[report("b-3", "partial", 3, 4)], false, &HashMap::new(), now, &t).unwrap();
+            assert!(p.body.contains("3 of 4"), "a partial reports per criterion, because the numbers carry into the continuation");
+
+            // The same three gates that ration N1 ration this: presence, the off switch, and the
+            // machine-wide ceiling. A second channel with its own budget is not a budget.
+            assert!(brief_push_candidate(&[report("b-4", "done", 1, 1)], true, &HashMap::new(), now, &t).is_none(),
+                "you are already looking at it");
+            let mut off = t.clone();
+            off.push_enabled = false;
+            assert!(brief_push_candidate(&[report("b-5", "done", 1, 1)], false, &HashMap::new(), now, &off).is_none());
+            let mut spent: HashMap<String, u64> = HashMap::new();
+            spent.insert("mars-dev:terminal 2".into(), now);
+            assert!(brief_push_candidate(&[report("b-6", "done", 1, 1)], false, &spent, now, &t).is_none(),
+                "an interrupt already spent on a pane is spent — the reader experiences the total");
+        }
+        println!("[selfcheck] push: a filed report asks for a person, once ... PASS");
+
         // THE KNOBS ARE LOAD-BEARING. `notify_for_board` passed `Tuning::default()`, so these
         // three were documented, written into the user's config on first run, and ignored — and
         // the floor being ten minutes with no way to lower it is also what made the feature
@@ -9612,6 +9796,226 @@ fn selfcheck() -> Result<()> {
             "WORKING-MODEL still leaves verification with the worker");
         assert!(briefs::doc_version(briefs::WORKING_MODEL) >= 3);
 
+        // ── APPROVAL IS CONSENT, CARRIED FORWARD ───────────────────────────────────────────
+        //
+        // Under autopilot the manager assigns with nobody there, so the human's consent has to
+        // survive the gap between the moment it was given and the moment it is acted on. This is
+        // the file that carries it, and the properties that make it worth carrying.
+        {
+            assert!(!briefs::is_approved(&fdir), "a brief is not approved by existing");
+            briefs::approve(&fdir, "tester", 1_700_000_000).expect("a brief with no stale ruling approves");
+            assert!(briefs::is_approved(&fdir));
+
+            // NOT A FOURTH STATE. `state_of` answers how far the work got; approval answers
+            // whether it may run without you. Folding one into the other would make a permission
+            // look like a stage.
+            assert_eq!(briefs::state_of(&fdir), briefs::State::Reported,
+                "approving must not move the work's state — they answer different questions");
+
+            // WHAT WAS APPROVED STAYS ANSWERABLE. The brief is editable afterwards, so the
+            // rulings are recorded here as they stood; reading brief.md later answers "what does
+            // it say now", which is a different question from "what did they agree to".
+            let rec = std::fs::read_to_string(fdir.join("approved.md")).unwrap();
+            assert!(rec.contains("approved_by: tester") && rec.contains("approved_ts: 1700000000"),
+                "an action ledger with no accountable person is a log, not a ledger");
+
+            // THE STALE GATE, and it gates because it is arithmetic. A ruling that assumes a fork
+            // somebody later overrode is a dangling reference — approving it is approving
+            // something nobody has read. A reviewer's objection is a judgement and does not gate.
+            let sdir = tmp.join("brief-stale");
+            std::fs::create_dir_all(&sdir).unwrap();
+            std::fs::write(sdir.join("brief.md"), concat!(
+                "---\ntitle: t\ncreated_ts: 1\n---\n",
+                "## HLD\n\n",
+                "### Fork 1 — shape?\n\n",
+                "- **Option A ✅ chosen** — one. *Why this:* fewer moving parts\n\n",
+                "### Fork 2 — where?\n\n*Assumes:* hld-1\n\n",
+                "- **Option B ✅ chosen** — there. *Why this:* it follows from Fork 1\n\n",
+                "## Decisions already made\n\n",
+                "- [hld-1] **overridden** → Option B — *(planner chose A; by tester at 1)*\n",
+                "- [lld-1] **stale** — assumes hld-1, which was overridden *(ruling abc123)*\n",
+                "- [hld-2] **stale** — assumes hld-1, which was overridden *(ruling abc123)*\n",
+            )).unwrap();
+            assert!(briefs::decisions_of(&sdir).iter().any(|d| d.stale),
+                "the fixture must actually produce a stale decision, or the gate below proves nothing");
+            let err = briefs::approve(&sdir, "tester", 1).expect_err("a stale ruling withholds approval");
+            assert!(err.to_string().contains("withheld") && err.to_string().contains("hld-2"),
+                "the refusal must name which decision and what to do: {err}");
+            assert!(!briefs::is_approved(&sdir), "a withheld approval must leave no file behind");
+        }
+        println!("[selfcheck] briefs: approval is consent, recorded and gated on staleness ... PASS");
+
+        // ── THE GATE MAY NOT BE MOVED BY THE THING IT GATES ────────────────────────────────
+        //
+        // Mars grades a brief with `mars --selfcheck`, compiled from `src/main.rs` — a file
+        // workers edit, and the one brief that ever ran end to end added 61 lines to it. Running
+        // the verify commands ourselves stops an agent writing down its own exit codes; it does
+        // nothing about an agent editing what those codes test.
+        {
+            use briefs::{classify, weakened_checks, Autonomy};
+
+            // ADDITIONS ARE FREE. Writing a selfcheck beside a change is the house standard and
+            // must stay cheap, which is why this rule is about direction and not about the file.
+            let added = "+++ b/src/main.rs\n+        assert!(thing, \"new check\");\n+    println!(\"ok\");\n";
+            assert!(weakened_checks(added).is_empty(), "adding a check must never gate");
+
+            // A REMOVAL IS NOT SELF-GRADABLE, and the actual line goes to the person.
+            let removed = "--- a/src/main.rs\n-        assert_eq!(met, total, \"every criterion\");\n+        // TODO\n";
+            let w = weakened_checks(removed);
+            assert_eq!(w.len(), 1, "a deleted assertion must be caught: {w:?}");
+            assert!(w[0].contains("every criterion"), "the line itself is the evidence, not a count: {w:?}");
+
+            // A MOVE IS NOT A WEAKENING. Reindentation and block shuffling would otherwise flag
+            // every large diff, and a warning that fires on everything is one nobody reads.
+            let moved = "-    assert!(a == b);\n+    assert!(a == b);\n";
+            assert!(weakened_checks(moved).is_empty(), "an unchanged line that moved is not a removed check");
+
+            // DEMOTE-ONLY. A model may propose a ceiling; nothing it writes may raise one. The
+            // manager reads untrusted terminal output all day and its section headers are
+            // forgeable, so this asymmetry is the property that survives being lied to.
+            let one = vec!["src/fleet.rs".to_string()];
+            let ok = classify(Autonomy::Land, &one, "+ fine\n", &["cargo build".into()]);
+            assert_eq!(ok.autonomy, Autonomy::Land, "small, verified and reversible lands: {}", ok.why);
+            assert_eq!(
+                classify(Autonomy::Press, &one, "+ fine\n", &["cargo build".into()]).autonomy,
+                Autonomy::Press,
+                "a lower proposal must stand — this function lowers, it never raises"
+            );
+
+            // The matrix, row by row.
+            assert_eq!(classify(Autonomy::Land, &one, "+x\n", &[]).autonomy, Autonomy::Look,
+                "with no verify: command nothing but a person can decide it");
+            let wide: Vec<String> = (0..5).map(|i| format!("src/f{i}.rs")).collect();
+            assert_eq!(classify(Autonomy::Land, &wide, "+x\n", &["cargo build".into()]).autonomy, Autonomy::Press,
+                "blast radius past the work model's own three-file line wants a pair of eyes");
+            let schema = vec!["mars-rover/src/rover/protocol.ts".to_string()];
+            assert_eq!(classify(Autonomy::Land, &schema, "+x\n", &["tsc".into()]).autonomy, Autonomy::Look,
+                "a wire contract is never fully autonomous, however green the build is");
+            let sneak = classify(Autonomy::Land, &one, removed, &["cargo build".into()]);
+            assert_eq!(sneak.autonomy, Autonomy::Look, "a diff that weakens a check can never self-land");
+            assert!(!sneak.weakened.is_empty() && sneak.why.contains("gate"),
+                "the refusal must carry the reason and the lines: {sneak:?}");
+
+            // And the worst case: small, green, one file, and it deleted the thing that proves it.
+            // Every other signal here says land. This is the one that must still refuse.
+            assert_eq!(
+                classify(Autonomy::Land, &one, "-assert!(ok);\n", &["cargo build".into()]).autonomy,
+                Autonomy::Look,
+                "green plus small must not outvote a moved gate"
+            );
+        }
+        println!("[selfcheck] briefs: autonomy is a ceiling, and only ever lowered ... PASS");
+
+        // ── LANDING, DRIVEN AGAINST A REAL REPOSITORY ──────────────────────────────────────
+        //
+        // The one verb here that changes a repository at a moment nobody asked for, so it is
+        // driven against real git rather than a stub: a stubbed merge proves the rules and not
+        // that a real board reaches them, which is the failure the push gates already recorded.
+        {
+            use briefs::{land, Autonomy};
+            let repo = tmp.join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            let g = |args: &[&str]| {
+                std::process::Command::new("git").args(args).current_dir(&repo)
+                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+                    .status().map(|s| s.success()).unwrap_or(false)
+            };
+            // `-c` rather than `config`: a machine running this may have no global identity, and
+            // a selfcheck that writes one into the user's gitconfig is a selfcheck with a side
+            // effect. Skipped entirely if git is absent — a missing tool is not a failing rule.
+            if g(&["init", "-q", "-b", "main"]) {
+                std::fs::write(repo.join("f.txt"), "one\n").unwrap();
+                assert!(g(&["add", "-A"]));
+                assert!(g(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base"]));
+                assert!(g(&["checkout", "-qb", "brief-1-x"]));
+                std::fs::write(repo.join("f.txt"), "two\n").unwrap();
+                assert!(g(&["add", "-A"]));
+                assert!(g(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "work"]));
+                assert!(g(&["checkout", "-q", "main"]));
+
+                let ldir = tmp.join("brief-1-x");
+                std::fs::create_dir_all(&ldir).unwrap();
+                let write_brief = |verify: &str| {
+                    std::fs::write(ldir.join("brief.md"), format!(
+                        "---\ntitle: land me\ncreated_ts: 1\nbranch: brief-1-x\nrepo: {}\nverify:\n  - \"{verify}\"\n---\n\
+                         ## Acceptance\n\n1. it merges\n",
+                        repo.display()
+                    )).unwrap();
+                };
+                write_brief("git --version");
+                std::fs::write(ldir.join("in_process.md"), "---\nbrief: brief-1-x\n---\n").unwrap();
+                std::fs::write(ldir.join("completed.md"),
+                    "---\noutcome: done\nacceptance:\n  - {n: 1, met: true}\n---\ndone\n").unwrap();
+
+                // CONSENT IS A PRECONDITION, and landing cannot manufacture it.
+                let l = land(&briefs::read(&ldir).unwrap(), &ldir, true, std::time::Duration::from_secs(30));
+                assert!(!l.merged && l.why.contains("approved.md"),
+                    "an unapproved brief must not land, however green: {}", l.why);
+                briefs::approve(&ldir, "tester", 1).unwrap();
+
+                // THE POLICY SWITCH IS LOAD-BEARING, not decorative: everything else says yes.
+                let off = land(&briefs::read(&ldir).unwrap(), &ldir, false, std::time::Duration::from_secs(30));
+                assert!(!off.merged && off.why.contains("autopilot off"),
+                    "autopilot off must stop a landing that every other rule permits: {}", off.why);
+
+                // RED IS RED. The commands run here rather than being read from the worker's
+                // account of them, which is the whole reason this is not the worker's job.
+                write_brief("git rev-parse --verify no-such-ref");
+                let red = land(&briefs::read(&ldir).unwrap(), &ldir, true, std::time::Duration::from_secs(30));
+                assert!(!red.merged && red.why.contains("verify is not green"), "{}", red.why);
+                write_brief("git --version");
+
+                // A WORKER LEAVES THE REPO ON ITS OWN BRANCH, and landing from there merged the
+                // branch into itself: git reported success, this reported a landing, and `main`
+                // never moved. Every gate was green and nothing shipped — found by running a real
+                // worker end to end, which is the only way this one was ever going to surface.
+                assert!(g(&["checkout", "-q", "brief-1-x"]));
+                let from_branch = land(&briefs::read(&ldir).unwrap(), &ldir, true, std::time::Duration::from_secs(30));
+                assert!(from_branch.merged, "landing must work from wherever the worker left us: {}", from_branch.why);
+                assert_eq!(
+                    std::process::Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"])
+                        .current_dir(&repo).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap(),
+                    "main",
+                    "landing must leave you on main, not on the branch it just merged"
+                );
+                // Undo it so the happy-path case below starts from the same place it always did.
+                if let Some(u) = from_branch.undo.as_ref().and_then(|u| u.split_whitespace().last()) {
+                    assert!(g(&["reset", "--hard", u]));
+                }
+                // A SECOND LANDING IS NOT A LANDING. `git merge` succeeds with "Already up to
+                // date" when the branch is an ancestor, so an unchanged head has to be caught
+                // here or a no-op reports as a merge and gets a receipt saying so.
+                assert!(g(&["merge", "--no-ff", "-m", "manual", "brief-1-x"]));
+                let again = land(&briefs::read(&ldir).unwrap(), &ldir, true, std::time::Duration::from_secs(30));
+                assert!(!again.merged && again.why.contains("already in"),
+                    "merging work that is already on main must not report a landing: {}", again.why);
+                assert!(g(&["reset", "--hard", "HEAD~1"]));
+
+                // And the happy path actually moves `main`, which is the only proof that matters.
+                let before = std::process::Command::new("git").args(["rev-parse", "HEAD"])
+                    .current_dir(&repo).output().unwrap().stdout;
+                let l = land(&briefs::read(&ldir).unwrap(), &ldir, true, std::time::Duration::from_secs(30));
+                assert!(l.merged, "a green, approved, single-file brief must land: {}", l.why);
+                assert_eq!(l.autonomy, Autonomy::Land);
+                let after = std::process::Command::new("git").args(["rev-parse", "HEAD"])
+                    .current_dir(&repo).output().unwrap().stdout;
+                assert_ne!(before, after, "it reported a merge without moving main");
+                let undo = l.undo.expect("every autonomous act gets an undo, or it does not ship");
+                assert!(undo.contains("reset --hard") || undo.contains("revert"),
+                    "the undo must be runnable, not described: {undo}");
+
+                // THE UNDO MUST ACTUALLY UNDO. An undo nobody has run is a claim.
+                let sha = String::from_utf8_lossy(&before).trim().to_string();
+                assert!(g(&["reset", "--hard", &sha]));
+                let back = std::process::Command::new("git").args(["rev-parse", "HEAD"])
+                    .current_dir(&repo).output().unwrap().stdout;
+                assert_eq!(before, back, "the printed undo did not restore the previous head");
+                println!("[selfcheck] briefs: landing moves main, and its undo moves it back ... PASS");
+            } else {
+                println!("[selfcheck] briefs: landing ... SKIP (no git on this machine)");
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&tmp);
         println!("[selfcheck] briefs: verify runs argv, never a shell ... PASS");
         println!("[selfcheck] briefs: an unrunnable check is unknown, never a pass ... PASS");
@@ -9807,6 +10211,89 @@ fn selfcheck() -> Result<()> {
             phantom.join("\n  ")
         );
         println!("[selfcheck] docs: every command the agent is told about exists ... PASS");
+    }
+
+    // ── THE SAFETY DOCUMENT MUST DESCRIBE A REAL BOUNDARY ────────────────────────────────────
+    //
+    // The sibling of the check above, and the more consequential one. `docs/tools.md` named five
+    // `mars` verbs that did not exist, which misleads the AGENT; `policy.md` granted autonomy that
+    // nothing parsed, which misleads the HUMAN about what is protecting them. It opens by calling
+    // itself "the one boundary with no recoverable failure mode" and then described a graduation
+    // feature — `allow:` with a worked example — that no code had ever read.
+    //
+    // So: every `key:` the shipped document names must be one the parser recognises.
+    {
+        use crate::manager::{parse_policy, Policy, POLICY_KEYS};
+        const POLICY: &str = include_str!("manager_docs/policy.md");
+        let mut phantom: Vec<String> = Vec::new();
+        for line in POLICY.lines() {
+            let line = line.trim();
+            // Only fenced settings lines, which is what a reader will copy: `key: value` with no
+            // spaces in the key. Prose mentioning a word followed by a colon is not a promise.
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some((k, _)) = line.split_once(':') else { continue };
+            let k = k.trim();
+            if k.is_empty() || k.contains(' ') || !k.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                continue;
+            }
+            if !POLICY_KEYS.contains(&k) {
+                phantom.push(k.to_string());
+            }
+        }
+        assert!(phantom.is_empty(),
+            "policy.md promises {phantom:?}, which nothing reads — a permission with no reader is worse than no permission");
+
+        // AND THE OTHER DIRECTION, which is what stops this check being vacuous. A scan that
+        // matched no keys at all would report an empty phantom list and pass — the same shape as
+        // the six push gates that were green for weeks while nothing called them. It also catches
+        // the real inverse defect: a permission the code honours that the document never mentions
+        // is an undocumented permission, and this file is the only place a human can see them.
+        let undocumented: Vec<&&str> = POLICY_KEYS
+            .iter()
+            .filter(|k| !POLICY.lines().any(|l| l.trim().starts_with(&format!("{k}:"))))
+            .collect();
+        assert!(undocumented.is_empty(),
+            "policy.md never mentions {undocumented:?} — the code honours a permission the human cannot see");
+
+        // EVERY DEFAULT IS THE CAUTIOUS ONE. A policy file answers "may this happen without me",
+        // so an absent key, a typo and an unparseable value must all mean no.
+        let d = Policy::default();
+        assert!(d.confirm_all && !d.autopilot, "the defaults must not grant autonomy");
+        assert_eq!(parse_policy(""), d, "an empty policy is the safe policy");
+        assert_eq!(parse_policy("autopilot: banana"), d, "a value that does not parse takes the default");
+        assert_eq!(parse_policy("# autopilot: true"), d, "a commented line is inert, which is what makes examples safe");
+        assert!(parse_policy("autopilot: true").autopilot, "and an explicit grant is honoured");
+        assert_eq!(parse_policy("max_continuations: 7").max_continuations, 7);
+
+        // The shipped document must itself parse to something safe — it is what every new install
+        // gets, and an install that arrives already self-driving is the worst possible default.
+        assert!(!parse_policy(POLICY).autopilot, "a fresh install must not arrive self-driving");
+        println!("[selfcheck] policy: every permission the document promises has a reader ... PASS");
+
+        // ── THE DAY SHIFT STARTS NOTHING IT WAS NOT TOLD TO ──────────────────────────────────
+        //
+        // `autopilot_tick` is the only loop in this system that acts with nobody watching, so the
+        // properties worth pinning are the ones that decide whether it acts at all. It reads the
+        // real brief directory, so these drive the gates rather than the queue: on a machine with
+        // no briefs the honest assertion is that it proposes nothing, and on any machine at all
+        // it must propose nothing while switched off.
+        {
+            use crate::manager::{autopilot_tick, Policy};
+            let off = Policy { autopilot: false, ..Policy::default() };
+            let t = autopilot_tick(&off, 1);
+            assert!(t.to_assign.is_empty() && t.landed.is_empty() && t.superseded.is_empty(),
+                "autopilot off must do nothing at all — the switch is the one control that cannot be partly true");
+
+            // THE ATTENTION CAP IS A REAL STOP, not advice. Zero decisions may be waiting, so
+            // nothing may start; the shift may still FINISH work, because landing and superseding
+            // are what shorten the queue.
+            let full = Policy { autopilot: true, awaiting_human_max: 0, ..Policy::default() };
+            assert!(autopilot_tick(&full, 1).to_assign.is_empty(),
+                "past the attention cap nothing new may start, however much is approved");
+        }
+        println!("[selfcheck] autopilot: the switch and the attention cap both stop it ... PASS");
     }
 
         // The cost boundary that makes the above affordable: free enrichment for any reader,

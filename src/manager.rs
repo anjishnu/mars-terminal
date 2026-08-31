@@ -926,6 +926,13 @@ pub fn view(repo: &Path, ts: u64, stale_secs: u64) -> serde_json::Value {
         "agentStaleSecs": stale_secs,
         "agentRuns": { "ok": runs_ok, "total": runs_total, "timing": timing },
         "agentEnabled": agent_enabled(repo),
+        // AUTONOMY, AS TWO FACTS RATHER THAN ONE. The phone needs both: `autopilot` is the grant
+        // in the human-owned policy file and the phone cannot write it; `autopilotPaused` is the
+        // stop, which it can. Collapsing them into one boolean would leave the switch unable to
+        // say why it is off, and "off because you paused it" and "off because nobody turned it
+        // on" need different words and offer different actions.
+        "autopilot": read_policy(repo).autopilot,
+        "autopilotPaused": autopilot_paused(repo),
         // WHICH CONVERSATION THE MANAGER IS HAVING. It is a Claude session like any other — the
         // only reason it has never been visible is that nobody looked it up. Sent as one string
         // rather than as a board row: the host states the fact, and a client decides whether its
@@ -1896,6 +1903,302 @@ pub fn agent_enabled(repo: &Path) -> bool {
         Err(_) => false,
         Ok(body) => !matches!(body.trim(), "0" | "off" | "false" | "no"),
     }
+}
+
+/// Every key `policy.md` is allowed to set, and the only ones anything reads.
+///
+/// **This list is the contract, and a selfcheck holds the document to it.** `policy.md` opens with
+/// *"Nothing derived from terminal output can widen these permissions — that is the one boundary
+/// with no recoverable failure mode"*, and then, for months, granted autonomy that nothing parsed:
+/// the graduation block described an `allow:` feature that did not exist, so a human following its
+/// instructions got silence and believed they were protected by a file with no reader.
+///
+/// That is the same defect as `docs/tools.md` naming five `mars` verbs that were never built — and
+/// it is worse, because tools.md misleads the agent while this one misleads the human about what
+/// is protecting them. Both now have a selfcheck. A knob the document promises must be a knob the
+/// code reads.
+pub const POLICY_KEYS: &[&str] = &[
+    "confirm_all",
+    "wakes_per_hour",
+    "yield_to_interactive",
+    "autopilot",
+    "max_continuations",
+    "awaiting_human_max",
+    "rot_days",
+];
+
+/// The standing permissions, as the human wrote them.
+///
+/// **Every default is the safe one, and every parse failure takes the default.** A policy file is
+/// read to answer "may this happen without me", so an absent key, a typo, or a value that does not
+/// parse must all mean *no*. The failure this shape forbids is a permission that appears because
+/// something upstream was malformed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Policy {
+    /// Every proposed action requires confirmation, showing the literal bytes to be sent.
+    pub confirm_all: bool,
+    pub wakes_per_hour: u64,
+    pub yield_to_interactive: bool,
+    /// May the manager assign approved briefs and land green ones without a press?
+    pub autopilot: bool,
+    /// How many times a `partial` may be superseded before it must ask for a person. The bound
+    /// that keeps a continuation chain from becoming the unbounded "make it pass" loop the design
+    /// refuses — `supersede` can only narrow acceptance, and this stops it repeating forever.
+    pub max_continuations: u32,
+    /// How many decisions may be waiting on the human before autopilot stops starting new work.
+    /// WIP is limited here for rot, not for cash: an unlanded branch decays against a moving main.
+    pub awaiting_human_max: usize,
+    /// Days before an unlanded brief branch is rebased and re-verified, or closed with a note.
+    pub rot_days: u64,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            confirm_all: true,
+            wakes_per_hour: 12,
+            yield_to_interactive: true,
+            autopilot: false,
+            max_continuations: 2,
+            awaiting_human_max: 5,
+            rot_days: 3,
+        }
+    }
+}
+
+/// Is the day shift actually running right now?
+///
+/// Two files, and they compose in one direction only: **`policy.md` grants and `autopilot.paused`
+/// narrows.** A phone can stop autopilot and cannot start it.
+///
+/// That asymmetry is `policy.md`'s own opening rule made mechanical — *"nothing derived from
+/// terminal output can widen these permissions"*. A pause file can only ever subtract, so it is
+/// safe to expose to a surface that a model can reach; the grant stays a deliberate edit in the
+/// human-owned file that documents what it means. It also gives the kill switch the property a
+/// kill switch has to have: reachable from a pocket, with no way for anything else to undo it.
+pub fn autopilot_on(repo: &Path) -> bool {
+    read_policy(repo).autopilot && !autopilot_paused(repo)
+}
+
+/// Paused from a phone. Absent means not paused, so the file's absence is the ordinary state and
+/// nothing has to exist for autopilot to work — the same shape as `agent.enabled` inverted, and
+/// inverted on purpose: a switch that fails to be read must fail towards stopped.
+pub fn autopilot_paused(repo: &Path) -> bool {
+    match std::fs::read_to_string(repo.join("autopilot.paused")) {
+        Err(_) => false,
+        Ok(body) => !matches!(body.trim(), "" | "0" | "off" | "false" | "no"),
+    }
+}
+
+/// Parse `policy.md`. Absent file, unreadable file and empty file are all `Policy::default()`.
+///
+/// Hand-parsed, and over every line rather than only inside the fenced blocks: the fences are a
+/// rendering choice in a document a human edits by hand, and a permission that silently stops
+/// applying because somebody moved a line out of a code block is precisely the drift this file
+/// cannot afford. A `#` comment is ignored, which is what makes the commented graduation example
+/// inert rather than active.
+pub fn read_policy(repo: &Path) -> Policy {
+    let Ok(body) = std::fs::read_to_string(repo.join("policy.md")) else {
+        return Policy::default();
+    };
+    parse_policy(&body)
+}
+
+/// Pure over the text, so a selfcheck can drive every case without a filesystem.
+pub fn parse_policy(body: &str) -> Policy {
+    let mut p = Policy::default();
+    let flag = |v: &str, d: bool| match v.trim() {
+        "true" | "yes" | "on" | "1" => true,
+        "false" | "no" | "off" | "0" => false,
+        _ => d,
+    };
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "confirm_all" => p.confirm_all = flag(v, p.confirm_all),
+            "yield_to_interactive" => p.yield_to_interactive = flag(v, p.yield_to_interactive),
+            "autopilot" => p.autopilot = flag(v, p.autopilot),
+            "wakes_per_hour" => p.wakes_per_hour = v.parse().unwrap_or(p.wakes_per_hour),
+            "max_continuations" => p.max_continuations = v.parse().unwrap_or(p.max_continuations),
+            "awaiting_human_max" => p.awaiting_human_max = v.parse().unwrap_or(p.awaiting_human_max),
+            "rot_days" => p.rot_days = v.parse().unwrap_or(p.rot_days),
+            _ => {}
+        }
+    }
+    p
+}
+
+/// The file a phone writes to ask for a planning run. Consumed and removed by the tick, the same
+/// read-then-advance shape as the inbox cursor — a request that survives being served would be
+/// served again every minute forever.
+pub fn plan_request(repo: &Path) -> PathBuf {
+    repo.join("plan.now")
+}
+
+/// One night shift: turn cited observations into drafted briefs.
+///
+/// **Demand-driven, never continuous.** It runs when the queue is below its floor or when somebody
+/// asked, and not otherwise. A supply-driven ideator always outruns acceptance, and the result is
+/// a morning list nobody reads — which is the same failure as a notification channel that cries
+/// wolf, arriving through a different door.
+///
+/// Nothing here approves anything. Every brief it writes lands as a draft with no `approved.md`,
+/// so the morning press is still the only thing that lets work start.
+pub fn plan_night(pol: &Policy, ts: u64, model: &str) -> Vec<Result<String, String>> {
+    let mut out = Vec::new();
+    let obs = crate::briefs::observations();
+    if obs.is_empty() {
+        return out;
+    }
+    // Already-drafted work is not re-drafted. Matching on the cite rather than the headline: the
+    // headline is a label a planner may reword, and the citation is the identity of the thing
+    // being planned against.
+    let existing: Vec<String> = crate::briefs::list()
+        .iter()
+        .filter_map(|b| {
+            crate::briefs::dir()
+                .map(|d| d.join(&b.id).join("triage.md"))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        })
+        .collect();
+    let drafts = crate::briefs::list().iter().filter(|b| b.state == crate::briefs::State::Draft).count();
+    let room = pol.awaiting_human_max.saturating_sub(drafts);
+    for o in obs.into_iter().filter(|o| !existing.iter().any(|t| t.contains(&o.cite))).take(room) {
+        let repo = o.repo.clone();
+        match crate::briefs::plan_one(&o, repo.as_deref(), ts, model) {
+            Ok(id) => {
+                record_event("brief_drafted", ts, serde_json::json!({ "target": id, "cited": o.cite }));
+                out.push(Ok(id));
+            }
+            // A FAILED PLANNER RUN IS NOT SILENT. `plan_one` removes the scaffold it minted, so
+            // the queue does not fill with empty briefs — but the failure still has to reach
+            // somebody, or a night that produced nothing is indistinguishable from a quiet one.
+            Err(e) => {
+                record_event("brief_draft_failed", ts, serde_json::json!({ "cited": o.cite, "why": e.to_string() }));
+                out.push(Err(e.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// What the day shift decided, and what it needs somebody else to do.
+///
+/// Landing and superseding need only files and git, so they happen here. Assigning needs a live
+/// pane, which lives on `App` — so it is RETURNED rather than performed, and the caller that owns
+/// the panes does it. Splitting on who owns the state keeps this function drivable by a selfcheck.
+#[derive(Debug, Default)]
+pub struct AutopilotTick {
+    /// Brief ids that are approved, undrafted-out, and want a worker.
+    pub to_assign: Vec<String>,
+    pub landed: Vec<String>,
+    pub superseded: Vec<String>,
+    /// Briefs that reached a person's desk instead, with the reason. Recorded, never silent —
+    /// a refusal nobody can see is indistinguishable from a system that did nothing.
+    pub escalated: Vec<(String, String)>,
+}
+
+/// One pass of the day shift.
+///
+/// **Everything here is arithmetic over files, and that is deliberate rather than lazy.** The
+/// manager reads untrusted terminal output all day, and the section headers in that input are
+/// forgeable — any program running in a pane can print one. A model choosing what to assign is
+/// steerable by that text; a fixed order over a list a human approved is not. So the only
+/// judgement in the loop is the one a person already made, and this replays it.
+///
+/// Nothing here can widen anything: it may only act on briefs that already carry `approved.md`,
+/// which it cannot write, and it lands only what `classify` prices at `Land`.
+pub fn autopilot_tick(pol: &Policy, ts: u64) -> AutopilotTick {
+    let mut out = AutopilotTick::default();
+    if !pol.autopilot {
+        return out;
+    }
+    let mut briefs = crate::briefs::list();
+    // Priority first, then oldest — the same order the board shows, so what runs next is what a
+    // reader would have predicted.
+    briefs.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.created_ts.cmp(&b.created_ts)));
+
+    // THE ATTENTION BUDGET, counted before anything starts. Work in progress is limited here for
+    // rot rather than for cash: an unlanded branch decays against a moving main, and one measured
+    // at twelve days and sixty-four commits. Past the cap the shift still FINISHES work — landing
+    // and superseding reduce the queue — but it starts nothing new.
+    let waiting = briefs
+        .iter()
+        .filter(|b| b.state == crate::briefs::State::Reported)
+        .count();
+    // ONE WORKER AT A TIME. Nothing here can tell whether an agent is mid-brief — for a pane
+    // running `claude` the foreground process is `claude` from launch to exit, so the process
+    // table says "busy" whether it is building or waiting, and the verdict layer reads a thinking
+    // model as `stalled`. The knowable version of the question lives in this directory: a brief
+    // in `Started` means a worker was told about it and has not reported. Serial per repo is also
+    // what the staging asks for, and it is the setting in which two agents cannot collide on one
+    // working tree.
+    let anything_running = briefs.iter().any(|b| b.state == crate::briefs::State::Started);
+    let may_start = waiting < pol.awaiting_human_max && !anything_running;
+
+    for b in &briefs {
+        let Some(dir) = crate::briefs::dir().map(|d| d.join(&b.id)) else { continue };
+        if !crate::briefs::is_approved(&dir) {
+            continue;
+        }
+        match b.state {
+            crate::briefs::State::Draft if may_start => out.to_assign.push(b.id.clone()),
+            crate::briefs::State::Draft => {}
+            // A worker is on it. Liveness is a question about a pane and this module is
+            // documented as unable to answer it, so nothing here guesses.
+            crate::briefs::State::Started => {}
+            crate::briefs::State::Reported => {
+                let l = crate::briefs::land(b, &dir, true, std::time::Duration::from_secs(600));
+                if l.merged {
+                    record_event("brief_landed", ts, serde_json::json!({
+                        "target": b.id, "why": l.why, "undo": l.undo,
+                    }));
+                    let _ = crate::briefs::archive(&b.id);
+                    out.landed.push(b.id.clone());
+                    continue;
+                }
+                // A PARTIAL CONTINUES ITSELF, up to a bound. `supersede` sets the next brief's
+                // acceptance to the unmet subset, so a chain can only ever narrow — that is what
+                // makes this a bounded loop rather than the unbounded "make it pass" the design
+                // refuses. The cap is the second bound, for the case where narrowing stalls.
+                let is_partial = b.report.as_ref().is_some_and(|r| r.outcome == "partial");
+                if is_partial && continuations_of(&b.id) < pol.max_continuations {
+                    if let Ok((next, _)) = crate::briefs::supersede(&dir, ts) {
+                        record_event("brief_superseded", ts, serde_json::json!({
+                            "target": b.id, "next": next,
+                        }));
+                        let _ = crate::briefs::archive(&b.id);
+                        out.superseded.push(next);
+                        continue;
+                    }
+                }
+                record_event("brief_escalated", ts, serde_json::json!({
+                    "target": b.id, "why": l.why, "autonomy": l.autonomy.label(),
+                    "weakened": l.weakened,
+                }));
+                out.escalated.push((b.id.clone(), l.why));
+            }
+        }
+    }
+    out
+}
+
+/// How many times this line of work has already been superseded.
+///
+/// Counted from the title rather than a field, because `supersede` marks its output `(cont.)` and
+/// a counter stored anywhere else would be a second thing to keep in step with the archive.
+fn continuations_of(id: &str) -> u32 {
+    crate::briefs::list()
+        .iter()
+        .filter(|b| b.id == id)
+        .map(|b| b.title.matches("(cont.)").count() as u32)
+        .next()
+        .unwrap_or(0)
 }
 
 /// Record that a turn was actually DELIVERED to the agent — called only once the bytes are in the
@@ -3441,6 +3744,85 @@ pub fn push_candidate(
     best.map(|(_, n)| n)
 }
 
+/// What a filed report is, to a notification. Deliberately not `briefs::Brief` — this is the
+/// deterministic half and it should not be able to reach for anything richer than these facts.
+pub struct ReportFacts {
+    pub id: String,
+    pub title: String,
+    /// `done` | `partial` | `blocked` | `rejected`, as the worker wrote it.
+    pub outcome: String,
+    pub met: usize,
+    pub total: usize,
+}
+
+/// N2 — *the thing you asked to be told about is done*.
+///
+/// The measured failure this exists for: one brief was built end to end, met 11 of 11 criteria,
+/// and sat as an open PR for twelve days while `main` moved 64 commits underneath it. Nothing
+/// failed. No surface ever said it was waiting, so nobody landed it.
+///
+/// N1 is a person blocking a machine and outranks this by construction — the caller only reaches
+/// here when no pane candidate won. A report blocks nothing, which is exactly why it is the one
+/// that goes unnoticed: it is quiet, and it decays.
+///
+/// **The cooldown is keyed on the brief id, so this fires once per brief, ever.** A report does
+/// not change once written; re-announcing it would be the memo-rewrite failure in another costume.
+pub fn brief_push_candidate(
+    reports: &[ReportFacts],
+    watched: bool,
+    last_sent: &std::collections::HashMap<String, u64>,
+    ts: u64,
+    t: &crate::tuning::Tuning,
+) -> Option<Notification> {
+    if !t.push_enabled || watched || over_ceiling(last_sent, ts, t) {
+        return None;
+    }
+    for r in reports {
+        let key = format!("brief:{}", r.id);
+        if last_sent.contains_key(&key) {
+            continue;
+        }
+        // The outcome word decides what to say, because the four are genuinely different errands
+        // and a single "a brief finished" would send you to read the file to find out which.
+        // `rejected` is the one most systems have no channel for at all: the worker is reporting
+        // that the premise is wrong, and that is a finding, not a failure.
+        let (title, body, stakes) = match r.outcome.as_str() {
+            "done" if r.met == r.total => (
+                format!("{} is built", r.title),
+                format!("{}/{} criteria met. Ready to land.", r.met, r.total),
+                Some("It will keep waiting — but the branch ages against main.".to_string()),
+            ),
+            "done" | "partial" => (
+                format!("{} came back partial", r.title),
+                format!("{} of {} criteria met.", r.met, r.total),
+                Some("The unmet criteria carry into a continuation brief.".to_string()),
+            ),
+            "rejected" => (
+                format!("{} was rejected", r.title),
+                "The worker reports the premise is wrong and this should not be built.".to_string(),
+                Some("Nothing was built. The brief stays open for you to judge.".to_string()),
+            ),
+            _ => (
+                format!("{} is blocked", r.title),
+                "The worker stopped and wrote down what it needs.".to_string(),
+                Some("Nothing is running — a blocked worker stops rather than waits.".to_string()),
+            ),
+        };
+        return Some(Notification {
+            key,
+            session: String::new(),
+            // No pane. A brief is not a pane, and inventing one would deep-link the tap at
+            // whatever happened to be in that slot — see `store.tsx`'s pane-less manager row for
+            // the same choice made in the other direction.
+            pane: String::new(),
+            title,
+            body,
+            stakes,
+        });
+    }
+    None
+}
+
 /// Strip everything that changes without the situation changing.
 ///
 /// The single most expensive bug in this system's history was a memo that rewrote itself 50,570
@@ -3799,6 +4181,32 @@ pub fn status_report(ts: u64) -> Result<String> {
             Some(rel) => format!("DRIFT — {rel} differs at the current version; the next run will refuse until it is blessed"),
         }
     ));
+    // AUTONOMY, AND WHETHER THE FILE THAT GRANTS IT IS CURRENT.
+    //
+    // `policy.md` is the human's and is scaffolded once, never overwritten — so an install that
+    // predates a new permission keeps a file that does not mention it, and the human reads their
+    // own policy file and sees no autopilot setting at all. Silently defaulting is correct and
+    // silently defaulting *without saying so* is how a file stops describing the system it
+    // governs. Reported, never repaired: writing to it here would break the one ownership rule
+    // this document depends on.
+    let pol = read_policy(&repo);
+    s.push_str(&format!("autopilot     {}\n", match (pol.autopilot, autopilot_paused(&repo)) {
+        (true, false) => "ON — the manager may assign and land".to_string(),
+        (true, true) => "PAUSED from a phone — rm autopilot.paused to resume".to_string(),
+        (false, _) => "off — set `autopilot: true` in policy.md".to_string(),
+    }));
+    let live_policy = std::fs::read_to_string(repo.join("policy.md")).unwrap_or_default();
+    let missing: Vec<&str> = POLICY_KEYS
+        .iter()
+        .copied()
+        .filter(|k| !live_policy.lines().any(|l| l.trim().starts_with(&format!("{k}:"))))
+        .collect();
+    if !missing.is_empty() {
+        s.push_str(&format!(
+            "policy        {} not named in your policy.md — running the safe default for each. Copy them from the shipped template, or delete the file to re-scaffold it.\n",
+            missing.join(", ")
+        ));
+    }
     s.push_str(&format!("live sessions {}\n", if live.is_empty() { "(none)".into() } else { live.join(", ") }));
     s.push_str(&format!("snapshots     {pending} on disk\n"));
     s.push_str(&format!("open batch    {}\n", open_batch(&repo).map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_else(|| "(none)".into())));

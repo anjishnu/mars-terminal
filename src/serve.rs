@@ -1078,8 +1078,59 @@ fn notify_for_board(
                 note_ceiling_hit(&session, ts);
             }
         }
-        frame
+        // N2, only when N1 had nothing. A person blocking a machine outranks work that is merely
+        // waiting to be landed, and this call is allowed one interrupt.
+        frame.or_else(|| notify_frame_for_reports(watched, sent, ts, t))
     })
+}
+
+/// The disk half of N2, kept out of `brief_push_candidate` so the rules stay drivable by a
+/// selfcheck — the same split that exists for the board, and for the same reason.
+///
+/// **Rationed, because boards arrive about once a second.** An unrationed directory read here
+/// would be a `readdir` per second forever: the identical objection that keeps `Tuning` from
+/// being re-read on this path, and the write-amplification shape `mars manager health` exists to
+/// catch. A report is written once and then does not change, so noticing it a minute late costs
+/// nothing — it has already been waiting for the length of a worker run.
+fn notify_frame_for_reports(
+    watched: bool,
+    sent: &mut std::collections::HashMap<String, u64>,
+    ts: u64,
+    t: &crate::tuning::Tuning,
+) -> Option<String> {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !t.push_enabled || watched {
+        return None;
+    }
+    let prev = LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if ts.saturating_sub(prev) < 60 {
+        return None;
+    }
+    LAST.store(ts, std::sync::atomic::Ordering::Relaxed);
+
+    let reports: Vec<crate::manager::ReportFacts> = crate::briefs::list()
+        .into_iter()
+        .filter(|b| b.state == crate::briefs::State::Reported)
+        .filter_map(|b| {
+            let r = b.report?;
+            Some(crate::manager::ReportFacts {
+                id: b.id,
+                title: b.title,
+                outcome: r.outcome,
+                met: r.met,
+                total: r.total,
+            })
+        })
+        .collect();
+    let n = crate::manager::brief_push_candidate(&reports, watched, sent, ts, t)?;
+    sent.insert(n.key.clone(), ts);
+    let mut out = serde_json::json!({
+        "t": "notify", "key": n.key, "title": n.title, "body": n.body,
+    });
+    if let Some(s) = n.stakes {
+        out["stakes"] = serde_json::json!(s);
+    }
+    Some(out.to_string())
 }
 
 /// Record a suppressed interrupt, at most once an hour.
@@ -3174,6 +3225,7 @@ fn manager_view_json(want: &str, session: &str) -> String {
         "manager.memos" => serde_json::json!({ "memos": v["memos"] }),
         "manager.health" => serde_json::json!({
             "agentEnabled": v["agentEnabled"], "agentRuns": v["agentRuns"],
+            "autopilot": v["autopilot"], "autopilotPaused": v["autopilotPaused"],
             // WHICH CONVERSATION THE MANAGER IS HAVING, forwarded so a client can render it as a
             // workspace of its own. This projection names every field it passes on, so a field
             // added to the index and not added here arrives nowhere — which is what happened on
