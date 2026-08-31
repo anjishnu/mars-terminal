@@ -2230,11 +2230,48 @@ impl App {
                     .into(),
             );
         }
+        // THE PRESS IS THE APPROVAL, so record one rather than demand a second. Reaching here
+        // means a person chose this brief and this pane; asking them to approve it first would
+        // add a press to the path that already has the only one that matters.
+        //
+        // Autopilot reads the same file and cannot write it, which is what makes the two paths
+        // different: a human assigning leaves consent behind, and the manager may only act on
+        // consent somebody already left.
+        if !crate::briefs::is_approved(&dir) {
+            let who = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+            let _ = crate::briefs::approve(&dir, &who, crate::worklog::now_secs());
+        }
         let msg = crate::briefs::assignment(brief, &home).ok_or("bad brief id")?;
         if let Some(t) = self.terms.get_mut(&tid) {
             t.send_bytes(crate::briefs::manager_bytes(&msg).as_bytes());
         }
         Ok(())
+    }
+
+    /// A pane holding a correctly-scoped worker.
+    ///
+    /// **Scope is read from the live process, like every other answer about a worker** — a
+    /// recorded "this pane is a worker" would keep saying so about a pane whose `claude` was
+    /// interrupted and restarted bare, and the thing being protected is the deny-list.
+    ///
+    /// **It does not ask whether the agent is busy, because that question has no honest answer
+    /// here.** `foreground_busy()` compares the foreground process group to the shell, so for a
+    /// pane running `claude` it is true from launch to exit whether the agent is building or
+    /// sitting at a prompt — an idleness test built on it could never fire. The verdict layer
+    /// cannot answer it either: a turn that goes quiet while a model thinks reads `stalled`.
+    ///
+    /// So "is a worker available" is answered where it is actually knowable — in the brief
+    /// directory, by `autopilot_tick`, which proposes nothing while any brief is `Started`. One
+    /// worker at a time is also what the staging asks for, and it is the setting in which two
+    /// agents cannot land on one working tree.
+    pub fn free_worker_pane(&self) -> Option<crate::pane::PaneId> {
+        self.panes
+            .keys()
+            .copied()
+            .find(|&pane_id| {
+                self.live_agent_in(pane_id, "worker")
+                    .is_ok_and(|(_, argv)| crate::briefs::worker_argv_ok(&argv))
+            })
     }
 
     /// The terminal id and the live argv of whatever is running in a pane.
