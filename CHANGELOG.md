@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`mars pair` adopted a foreign ngrok tunnel.** On a host already running ngrok for
+  another service, the bridge read the first `public_url` on `:4040` and put that
+  service's URL in the QR; the phone reached an unrelated app, `--check` called it a live
+  bridge and then a dead one, and the remedy said to stop an agent Mars never started.
+  A tunnel is Mars's only if its upstream is the bridge port (and its host matches a pinned
+  `--domain`). Anything else is reported as another agent's and left alone. `MARS_NGROK_API`
+  names the agent API to read; `MARS_NGROK_CONFIG` gives the agent Mars starts a config of
+  its own; `NGROK_AUTHTOKEN` passes through. (#6)
+- **`mars pair --help` started the bridge and printed the pairing token.** `pair`, `serve`
+  and `qr` now print usage on `--help` and exit 2 on an unknown flag, before anything is
+  started or printed. (#6)
+
 ## 0.7.2
 
 The desk gets faster, and the parts of Rover that were guessing start

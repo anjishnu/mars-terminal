@@ -372,10 +372,15 @@ pub fn open_main(session_arg: Option<String>) -> Result<()> {
             return Ok(());
         }
     }
-    let base = running_tunnel_url().ok_or_else(|| anyhow!(
-        "the bridge is up but its tunnel URL could not be read from ngrok \
-         (http://127.0.0.1:4040) — see ~/.mars/serve-agent.log"
-    ))?;
+    let base = match tunnel_state() {
+        TunnelState::Ours(b) => b,
+        TunnelState::Foreign { api, addrs, port_match } => anyhow::bail!("the bridge is up but has no tunnel of its own — {}", foreign_agent_note(&api, &addrs, port_match.as_deref())),
+        TunnelState::None => anyhow::bail!(
+            "the bridge is up but its tunnel URL could not be read from ngrok \
+             ({}) — see ~/.mars/serve-agent.log",
+            ngrok_api_candidates().join(" / ")
+        ),
+    };
     let url = pair_link(&session, &base, "rover")?;
 
     // Printed BEFORE the open, and printed whether or not it succeeds. A browser that does not
@@ -1011,8 +1016,9 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Read the live public tunnel URL from ngrok's local inspection API (127.0.0.1:4040), so we can
-/// reprint the pairing QR for an already-running bridge without standing up a second server.
+/// Read the live public tunnel URL from ngrok's local inspection API (`MARS_NGROK_API`, default
+/// 127.0.0.1:4040 and the next few ports), so we can reprint the pairing QR for an already-running
+/// bridge without standing up a second server.
 /// The header `serve_static` stamps on its reply, and the only proof a tunnel reaches THIS bridge.
 const BRIDGE_HEADER: &str = "X-Mars-Bridge";
 
@@ -1166,7 +1172,9 @@ struct TunnelFault {
 fn restart_remedy() -> Vec<String> {
     vec![
         "   A phone will not reach this machine until the tunnel is replaced:".into(),
-        "   stop the bridge and its ngrok agent, then run `mars pair` again.".into(),
+        "   stop the bridge, then run `mars pair` again. If Mars started the ngrok agent, stop".into(),
+        "   that too; if the tunnel is an endpoint of an agent you run yourself, check that".into(),
+        "   agent instead — Mars does not touch it.".into(),
         "   (Away from the machine, this is what the phone reports as \"the host did not answer\".)".into(),
     ]
 }
@@ -1336,20 +1344,156 @@ fn tunnel_warning(f: &TunnelFault) -> String {
     out.join("\n")
 }
 
-fn running_tunnel_url() -> Option<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", 4040)).ok()?;
+/// One tunnel as ngrok's local API reports it: where it is reachable and what it forwards to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NgrokTunnel {
+    pub public_url: String,
+    pub addr: String,
+}
+
+/// What the ngrok agent(s) on this machine are doing, as far as the bridge is concerned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TunnelState {
+    /// No agent answered on any address we look at.
+    None,
+    /// A tunnel that forwards to THIS bridge's port (and matches the pinned domain, if any).
+    Ours(String),
+    /// An agent is up, but no tunnel it carries is ours. `addrs` is where they forward;
+    /// `port_match` is a tunnel that does reach the bridge port but sits on a host other than the
+    /// pinned domain — the one case where the fix is a `--domain`, not an account.
+    Foreign { api: String, addrs: Vec<String>, port_match: Option<String> },
+}
+
+/// The agent API addresses we consult, in order. `MARS_NGROK_API` pins exactly one; otherwise
+/// 4040 and the next few ports, because ngrok moves a second agent's API up by one when 4040 is
+/// already taken — so a machine with a foreign agent on 4040 has Mars's own agent on 4041.
+fn ngrok_api_candidates() -> Vec<String> {
+    if let Some(api) = std::env::var("MARS_NGROK_API").ok().filter(|a| !a.trim().is_empty()) {
+        return vec![api.trim().trim_end_matches('/').to_string()];
+    }
+    (4040..=4044).map(|p| format!("http://127.0.0.1:{p}")).collect()
+}
+
+/// `GET /api/tunnels` on one agent. `None` when nothing answers there; `Some(vec![])` when an
+/// agent answers with no tunnels.
+fn read_ngrok_agent(api: &str) -> Option<Vec<NgrokTunnel>> {
+    let hostport = api.split("://").last()?.trim_end_matches('/');
+    let (host, port) = hostport.rsplit_once(':')?;
+    let port: u16 = port.parse().ok()?;
+    let mut stream = TcpStream::connect((host, port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
     stream
-        .write_all(b"GET /api/tunnels HTTP/1.1\r\nHost: 127.0.0.1:4040\r\nConnection: close\r\n\r\n")
+        .write_all(format!("GET /api/tunnels HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n").as_bytes())
         .ok()?;
-    let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    let key = "\"public_url\":\"";
-    let start = body.find(key)? + key.len();
-    let rest = &body[start..];
-    let end = rest.find('"')?;
-    let url = rest[..end].trim_end_matches('/').to_string();
-    url.starts_with("https://").then_some(url)
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&raw);
+    Some(parse_ngrok_tunnels(body))
+}
+
+/// Pure: the tunnels in an `/api/tunnels` body. Tolerant of an agent whose JSON is not what we
+/// expect — an unparseable body is an agent with no tunnels we can name, not a crash.
+pub fn parse_ngrok_tunnels(body: &str) -> Vec<NgrokTunnel> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return vec![] };
+    v.get("tunnels")
+        .and_then(|t| t.as_array())
+        .map(|ts| {
+            ts.iter()
+                .filter_map(|t| {
+                    let public_url = t.get("public_url")?.as_str()?.trim_end_matches('/').to_string();
+                    let addr = t.get("config").and_then(|c| c.get("addr")).and_then(|a| a.as_str()).unwrap_or("").to_string();
+                    Some(NgrokTunnel { public_url, addr })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pure: does this tunnel forward to the bridge on `port`? ngrok writes `config.addr` as
+/// `http://localhost:8787`, `localhost:8787`, `127.0.0.1:8787` or a bare `8787` depending on how
+/// the agent was started, so compare host and port rather than strings.
+pub fn tunnel_is_ours(t: &NgrokTunnel, port: u16, domain: Option<&str>) -> bool {
+    let hostport = t.addr.split("://").last().unwrap_or(&t.addr).trim_end_matches('/');
+    let (host, p) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => ("localhost", hostport),
+    };
+    let local = matches!(host, "" | "localhost" | "127.0.0.1" | "[::1]" | "::1" | "0.0.0.0");
+    if !(local && p.parse::<u16>().ok() == Some(port)) {
+        return false;
+    }
+    match domain {
+        // A pinned domain is a promise about WHICH tunnel; a tunnel on some other host is not it,
+        // however correct its upstream.
+        Some(d) => {
+            let want = d.split("://").last().unwrap_or(d).trim_end_matches('/');
+            host_of(&t.public_url).as_deref() == Some(want)
+        }
+        None => true,
+    }
+}
+
+/// Pure: the one tunnel to use, if any. https beats http; a pinned domain must match.
+pub fn pick_tunnel(tunnels: &[NgrokTunnel], port: u16, domain: Option<&str>) -> Option<String> {
+    let mut ours: Vec<&NgrokTunnel> = tunnels.iter().filter(|t| tunnel_is_ours(t, port, domain)).collect();
+    ours.sort_by_key(|t| !t.public_url.starts_with("https://"));
+    ours.first().map(|t| t.public_url.clone())
+}
+
+/// Look at every agent we know how to find and say what it means for this bridge.
+///
+/// This used to be "the first `public_url` on :4040", which is only right on a machine where the
+/// only ngrok agent is ours. On a host that already runs ngrok for something else, that adopted
+/// the other service's tunnel: the QR pointed a phone at an unrelated app, `--check` said the
+/// bridge was live and not live in the same breath, and the remedy told the user to stop an agent
+/// Mars never started. Ownership is the upstream address — nothing else about a tunnel says whose
+/// it is.
+fn tunnel_state() -> TunnelState {
+    let port = default_port();
+    let domain = std::env::var("MARS_NGROK_DOMAIN").ok().filter(|d| !d.trim().is_empty()).or_else(ngrok_domain);
+    let mut foreign: Option<TunnelState> = None;
+    for api in ngrok_api_candidates() {
+        let Some(tunnels) = read_ngrok_agent(&api) else { continue };
+        if let Some(url) = pick_tunnel(&tunnels, port, domain.as_deref()) {
+            return TunnelState::Ours(url);
+        }
+        if foreign.is_none() {
+            foreign = Some(TunnelState::Foreign {
+                api,
+                addrs: tunnels.iter().map(|t| t.addr.clone()).filter(|a| !a.is_empty()).collect(),
+                port_match: pick_tunnel(&tunnels, port, None),
+            });
+        }
+    }
+    foreign.unwrap_or(TunnelState::None)
+}
+
+/// A foreign agent, in one line a reader can act on. Never "stop it": it is not ours to stop.
+fn foreign_agent_note(api: &str, addrs: &[String], port_match: Option<&str>) -> String {
+    let port = default_port();
+    if let Some(url) = port_match {
+        let host = host_of(url).unwrap_or_else(|| url.to_string());
+        let pinned = std::env::var("MARS_NGROK_DOMAIN").ok().or_else(ngrok_domain).unwrap_or_default();
+        return format!(
+            "the ngrok agent at {api} has an endpoint for 127.0.0.1:{port} at {url}, but the pinned \
+             domain is {pinned}, so Mars will not use it. To use that endpoint: `mars pair --domain {host}`."
+        );
+    }
+    let what = if addrs.is_empty() { "no tunnels".to_string() } else { addrs.join(", ") };
+    format!(
+        "another ngrok agent is running at {api} (forwarding to {what}) — it is not Mars's, and Mars \
+         will not use its tunnels. `mars pair` starts its own agent; on a free plan that needs a free \
+         agent slot (give Mars its own account via NGROK_AUTHTOKEN or MARS_NGROK_CONFIG), or add an \
+         endpoint for 127.0.0.1:{port} to that agent's config and Mars will adopt it."
+    )
+}
+
+fn running_tunnel_url() -> Option<String> {
+    match tunnel_state() {
+        TunnelState::Ours(url) => Some(url),
+        _ => None,
+    }
 }
 
 /// Print the pairing QR for a bridge that's already live: read its tunnel URL from ngrok and the
@@ -1365,21 +1509,28 @@ fn reprint_running(session: &str, reset: bool) -> Result<()> {
     // does when they are trying to make the tunnel come back with new settings.
     //
     // The remedy is the bridge's pid, so print the pid.
-    let base = match running_tunnel_url() {
-        Some(b) => b,
-        None => {
+    let base = match tunnel_state() {
+        TunnelState::Ours(b) => b,
+        // The agent on the API port belongs to somebody else. The old message blamed the bridge
+        // and told the reader to restart it, which would not have helped and would have cost a
+        // tunnel that was never ours.
+        TunnelState::Foreign { api, addrs, port_match } => {
+            anyhow::bail!("the bridge on :{} has no tunnel of its own — {}", default_port(), foreign_agent_note(&api, &addrs, port_match.as_deref()))
+        }
+        TunnelState::None => {
             let port = default_port();
             let who = crate::sys::proc::listener_pid(port)
                 .map(|p| format!("kill {p}"))
                 .unwrap_or_else(|| "stop the bridge".into());
             anyhow::bail!(
                 "the bridge on :{port} has no tunnel — ngrok is not answering on \
-                 http://127.0.0.1:4040.\n  \
+                 {}.\n  \
                  A bridge holds the port, so `mars pair` will not start a replacement while it \
                  runs.\n  \
                  Restart it and the tunnel comes with it:  {who} && mars pair\n  \
                  (If that is not what you expected, ~/.mars/serve-agent.log has the bridge's own \
-                 account.)"
+                 account.)",
+                ngrok_api_candidates().join(" / ")
             )
         }
     };
@@ -1491,11 +1642,20 @@ fn start_tunnel(local_port: u16) -> Result<(Option<std::process::Child>, String)
     // ADOPT before spawning. A free ngrok account allows ONE agent session, and a bridge that
     // died (or exec-replaced itself) can leave its ngrok child running with the tunnel intact —
     // in which case a fresh spawn cannot get a slot and times out, which serially killed every
-    // bridge restart one night. If a live agent already fronts a tunnel, use it.
-    if let Some(url) = running_tunnel_url() {
-        crate::session::debug_log(&format!("[rover] adopting the running ngrok tunnel {url}"));
-        return Ok((None, url));
-    }
+    // bridge restart one night. If a live agent already fronts a tunnel TO THIS PORT, use it —
+    // and only then. An agent forwarding anywhere else is somebody else's; adopting it once sent
+    // a phone to an unrelated app and told the user to stop a production service.
+    let foreign = match tunnel_state() {
+        TunnelState::Ours(url) => {
+            crate::session::debug_log(&format!("[rover] adopting the running ngrok tunnel {url}"));
+            return Ok((None, url));
+        }
+        TunnelState::Foreign { api, addrs, port_match } => {
+            crate::session::debug_log(&format!("[rover] ignoring a foreign ngrok agent at {api} ({})", addrs.join(", ")));
+            Some((api, addrs, port_match))
+        }
+        TunnelState::None => None,
+    };
     // ENV FIRST, THEN CONFIG — because `mars pair --domain` writes CONFIG and this read only the
     // env var, so the flag wrote a setting nothing consumed. The command reported "stable URL set
     // … it survives restarts", the next restart spawned ngrok with no `--url`, and the promise in
@@ -1508,12 +1668,21 @@ fn start_tunnel(local_port: u16) -> Result<(Option<std::process::Child>, String)
         .filter(|d| !d.trim().is_empty())
         .or_else(ngrok_domain)
         .filter(|d| !d.trim().is_empty());
-    let mut args: Vec<String> = vec!["http".into(), local_port.to_string()];
+    // An explicit loopback upstream, so the agent's own API reports exactly the address
+    // `tunnel_is_ours` looks for, and the next `mars pair` recognises this tunnel as Mars's.
+    let mut args: Vec<String> = vec!["http".into(), format!("127.0.0.1:{local_port}")];
     if let Some(d) = &domain {
         // Accept a bare host or a full https URL; ngrok's --url wants the scheme.
         let url = if d.contains("://") { d.clone() } else { format!("https://{}", d.trim_end_matches('/')) };
         args.push("--url".into());
         args.push(url);
+    }
+    // A config of Mars's own, so a host whose default ngrok config belongs to another service can
+    // give the bridge a different authtoken, account or `web_addr`. NGROK_AUTHTOKEN needs no
+    // plumbing: ngrok reads it from the environment the bridge inherits.
+    if let Some(cfg) = std::env::var("MARS_NGROK_CONFIG").ok().filter(|c| !c.trim().is_empty()) {
+        args.push("--config".into());
+        args.push(cfg);
     }
     args.extend(["--log".into(), "stdout".into(), "--log-format".into(), "logfmt".into()]);
     let mut child = Command::new("ngrok")
@@ -1569,6 +1738,15 @@ fn start_tunnel(local_port: u16) -> Result<(Option<std::process::Child>, String)
         Ok(url) => Ok((Some(child), url)),
         Err(_) => {
             let _ = child.kill();
+            // Name the likeliest cause when it is knowable: a foreign agent on the same free
+            // account already holds the one session that plan allows (ERR_NGROK_108), and no
+            // amount of retrying gets a second.
+            if let Some((api, addrs, port_match)) = foreign {
+                return Err(anyhow!(
+                    "timed out waiting for an ngrok tunnel URL — {}",
+                    foreign_agent_note(&api, &addrs, port_match.as_deref())
+                ));
+            }
             Err(anyhow!(
                 "timed out waiting for an ngrok tunnel URL — is your authtoken set? \
                  (`ngrok config add-authtoken …`) An orphaned `ngrok` from a dead bridge can also \
@@ -3618,15 +3796,25 @@ pub fn check_main(session_arg: Option<String>) -> Result<()> {
     // A bridge may already BE up, and this is where somebody asks "is this working". Answering
     // "ready to start one" is wrong when one is running on a tunnel that no longer carries
     // anything — precisely the case where every local signal reads fine.
-    if let Some(base) = running_tunnel_url() {
-        match tunnel_answers(&base) {
-            Ok(()) => println!("  a bridge is already live at {base}, and it answers from outside"),
-            Err(why) => {
-                println!("  a bridge is already live at {base}");
-                println!("{}", tunnel_warning(&why));
+    match tunnel_state() {
+        TunnelState::Ours(base) => {
+            match tunnel_answers(&base) {
+                Ok(()) => println!("  a bridge is already live at {base}, and it answers from outside"),
+                Err(why) => {
+                    println!("  a bridge is already live at {base}");
+                    println!("{}", tunnel_warning(&why));
+                }
             }
+            return Ok(());
         }
-        return Ok(());
+        // Say whose agent it is and leave it alone. This case used to print "a bridge is already
+        // live at <somebody else's URL>" and then a restart remedy for an agent Mars never
+        // started.
+        TunnelState::Foreign { api, addrs, port_match } => {
+            println!("  ⚠  {}", foreign_agent_note(&api, &addrs, port_match.as_deref()));
+            println!();
+        }
+        TunnelState::None => {}
     }
     println!("  ready — run `mars pair` to bring the bridge up");
     Ok(())

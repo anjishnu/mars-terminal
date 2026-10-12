@@ -236,6 +236,61 @@ pub const CLI_VERBS: &[&str] = &[
     "setup", "snapshot", "ssh", "theme", "upgrade", "version", "workspace",
 ];
 
+/// Usage for the Rover verbs alone — what `mars pair --help` prints instead of a pairing link.
+#[cfg(feature = "web")]
+const PAIR_HELP: &str = "\
+usage: mars pair [session] [--all] [--check] [--link] [--open] [--desk [--web <dir>]]
+                 [--domain <name>] [--supervise] [--reset]
+       mars serve …                 same verb, older name
+       mars qr [session] [--all]    just the code, for a phone camera
+
+  --all          offer the whole machine, not just this session
+  --check        what's set up and what isn't, with the fix for each; starts nothing
+  --link         reprint the pairing link for a bridge already running
+  --open         open the paired app here, on this machine
+  --desk         the link aimed at the desktop shell
+  --domain <d>   pin the tunnel URL so the QR survives restarts
+  --supervise    hand the bridge to launchd
+  --reset        rotate the pairing token — drops every paired client
+
+environment: MARS_NGROK_DOMAIN, MARS_NGROK_API (agent API, default http://127.0.0.1:4040),
+             MARS_NGROK_CONFIG (an ngrok config file of Mars's own), NGROK_AUTHTOKEN,
+             MARS_BRIDGE_PORT, MARS_BRIDGE_LOOPBACK. See ROVER.md.";
+
+/// Flags each Rover verb accepts. `--web` and `--domain` take a value.
+#[cfg(feature = "web")]
+const PAIR_FLAGS: &[&str] = &[
+    "--all", "--check", "--link", "--open", "--desk", "--web", "--domain", "--supervise", "--reset",
+];
+#[cfg(feature = "web")]
+const QR_FLAGS: &[&str] = &["--all"];
+
+/// `--help` prints usage and exits 0; an unknown `-`/`--` argument prints it and exits 2, the
+/// same contract as the top-level dispatcher. Either way the bridge is never started and no
+/// link is printed. `Ok(())` means carry on.
+#[cfg(feature = "web")]
+fn check_pair_flags(rest: &[String], known: &[&str]) -> std::result::Result<(), Result<()>> {
+    if rest.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
+        println!("{PAIR_HELP}");
+        return Err(Ok(()));
+    }
+    let mut takes_value = false;
+    for a in rest {
+        if takes_value {
+            takes_value = false;
+            continue;
+        }
+        if a.starts_with('-') {
+            if !known.contains(&a.as_str()) {
+                eprintln!("mars: unknown option `{a}`\n\n{PAIR_HELP}");
+                std::process::exit(2);
+            }
+            takes_value = matches!(a.as_str(), "--web" | "--domain");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     // A previously killed client may have left this TTY in raw mode — repair
     // it before printing anything (and before crossterm snapshots "original").
@@ -963,6 +1018,13 @@ fn main() -> Result<()> {
             // `mars serve [session]` runs the bridge (or reprints the QR if one's already up);
             // `mars serve --reset [session]` rotates the pairing QR and disconnects phones.
             let rest: Vec<String> = args.collect();
+            // BEFORE ANYTHING ELSE. `--help` used to fall through to the default action, which
+            // started the bridge and printed the pairing link — token included — on a screen whose
+            // only request was usage. A flag that asks for help must never hand out a credential,
+            // and an unknown flag must not be silently taken as "run the bridge" either.
+            if let Err(bad) = check_pair_flags(&rest, PAIR_FLAGS) {
+                return bad;
+            }
             let has = |f: &str| rest.iter().any(|a| a == f);
             let reset = has("--reset") || rest.iter().any(|a| a == "reset");
             let session = rest.iter().find(|a| !a.starts_with('-') && *a != "reset").cloned();
@@ -1019,6 +1081,9 @@ fn main() -> Result<()> {
         // phone, which is where sharing the machine is most likely to be what you want.
         Some("qr") => {
             let rest: Vec<String> = args.collect();
+            if let Err(bad) = check_pair_flags(&rest, QR_FLAGS) {
+                return bad;
+            }
             if rest.iter().any(|a| a == "--all") {
                 std::env::set_var("MARS_PAIR_ALL", "1");
             }
@@ -8126,6 +8191,65 @@ fn selfcheck() -> Result<()> {
             "the preflight check leaked its fixture into the real config");
     }
     println!("[selfcheck] pair: preflight is instant and config-backed ... PASS");
+
+    // ── mars pair: a foreign ngrok tunnel is never adopted ──────────────────────────────
+    // Ownership of a tunnel is its upstream address, nothing else. The agent API used to be
+    // read as "the first public_url", which on a host already running ngrok for another
+    // service pointed the QR at that service (issue #6).
+    #[cfg(feature = "web")]
+    {
+        use serve::{parse_ngrok_tunnels, pick_tunnel, NgrokTunnel};
+        let t = |url: &str, addr: &str| NgrokTunnel { public_url: url.into(), addr: addr.into() };
+        // The issue's exact shape: a foreign agent on :4040 serving an unrelated app.
+        let body = r#"{"tunnels":[{"name":"web","public_url":"https://static.ngrok-free.app",
+            "config":{"addr":"http://localhost:5000","inspect":true}}],"uri":"/api/tunnels"}"#;
+        let ts = parse_ngrok_tunnels(body);
+        assert_eq!(ts, vec![t("https://static.ngrok-free.app", "http://localhost:5000")]);
+        assert!(pick_tunnel(&ts, 8787, None).is_none(), "adopted a tunnel forwarding to :5000");
+        // Every spelling ngrok uses for a loopback upstream counts as ours.
+        for addr in ["http://localhost:8787", "localhost:8787", "127.0.0.1:8787", "8787", "http://127.0.0.1:8787"] {
+            assert_eq!(pick_tunnel(&[t("https://ours.ngrok-free.app", addr)], 8787, None).as_deref(),
+                Some("https://ours.ngrok-free.app"), "{addr} was not recognised as the bridge");
+        }
+        // The port is the whole test: same host, other port, not ours.
+        assert!(pick_tunnel(&[t("https://x.ngrok-free.app", "http://localhost:8788")], 8787, None).is_none());
+        // Foreign first, ours second: the order the API lists them in must not matter.
+        let both = vec![t("https://foreign.ngrok-free.app", "http://localhost:5000"), t("https://ours.ngrok-free.app", "localhost:8787")];
+        assert_eq!(pick_tunnel(&both, 8787, None).as_deref(), Some("https://ours.ngrok-free.app"));
+        // https wins over the http twin of the same tunnel.
+        let twins = vec![t("http://ours.ngrok-free.app", "localhost:8787"), t("https://ours.ngrok-free.app", "localhost:8787")];
+        assert_eq!(pick_tunnel(&twins, 8787, None).as_deref(), Some("https://ours.ngrok-free.app"));
+        // A pinned domain is a promise about WHICH tunnel: right upstream, wrong host, not ours.
+        assert!(pick_tunnel(&[t("https://other.ngrok-free.app", "localhost:8787")], 8787, Some("pinned.ngrok-free.app")).is_none());
+        assert_eq!(pick_tunnel(&[t("https://pinned.ngrok-free.app", "localhost:8787")], 8787, Some("https://pinned.ngrok-free.app/")).as_deref(),
+            Some("https://pinned.ngrok-free.app"));
+        // An agent whose body we cannot read is an agent with no tunnels we can name.
+        assert!(parse_ngrok_tunnels("<html>not json</html>").is_empty());
+        assert!(parse_ngrok_tunnels(r#"{"tunnels":[]}"#).is_empty());
+    }
+    println!("[selfcheck] pair: a foreign ngrok tunnel is never adopted ... PASS");
+
+    // ── mars pair --help prints usage, starts nothing, prints no token ──────────────────
+    // `--help` fell through to the default action, which started the bridge and printed the
+    // pairing link — the token is a credential for code execution, and that is how it ended up
+    // in an agent transcript (issue #6). Spawned for real: the contract is about the process.
+    #[cfg(feature = "web")]
+    {
+        let me = std::env::current_exe()?;
+        for verb in ["pair", "serve", "qr"] {
+            let out = std::process::Command::new(&me).args([verb, "--help"]).output()?;
+            let s = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "`mars {verb} --help` exited {:?}", out.status.code());
+            assert!(s.contains("usage: mars pair"), "`mars {verb} --help` printed no usage: {s}");
+            assert!(!s.contains("#h=") && !s.contains("&t="), "`mars {verb} --help` printed a pairing link");
+        }
+        let out = std::process::Command::new(&me).args(["pair", "--bogus"]).output()?;
+        assert_eq!(out.status.code(), Some(2), "an unknown pair flag did not exit 2");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("#h="), "an unknown flag printed a pairing link");
+        let out = std::process::Command::new(&me).args(["qr", "--check"]).output()?;
+        assert_eq!(out.status.code(), Some(2), "`mars qr --check` is not a thing and must say so");
+    }
+    println!("[selfcheck] pair: --help prints usage and no token; unknown flags exit 2 ... PASS");
 
     // ── The bridge's filesystem seam ────────────────────────────────────────────────────
     // The phone reaches this over a PUBLIC tunnel, so `fs.read`/`fs.write` with an unbounded
