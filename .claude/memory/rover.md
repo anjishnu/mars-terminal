@@ -246,3 +246,22 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   `Terminal::send_bytes` queues into `startup_input` behind the shell's prompt probe and only
   flushes when the terminal is pumped, so a test that writes a command and then polls without
   calling `app.tick()` waits forever on input the shell never received.
+
+## ngrok tunnel ownership is the upstream address (issue #6, 2026-10)
+- `tunnel_state()` (serve.rs) reads `/api/tunnels` on `MARS_NGROK_API` or 4040–4044 and
+  accepts a tunnel only when `config.addr` is loopback:`bridge_port` AND, if a domain is pinned
+  (`MARS_NGROK_DOMAIN` / config `ngrok_domain`), `public_url`'s host matches it. Everything
+  else is `TunnelState::Foreign` — reported, never restarted. **A pinned domain silently
+  rejects an otherwise-valid endpoint**; the note names it and suggests `--domain <host>`.
+- The agent Mars spawns is started as `ngrok http 127.0.0.1:<port>` so its own API reports an
+  address `tunnel_is_ours` recognises; `MARS_NGROK_CONFIG` → `--config`.
+- `mars pair --check` runs the session preflight FIRST and bails before the tunnel diagnosis
+  when no local session exists — to exercise the tunnel branch you need a session (a throwaway
+  `mars new <name>` via a pty works; see the issue-6 test script in the PR). A fake agent is
+  one Python `http.server` on any port + `MARS_NGROK_API=http://127.0.0.1:<port>`.
+- `pair/serve/qr --help` print `PAIR_HELP` and exit 0; unknown `-` flags exit 2 — checked by
+  spawning `current_exe` in the selfcheck, so it holds for the process, not just the parser.
+- **Tearing down a test bridge:** `mars pair <s>` run by hand is re-parented under the session
+  daemon, but `mars kill <s>` ends the session WITHOUT ending that bridge or its ngrok child —
+  both keep running (and keep the account's agent slot + the pinned domain) until killed by pid.
+  `killpg` on the bridge's pgid fails with EPERM; a plain `kill <bridge pid> <ngrok pid>` works.

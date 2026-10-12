@@ -412,6 +412,32 @@ mars pair --domain your-name.ngrok-free.dev
 It is stored in `~/.mars/config.json`, so a new shell and a supervised bridge both see it. After
 this the QR survives restarts and reboots.
 
+## A host that already runs ngrok
+
+Mars never uses a tunnel that does not forward to its own bridge port. If another agent is
+already up (a systemd service fronting some other app, say), `mars pair --check` names it and
+what it forwards to, and `mars pair` starts an agent of its own. Two things can stand in the way,
+and both are the account's, not Mars's:
+
+- **A free plan allows one agent session.** Give the bridge its own: set `NGROK_AUTHTOKEN` to a
+  second account's token, or point `MARS_NGROK_CONFIG` at a config file that is not the service's.
+- **The agent API moved.** A second agent cannot bind `:4040`, so ngrok puts its API on the next
+  port. Mars looks at `4040`–`4044`; `MARS_NGROK_API` pins one address if that is not enough.
+
+Or hand the bridge to the agent that is already there — add an endpoint for the bridge port to its
+config and Mars adopts it on the next `mars pair`, starting nothing:
+
+```yaml
+endpoints:
+  - name: mars
+    url: https://your-name.ngrok-free.dev
+    upstream:
+      url: 8787
+```
+
+Mars will not stop, restart or reconfigure an agent it did not start. If `--check` ever tells you
+to, that is a bug.
+
 To keep the bridge running across crashes and logouts:
 
 ```bash
@@ -475,7 +501,7 @@ can run at the keyboard says everything is well while the phone gets an SSL erro
 `mars pair --check` and `mars pair --link` now ask the question from outside: they fetch the public
 URL and require this bridge's own header in the answer, because ngrok's "tunnel not found" page is
 a perfectly good HTTP response and would otherwise read as success. A failure prints what to do —
-stop the bridge and its ngrok agent, then `mars pair` again.
+stop the bridge and the ngrok agent Mars started, then `mars pair` again.
 
 Read the result asymmetrically. A reply has been to ngrok's edge and back, so it proves the path; a
 silence could equally be *this* laptop's network, which is why nothing refuses to work on the
@@ -529,6 +555,9 @@ mars reboot [name]             # restart onto the installed binary
 | Variable | Effect |
 |---|---|
 | `MARS_NGROK_DOMAIN` | overrides the configured stable domain |
+| `MARS_NGROK_API` | the ngrok agent API to read tunnels from (default: `http://127.0.0.1:4040`, then 4041–4044) |
+| `MARS_NGROK_CONFIG` | an ngrok config file of Mars's own, passed as `--config` to the agent it starts |
+| `NGROK_AUTHTOKEN` | read by ngrok itself — a second account for the bridge without touching the default config |
 | `MARS_ROVER_MODEL` | model for Rover chat (default `claude-sonnet-5`) |
 | `MARS_ROVER_EFFORT` | effort for Rover chat (default `medium`) |
 | `MARS_BRIDGE_PORT` | port the bridge listens on (default `8787`; values ≤1024 ignored) |
