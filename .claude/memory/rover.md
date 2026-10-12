@@ -261,3 +261,7 @@ Rover is the semantics-first mobile client (see `design_ideas/rover-brand.md`,
   one Python `http.server` on any port + `MARS_NGROK_API=http://127.0.0.1:<port>`.
 - `pair/serve/qr --help` print `PAIR_HELP` and exit 0; unknown `-` flags exit 2 — checked by
   spawning `current_exe` in the selfcheck, so it holds for the process, not just the parser.
+- **Tearing down a test bridge:** `mars pair <s>` run by hand is re-parented under the session
+  daemon, but `mars kill <s>` ends the session WITHOUT ending that bridge or its ngrok child —
+  both keep running (and keep the account's agent slot + the pinned domain) until killed by pid.
+  `killpg` on the bridge's pgid fails with EPERM; a plain `kill <bridge pid> <ngrok pid>` works.
