@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.7.3
+
+The bridge stops adopting other people's tunnels. On a host that already runs
+ngrok for something else, `mars pair` put that service's URL in the QR and
+then told you to stop a service it did not own. A tunnel is now Mars's only
+if it forwards to the bridge; everything else is named and left alone. And
+`pair --help` prints help, not a credential.
 
 ### Fixed
 
