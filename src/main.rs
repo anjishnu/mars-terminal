@@ -1827,19 +1827,38 @@ fn selfcheck() -> Result<()> {
     }
     app.handle_key(k(KeyCode::Esc))?;
 
-    // 14. kill_buffer with two panes on one buffer must not leave a dangling id.
+    // 14. kill_buffer with two panes on one buffer closes both and leaves no dangling id. When
+    //     they were everything open, closing the file is quitting, and asks quit's question.
     let mut app = App::new(None)?;
     typ(&mut app, "one")?;
     app.handle_key(kc(KeyCode::Char('x')))?;
     app.handle_key(k(KeyCode::Char('2')))?; // C-x 2 → split (same buffer)
-    app.new_scratch(); // a second buffer to land on
+    let closed = match app.focused_pane().content {
+        pane::PaneContent::Editor(b) => b,
+        _ => panic!("split did not show the buffer"),
+    };
     app.handle_key(kc(KeyCode::Char('x')))?;
     app.handle_key(k(KeyCode::Char('k')))?; // C-x k → kill buffer
+    assert!(
+        matches!(app.prompt.as_ref().map(|p| &p.kind), Some(app::PromptKind::ConfirmQuit)),
+        "closing the only open file did not ask about its unsaved changes"
+    );
+    app.handle_key(kc(KeyCode::Char('g')))?; // cancel: everything stays
+    assert_eq!(app.tab().layout.count(), 2, "cancelling still closed the file's panes");
+    app.new_tab();
+    app.active_tab = 0; // another workspace keeps the session alive
+    app.handle_key(kc(KeyCode::Char('x')))?;
+    app.handle_key(k(KeyCode::Char('k')))?;
+    app.handle_key(k(KeyCode::Char('y')))?; // its unsaved changes go
+    assert_eq!(app.tabs.len(), 1, "closing the file in both its panes left their workspace open");
+    assert!(
+        !app.panes.values().any(|p| matches!(p.content, pane::PaneContent::Editor(b) if b == closed)),
+        "a pane still points at the closed buffer"
+    );
     app.handle_key(kc(KeyCode::Char('x')))?;
     app.handle_key(k(KeyCode::Char('o')))?; // C-x o → other pane (would panic before)
     let _ = app.focused_buf(); // must not panic
-    assert_eq!(app.buffers.len(), 1, "kill_buffer left extra buffers");
-    println!("[selfcheck] kill_buffer retarget ....... PASS");
+    println!("[selfcheck] kill_buffer closes its panes ..... PASS");
 
     // 15. A real terminal PTY spawns and echoes.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2120,11 +2139,14 @@ fn selfcheck() -> Result<()> {
     assert_eq!(sh.view_offset(), 0, "history_tail left the view scrolled back");
     println!("[selfcheck] terminal scrollback ........ PASS");
 
-    // 15e. Dead-shell lifecycle: exit → Exited event → Enter recycles the pane.
+    // 15e. Dead-shell lifecycle. A failed exit keeps its notice until Enter; a clean `exit`
+    //      closes at once. Either way the pane closes for real: alone in a workspace, the
+    //      workspace goes with it; in the last workspace, the session.
     let mut app = App::new(None)?;
+    app.new_tab();
     app.handle_key(kc(KeyCode::Char(' ')))?;
     app.handle_key(k(KeyCode::Char('!')))?;
-    typ(&mut app, "exit")?;
+    typ(&mut app, "exit 3")?;
     app.handle_key(k(KeyCode::Enter))?; // attached; shell exits immediately
     let dead = wait_until(|| {
         app.tick(); // drains TermEvent::Exited
@@ -2134,15 +2156,36 @@ fn selfcheck() -> Result<()> {
     term.draw(|f| ui::render(f, &mut app))?;
     assert!(
         screen_text(&term).contains("process exited"),
-        "dead-shell notice not rendered"
+        "a failed exit did not keep its notice"
     );
     app.handle_key(k(KeyCode::Enter))?; // dismiss
     assert!(app.terms.is_empty(), "exited terminal not cleaned up");
-    assert!(
-        matches!(app.focused_pane().content, pane::PaneContent::Editor(_)),
-        "pane not recycled to an editor"
-    );
+    assert_eq!(app.tabs.len(), 1, "dismissing a dead shell did not close its workspace");
+    assert!(!app.should_quit, "closing one of two workspaces ended the session");
     assert!(app.mode == mode::Mode::Edit, "mode not restored after dismissal");
+
+    app.handle_key(kc(KeyCode::Char('\\')))?; // split: the shell gets a pane of its own
+    assert_eq!(app.tab().layout.count(), 2, "C-\\ did not split");
+    app.handle_key(kc(KeyCode::Char(' ')))?;
+    app.handle_key(k(KeyCode::Char('!')))?;
+    typ(&mut app, "exit")?;
+    app.handle_key(k(KeyCode::Enter))?;
+    let closed = wait_until(|| {
+        app.tick();
+        app.tab().layout.count() == 1
+    });
+    assert!(closed, "a clean exit did not close its pane");
+    assert!(app.terms.is_empty() && !app.should_quit, "a clean exit in a split closed more than its pane");
+
+    app.handle_key(kc(KeyCode::Char(' ')))?;
+    app.handle_key(k(KeyCode::Char('!')))?;
+    typ(&mut app, "exit")?;
+    app.handle_key(k(KeyCode::Enter))?;
+    let ended = wait_until(|| {
+        app.tick();
+        app.should_quit
+    });
+    assert!(ended, "a clean exit in the last pane did not end the session");
     println!("[selfcheck] dead-shell lifecycle ....... PASS");
 
     // 15d. Autosave: a modified path-backed buffer hits disk on the timer.
@@ -2617,23 +2660,34 @@ fn selfcheck() -> Result<()> {
     // 26f. Renames: tab via travel `r`; pane via action; auto-name plumbing.
     let mut app = App::new(None)?;
     app.handle_key(kc(KeyCode::Char('t')))?; // travel mode
-    app.handle_key(k(KeyCode::Char('r')))?; // rename tab → prompt (prefilled "1")
+    app.handle_key(k(KeyCode::Char('r')))?; // rename workspace → prompt (prefilled "1")
     assert!(app.mode == mode::Mode::Prompt, "travel r did not prompt");
     app.handle_key(k(KeyCode::Backspace))?; // clear the "1"
     typ(&mut app, "build")?;
     app.handle_key(k(KeyCode::Enter))?;
-    assert_eq!(app.tab().name, "build", "tab rename failed");
+    assert_eq!(app.tab().name, "build", "workspace rename failed");
     // A generated name must not even be OFFERED over a user-chosen (non-numeric) name.
     let tid0 = app.tab().id;
     app.agent_tx.send(agent::AgentEvent::AutoName { tab_id: tid0, name: "x".into() })?;
     app.tick();
     assert_eq!(app.tab().name, "build", "generated name overrode a manual rename");
     assert!(app.tab_name_suggestion.is_empty(), "suggested a name over a user's own");
-    app.run_action(palette::Action::RenamePane);
+    // One rename, for the workspace. Pane and tab were renamed separately, and could show two
+    // names for one place.
+    app.run_action(palette::Action::RenameWorkspace);
+    assert_eq!(
+        app.prompt.as_ref().map(|p| p.input.as_str()),
+        Some("build"),
+        "rename did not start from the workspace's name"
+    );
+    for _ in 0.."build".len() {
+        app.handle_key(k(KeyCode::Backspace))?;
+    }
     typ(&mut app, "logs")?;
     app.handle_key(k(KeyCode::Enter))?;
+    assert_eq!(app.tab().name, "logs", "workspace rename failed");
     term.draw(|f| ui::render(f, &mut app))?;
-    assert!(screen_text(&term).contains(" logs "), "pane title not rendered");
+    assert!(screen_text(&term).contains("logs"), "workspace name not rendered");
     // A default-named tab gets a SUGGESTION, not a rename. Applying it automatically is what
     // moved sessions out from under the things that address them by name; see 29a5.
     let mut app = App::new(None)?;
@@ -3833,17 +3887,11 @@ fn selfcheck() -> Result<()> {
             assert!(asks(&app), "opening a shell counted as using the session");
             app.handle_key(key(KeyCode::Esc))?;
             // Leaving is not using: Enter on an empty prompt, a typo taken back, `exit`.
-            for t in app.terms.values_mut() {
-                t.send_bytes(b"\r");
-                t.send_bytes(b"lsx\x7f\x7f\x7fexit\r");
-                assert!(!t.had_input(), "Enter or `exit` counted as running a command");
-                t.send_bytes(b"echo partial\x03");
-                assert!(!t.had_input(), "a line abandoned with C-c counted as a command");
-            }
-            app.tick();
-            app.run_action(palette::Action::Quit);
-            assert!(asks(&app), "typing `exit` made the session look used");
-            app.handle_key(key(KeyCode::Esc))?;
+            let mut line = terminal::TypedLine::default();
+            assert!(!line.feed(b"\r"), "Enter on an empty prompt counted as a command");
+            assert!(!line.feed(b"lsx\x7f\x7f\x7fexit\r"), "`exit` counted as a command");
+            assert!(!line.feed(b"echo partial\x03"), "a line abandoned with C-c counted as a command");
+            assert!(line.feed(b"true\r"), "a real command did not count");
             for t in app.terms.values_mut() {
                 t.send_bytes(b"true\r");
             }
@@ -5697,6 +5745,58 @@ fn selfcheck() -> Result<()> {
     assert!(!app.terms.contains_key(&tid), "confirmed close ORPHANED the terminal (not reaped)");
     assert!(!app.watches.contains_key(&tid), "watch state not cleaned on reap");
     println!("[selfcheck] close gate reaps PTYs ..... PASS");
+
+    // 33b. Closing really closes. The last pane of a workspace takes the workspace with it, and
+    //      the last workspace ends the session; the manager's hidden tab keeps nothing alive. A
+    //      file closes with every pane showing it, and asks first when it has unsaved changes.
+    {
+        let mut app = App::new(None)?;
+        app.new_tab();
+        app.run_action(palette::Action::ClosePane);
+        assert_eq!(app.tabs.len(), 1, "closing a workspace's last pane did not close the workspace");
+        assert!(!app.should_quit, "closing one of two workspaces ended the session");
+        app.session_name = Some("closing".into());
+        app.open_terminal();
+        app.run_action(palette::Action::ClosePane);
+        assert!(
+            matches!(app.prompt.as_ref().map(|p| &p.kind), Some(app::PromptKind::ConfirmAction(palette::Action::CloseTab))),
+            "ending the session over a live shell did not ask"
+        );
+        app.handle_key(k(KeyCode::Char('n')))?;
+        assert!(!app.should_quit, "declining still ended the session");
+        app.run_action(palette::Action::ClosePane);
+        app.handle_key(k(KeyCode::Char('y')))?;
+        assert!(app.should_quit && !app.detach_requested, "closing the last pane did not end the session");
+
+        let mut app = App::new(None)?;
+        app.new_tab();
+        app.tabs[1].hidden = true;
+        app.active_tab = 0;
+        app.run_action(palette::Action::CloseTab);
+        assert!(app.should_quit, "a hidden tab kept the session alive after its last workspace closed");
+
+        let mut app = App::new(None)?;
+        app.new_tab();
+        typ(&mut app, "draft")?;
+        app.run_action(palette::Action::KillBuffer);
+        assert!(
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(app::PromptKind::ConfirmAction(palette::Action::KillBuffer))
+            ),
+            "closing a file with unsaved changes did not ask"
+        );
+        app.handle_key(k(KeyCode::Char('n')))?;
+        assert_eq!(app.tabs.len(), 2, "declining still closed the file");
+        app.run_action(palette::Action::KillBuffer);
+        app.handle_key(k(KeyCode::Char('y')))?;
+        assert_eq!(app.tabs.len(), 1, "closing a workspace's only file did not close the workspace");
+        assert!(!app.buffers.is_empty(), "closing a file left no buffer to open panes from");
+        assert!(!app.should_quit, "closing one of two workspaces ended the session");
+        app.run_action(palette::Action::KillBuffer);
+        assert!(app.should_quit, "closing the last file did not end the session");
+    }
+    println!("[selfcheck] closing closes for real ..... PASS");
 
     // 34. Close short-circuit: a CLEAN editor pane closes without the motor-slip
     //     confirm (a nice speed-up); a DIRTY buffer still gates. Live terminals are

@@ -7,7 +7,8 @@ bridge adopting that service's tunnel, but the bridge then always started an
 agent of its own, which cannot get a hostname when the account's one domain is
 taken. The bridge now rides the agent that is already there, and can share a
 free plan's single domain by path. Sessions opened by mistake stop piling up,
-and `mars ls` keeps its order as new ones are made.
+`mars ls` keeps its order as new ones are made, closing a file or a shell
+really closes it, and a workspace has one name.
 
 ### Fixed
 
@@ -45,6 +46,15 @@ and `mars ls` keeps its order as new ones are made.
 - **`mars ls` reshuffled as sessions were made.** It sorted by name, so each new auto-numbered
   session landed above the named ones, and `10` above `2`. Sessions are now listed oldest first,
   by a birth record kept beside the socket that moves with a rename and survives a reboot.
+- **Closing a file or a shell left a scratch buffer behind.** `C-x k` swapped another buffer
+  into the pane, a shell's `exit` turned its pane into an editor, and `C-x 0` did nothing on a
+  workspace's last pane, so nothing ever really closed. Each now closes its pane, the workspace
+  when that was its last pane, and the session when that was the last workspace (the manager's
+  hidden tab does not count). A clean `exit` closes at once; a failed one keeps its notice until
+  Enter. `C-x k` on a file with unsaved changes now asks first; it used to drop them.
+- **One rename for a workspace.** "Rename pane" and "Rename tab" were two names for one place,
+  and the board, tab bar and pane border could disagree. They are now **Rename workspace**
+  (`r` in `C-t` space warp), the same rename Rover uses.
 
 ## 0.7.3
 

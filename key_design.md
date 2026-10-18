@@ -107,8 +107,10 @@ an always-on cheat panel: ONE directional grammar walks the whole workspace — 
 tab at the pane-grid edge, so panes and tabs are two *views* of one space, not two
 movement models. Then `1-9` jump to a tab · `⇧`-arrows / `H`/`L` reorder the focused
 tab · `z`/`Space` zoom (toggle) · `d`/`⌫` close the focused view (the pane, or the whole
-tab when it is the tab's last pane) · `t`/`T` new tab / terminal tab · `|`/`-` split ·
-`x` swap pane. Rule inside the hub: *creation exits, navigation stays.* The panel is
+tab when it is the tab's last pane, or the session when that was the last tab) · `t`/`T`
+new tab / terminal tab · `|`/`-` split · `x` swap pane · `r` rename the workspace. Every
+close follows that one rule: `C-x 0`, `C-x k` on a file, and a shell's `exit` close what
+they were in rather than leaving a scratch buffer in its place. Rule inside the hub: *creation exits, navigation stays.* The panel is
 the teacher; the direct chords above are what it graduates you to.
 
 **Terminal-capability tiering.** Legacy byte encoding cannot express Ctrl+shifted-
@@ -212,8 +214,8 @@ the substrates listed in §6.
 
 - *P0 — daily-driver blockers:* ~~terminal scrollback~~, ~~dead-shell lifecycle~~,
   ~~crash-safety~~, ~~pane resizing~~, ~~pane zoom~~ (all shipped 2026-07: 10k-line
-  scrollback with wheel / Shift+PgUp/PgDn and snap-back-on-input; exited shells show a
-  dismissal notice and recycle their pane; autosave of path-backed buffers on a timer +
+  scrollback with wheel / Shift+PgUp/PgDn and snap-back-on-input; a clean `exit` closes
+  its pane at once and a failed one keeps a notice until Enter, then closes it; autosave of path-backed buffers on a timer +
   on detach with a failure notice, daemons log to `~/.local/state/mars/<name>.log`;
   layout-tree split ratios with travel `> < + =` resize; travel `z` zoom toggle).
 - *P1 — comfort parity:* copy-mode-lite (keyboard select/yank from scrollback);

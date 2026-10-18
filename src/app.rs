@@ -124,8 +124,7 @@ pub struct Prompt {
 pub enum PromptKind {
     SaveAs,
     GotoLine,
-    RenameTab,
-    RenamePane,
+    RenameWorkspace,
     RenameSession,
     /// Live incremental search (C-s / C-r navigate, Enter accepts, C-g restores).
     Search,
@@ -940,13 +939,6 @@ impl App {
     pub fn tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active_tab]
     }
-    /// Rename the workspace that OWNS `pane`, for a Rover subscriber renaming a workspace it is
-    /// not standing in (the desk path renames the ACTIVE tab through `PromptKind::RenameTab`).
-    ///
-    /// Addressed by pane rather than by the board row's `id`, which is a `tab_index` — a position
-    /// in `tabs` that every close shifts. An index that crossed the wire can name a different
-    /// workspace by the time it lands, and renaming the wrong one is silent. A pane id never
-    /// means anything but the pane it was minted for.
     /// Did a PERSON name this tab, or is it still auto-named?
     ///
     /// `settle()` is what a manual rename calls to opt out of auto-naming, so that flag already
@@ -975,6 +967,16 @@ impl App {
         }
     }
 
+    /// Rename the workspace that OWNS `pane` — the one rename there is. The desk names the
+    /// workspace it is standing in; a Rover subscriber may name one it is not.
+    ///
+    /// A pane and its tab used to be renamed separately, and the board, the tab bar and the pane
+    /// border could then show three different names for one place.
+    ///
+    /// Addressed by pane rather than by the board row's `id`, which is a `tab_index` — a position
+    /// in `tabs` that every close shifts. An index that crossed the wire can name a different
+    /// workspace by the time it lands, and renaming the wrong one is silent. A pane id never
+    /// means anything but the pane it was minted for.
     pub fn rename_workspace_of_pane(&mut self, pane: PaneId, to: &str) -> bool {
         let to = to.trim();
         if to.is_empty() {
@@ -2630,24 +2632,47 @@ impl App {
 
     // ── Buffers & windows ────────────────────────────────────────────────────
 
+    /// Close the focused file, and every pane showing it, the way `drop_pane` closes any pane.
     fn kill_buffer(&mut self) {
+        let confirmed = std::mem::take(&mut self.close_confirmed);
         let buf_id = match self.editor_pos() { Some((_, _, id)) => id, None => return };
-        if self.buffers.len() <= 1 {
-            self.status_msg = Some("Only buffer".into());
+        let showing: Vec<PaneId> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.layout.pane_ids())
+            .filter(|id| matches!(self.panes.get(id).map(|p| &p.content), Some(PaneContent::Editor(b)) if *b == buf_id))
+            .collect();
+        // Closing the last workspace is quitting, and quitting already asks about unsaved files.
+        let ends_session = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.hidden)
+            .all(|(_, t)| t.layout.pane_ids().iter().all(|p| showing.contains(p)));
+        if ends_session {
+            self.quit_reason.get_or_insert_with(|| "last file closed".into());
+            self.request_quit();
             return;
         }
-        let other = self.buffers.keys().copied().find(|&id| id != buf_id);
+        if !confirmed && self.buffers.get(&buf_id).is_some_and(|b| b.modified) {
+            let name = self.buffers[&buf_id].name.clone();
+            self.start_prompt(
+                PromptKind::ConfirmAction(Action::KillBuffer),
+                &format!("Close {name} — its unsaved changes will be lost. y/n "),
+            );
+            return;
+        }
+        for pane in showing {
+            self.drop_pane(pane);
+        }
         self.buffers.remove(&buf_id);
-        if let Some(o) = other {
-            // Retarget EVERY pane showing the killed buffer, not just the
-            // focused one — a stale BufferId would panic on next focus.
-            for pane in self.panes.values_mut() {
-                if matches!(pane.content, PaneContent::Editor(id) if id == buf_id) {
-                    pane.content = PaneContent::Editor(o);
-                    pane.buffer_id = o;
-                    pane.cursor_row = 0; pane.cursor_col = 0; pane.scroll_row = 0;
-                    pane.selection_anchor = None;
-                }
+        // New panes are minted from an existing buffer, so one must always exist.
+        if self.buffers.is_empty() {
+            self.new_scratch();
+        }
+        for pane in self.panes.values_mut() {
+            if pane.buffer_id == buf_id {
+                pane.buffer_id = *self.buffers.keys().next().expect("a buffer always exists");
             }
         }
     }
@@ -2968,6 +2993,7 @@ impl App {
                 if let PaneContent::Terminal(tid) = p.content {
                     self.terms.remove(&tid);
                     self.watches.remove(&tid);
+                    self.pending_watch.retain(|(qid, _)| *qid != tid);
                 }
             }
         }
@@ -2993,6 +3019,8 @@ impl App {
     pub fn close_pane(&mut self) {
         let force = std::mem::take(&mut self.force_close_confirm);
         if self.tab().layout.count() <= 1 {
+            self.force_close_confirm = force;
+            self.close_tab();
             return;
         }
         let focused = self.focused_pane_id();
@@ -3155,20 +3183,66 @@ impl App {
 
     pub fn close_tab(&mut self) {
         let force = std::mem::take(&mut self.force_close_confirm);
-        if self.tabs.len() == 1 {
-            self.quit_reason.get_or_insert_with(|| "last tab closed".into());
+        let pane_ids = self.tab().layout.pane_ids();
+        if self.is_last_workspace(self.active_tab) {
+            if self.confirm_close(self.live_terms_in(&pane_ids), force, Action::CloseTab, "the last workspace and end the session") {
+                return;
+            }
+            self.quit_reason.get_or_insert_with(|| "last workspace closed".into());
             self.request_quit(); // quit has its own dirty-buffer gate
             return;
         }
-        let pane_ids = self.tab().layout.pane_ids();
         if self.confirm_close(self.live_terms_in(&pane_ids), force, Action::CloseTab, "this tab") {
             return;
         }
+        self.remove_tab(self.active_tab);
+    }
+
+    /// The manager's hidden tab is not a workspace anyone works in, so it neither keeps the
+    /// session alive nor is somewhere to land when one closes.
+    fn is_last_workspace(&self, idx: usize) -> bool {
+        !self.tabs.iter().enumerate().any(|(i, t)| i != idx && !t.hidden)
+    }
+
+    fn remove_tab(&mut self, idx: usize) {
+        let pane_ids = self.tabs[idx].layout.pane_ids();
         self.reap_panes(&pane_ids);
-        self.tabs.remove(self.active_tab);
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
+        self.tabs.remove(idx);
+        if self.active_tab > idx || self.active_tab >= self.tabs.len() {
+            self.active_tab = self.active_tab.saturating_sub(1).min(self.tabs.len() - 1);
         }
+        if self.tab().hidden {
+            self.rotate_tab(1);
+        }
+    }
+
+    /// Close one pane wherever it is, with no confirm: its workspace goes with it when it was the
+    /// last pane there, and the session when that was the last workspace. A closed file or a shell
+    /// that exited used to leave a scratch buffer in its place, so nothing ever really closed.
+    fn drop_pane(&mut self, pane: PaneId) {
+        let Some(idx) = self.tabs.iter().position(|t| t.layout.pane_ids().contains(&pane)) else {
+            self.reap_panes(&[pane]);
+            return;
+        };
+        if self.tabs[idx].layout.count() > 1 {
+            let next = self.tabs[idx].layout.next_pane(pane);
+            let tab = &mut self.tabs[idx];
+            tab.layout.remove(pane);
+            if tab.focused_pane == pane {
+                tab.focused_pane = next;
+            }
+            if tab.zoomed == Some(pane) {
+                tab.zoomed = None;
+            }
+            self.reap_panes(&[pane]);
+        } else if self.is_last_workspace(idx) {
+            self.quit_reason.get_or_insert_with(|| "last pane closed".into());
+            self.request_quit();
+            return;
+        } else {
+            self.remove_tab(idx);
+        }
+        self.mode = self.mode_for_focused_pane();
     }
 
     /// Rotate to the next visible tab. Hidden tabs (the manager) are skipped, so revealing one is
@@ -3904,20 +3978,9 @@ impl App {
                     Err(e) => format!("Save error: {}", e),
                 });
             }
-            PromptKind::RenameTab => {
-                let name = p.input.trim().to_string();
-                if !name.is_empty() {
-                    let id = self.tab().id;
-                    self.auto_name_attempts.entry(id).or_default().settle(); // manual name opts out
-                    self.tab_mut().name = name;
-                }
-            }
-            PromptKind::RenamePane => {
-                let title = p.input.trim().to_string();
-                let pid = self.focused_pane_id();
-                if let Some(pane) = self.panes.get_mut(&pid) {
-                    pane.title = if title.is_empty() { None } else { Some(title) };
-                }
+            PromptKind::RenameWorkspace => {
+                let pane = self.focused_pane_id();
+                self.rename_workspace_of_pane(pane, &p.input);
             }
             PromptKind::RenameSession => {
                 let name = p.input.trim().to_string();
@@ -3999,7 +4062,7 @@ impl App {
             KeyCode::Char('x') => self.swap_pane(),
             KeyCode::Char('>') | KeyCode::Char('+') | KeyCode::Char('=') => self.resize_pane(6),
             KeyCode::Char('<') => self.resize_pane(-6),
-            KeyCode::Char('r') => self.run_action(Action::RenameTab), // → prompt, exits mode
+            KeyCode::Char('r') => self.run_action(Action::RenameWorkspace), // → prompt, exits mode
             KeyCode::Char('?') => self.run_action(Action::ExplainFailure), // triage → Ask
             KeyCode::Char('w') => self.toggle_watch_pane(), // watch this pane
             KeyCode::Char('@') => self.toggle_file_tree(), // `@` opens/focuses the navigator
@@ -5416,13 +5479,9 @@ impl App {
             Action::PrevTab            => self.prev_tab(),
             Action::MoveTabLeft        => self.move_tab(-1),
             Action::MoveTabRight       => self.move_tab(1),
-            Action::RenameTab          => {
+            Action::RenameWorkspace    => {
                 let current = self.tab().name.clone();
-                self.start_prompt_with(PromptKind::RenameTab, "Rename tab: ", &current);
-            }
-            Action::RenamePane         => {
-                let current = self.focused_pane().title.clone().unwrap_or_default();
-                self.start_prompt_with(PromptKind::RenamePane, "Rename pane: ", &current);
+                self.start_prompt_with(PromptKind::RenameWorkspace, "Rename workspace: ", &current);
             }
             Action::RenameSession      => {
                 if self.session_name.is_some() {
@@ -6026,26 +6085,20 @@ impl App {
         }
     }
 
-    /// Dismiss an exited terminal: close the pane, or recycle the last pane
-    /// back into an editor showing a scratch/existing buffer.
+    /// Dismiss an exited terminal: its pane closes, and its workspace or the session with it
+    /// when nothing else is open there.
     fn close_terminal_pane(&mut self, term_id: TermId) {
-        self.terms.remove(&term_id);
-        if self.tab().layout.count() > 1 {
-            self.close_pane();
-        } else {
-            let buf = match self.buffers.keys().next().copied() {
-                Some(b) => b,
-                None => self.new_scratch(),
-            };
-            let pid = self.focused_pane_id();
-            if let Some(p) = self.panes.get_mut(&pid) {
-                p.content = PaneContent::Editor(buf);
-                p.cursor_row = 0;
-                p.cursor_col = 0;
-                p.scroll_row = 0;
+        let pane = self
+            .panes
+            .iter()
+            .find(|(_, p)| matches!(p.content, PaneContent::Terminal(t) if t == term_id))
+            .map(|(id, _)| *id);
+        match pane {
+            Some(pane) => self.drop_pane(pane),
+            None => {
+                self.terms.remove(&term_id);
             }
         }
-        self.mode = self.mode_for_focused_pane();
     }
 
     // ── Main loop ────────────────────────────────────────────────────────────
@@ -6135,7 +6188,9 @@ impl App {
                         continue;
                     }
                     t.exited = true;
+                    let clean = t.exit_code() == Some(0);
                     let watched = self.watches.get(&id).map(|w| w.watched && !w.triggered).unwrap_or(false);
+                    let asked_to_watch = self.watches.get(&id).is_some_and(|w| w.watched && !w.auto);
                     if watched {
                         if !self.pending_watch.iter().any(|(qid, _)| *qid == id) {
                             self.pending_watch.push((id, WatchReason::Exit)); // gets an LLM verdict
@@ -6143,6 +6198,12 @@ impl App {
                     } else {
                         // An unwatched shell ending is context, not an accomplishment.
                         self.push_away(AwayKind::Context, "shell exited".into(), None);
+                    }
+                    // `exit` closes the shell's pane the way closing a terminal tab does. A
+                    // failure, or a pane someone asked to watch, keeps its notice until Enter so
+                    // there is something to read.
+                    if clean && !asked_to_watch {
+                        self.close_terminal_pane(id);
                     }
                 }
             }
