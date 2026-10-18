@@ -791,7 +791,11 @@ pub fn next_auto_name() -> Result<String> {
         .unwrap_or_else(|| "0".to_string()))
 }
 
-/// (name, alive, attached) for every session socket; stale sockets are removed.
+/// (name, alive, attached) for every session socket, oldest session first; stale sockets are
+/// removed.
+///
+/// Oldest first, not by name. Sorted by name, every new auto-numbered session (`0`, `1`, …) landed
+/// above the named ones, and `10` above `2`, so the list reshuffled each time one was made.
 pub fn list_sessions() -> Result<Vec<(String, bool, bool)>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(socket_dir()?)? {
@@ -800,22 +804,52 @@ pub fn list_sessions() -> Result<Vec<(String, bool, bool)>> {
             continue;
         }
         let name = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        // A session from before birth records were kept falls back to its socket's age.
+        let made = session_born(&name)
+            .or_else(|| {
+                let t = std::fs::symlink_metadata(&path).and_then(|m| m.modified()).ok()?;
+                Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
+            })
+            .unwrap_or(u64::MAX);
         match query_attached(&path) {
-            Some(attached) => out.push((name, true, attached)),
+            Some(attached) => out.push((made, name, true, attached)),
             None => match crate::sys::control::probe(&path) {
                 crate::sys::control::Probe::Dead => {
                     let _ = std::fs::remove_file(&path);
-                    out.push((name, false, false));
+                    forget_born(&name);
+                    out.push((made, name, false, false));
                 }
                 crate::sys::control::Probe::Live
                 | crate::sys::control::Probe::Indeterminate => {
-                    out.push((name, true, false));
+                    out.push((made, name, true, false));
                 }
             },
         }
     }
     out.sort();
-    Ok(out)
+    Ok(out.into_iter().map(|(_, name, alive, attached)| (name, alive, attached)).collect())
+}
+
+/// When a session was made, kept beside its socket. Not the socket's own timestamp: a reboot
+/// recreates the socket, and that would send a rebooted session to the bottom of `mars ls`.
+fn born_path(name: &str) -> Result<PathBuf> {
+    Ok(socket_path(name)?.with_extension("born"))
+}
+
+pub fn session_born(name: &str) -> Option<u64> {
+    std::fs::read_to_string(born_path(name).ok()?).ok()?.trim().parse().ok()
+}
+
+pub fn set_session_born(name: &str, ts: u64) {
+    if let Ok(p) = born_path(name) {
+        let _ = std::fs::write(p, ts.to_string());
+    }
+}
+
+fn forget_born(name: &str) {
+    if let Ok(p) = born_path(name) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 // ── Server ───────────────────────────────────────────────────────────────────
@@ -2005,6 +2039,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     if new_path.exists() {
                         app.status_msg = Some(format!("session '{to}' already exists"));
                     } else if std::fs::rename(&path, &new_path).is_ok() {
+                        if let (Ok(from), Ok(into)) = (born_path(&name), born_path(&to)) {
+                            let _ = std::fs::rename(from, into);
+                        }
                         path = new_path;
                         name = to.clone();
                         app.session_name = Some(to);
@@ -2048,6 +2085,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
 
     app.save_state_now();
     let _ = std::fs::remove_file(&path);
+    forget_born(&name);
     Ok(())
 }
 
@@ -3096,8 +3134,13 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
     }
     // Graceful: the daemon flushes its state and removes its own socket. kill_main already waits
     // for the socket to disappear, which is the only reliable "it is really gone".
+    // The old daemon takes its birth record with it; the same session must keep its place.
+    let born = session_born(&name);
     kill_main(&name)?;
     spawn_daemon(&name, None)?;
+    if let Some(ts) = born {
+        set_session_born(&name, ts);
+    }
     println!("'{name}' is back on {}", env!("CARGO_PKG_VERSION"));
     Ok(())
 }
@@ -3113,6 +3156,9 @@ pub fn reboot_main(name_arg: Option<String>) -> Result<()> {
 pub fn spawn_daemon(name: &str, file: Option<String>) -> Result<()> {
     let path = socket_path(name)?;
     let _ = std::fs::remove_file(&path);
+    if session_born(name).is_none() {
+        set_session_born(name, crate::worklog::now_secs());
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     isolate_session_daemon_env(&mut cmd);
@@ -3163,6 +3209,7 @@ pub fn session_main(name: &str, file: Option<String>) -> Result<()> {
             );
         }
         crate::sys::control::Probe::Dead => {
+            set_session_born(name, crate::worklog::now_secs());
             spawn_daemon(name, file.clone())?;
         }
         crate::sys::control::Probe::Live => {}

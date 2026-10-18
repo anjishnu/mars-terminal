@@ -184,6 +184,11 @@ pub struct Term {
     pub assigned_chat_len: u64,
     /// The shell has exited; the pane shows a notice until the user closes it.
     pub exited: bool,
+    /// A command has reached the shell. Enter on an empty prompt, `exit` or `logout` is leaving,
+    /// not using: it is how you close a session opened by mistake.
+    had_input: bool,
+    /// What has been typed since the last line end, to tell the two apart.
+    typed: Vec<u8>,
     /// Where the shell was spawned (the work journal's cwd). The shell may
     /// `cd` later — a PTY can't see that without shell integration, so this
     /// is honest spawn-time truth, not a live value.
@@ -392,6 +397,8 @@ pub fn spawn(
         assigned_chat: None,
         assigned_chat_len: 0,
         exited: false,
+        had_input: false,
+        typed: Vec::new(),
         spawn_cwd,
         parser,
         writer,
@@ -487,6 +494,7 @@ impl Term {
     }
 
     pub fn send_bytes(&mut self, bytes: &[u8]) {
+        self.note_typed(bytes);
         if let Some(startup) = self.startup_input.as_mut() {
             startup.bytes.extend_from_slice(bytes);
             startup.last_probe.get_or_insert_with(Instant::now);
@@ -494,6 +502,32 @@ impl Term {
             return;
         }
         self.write_input(bytes);
+    }
+
+    pub fn had_input(&self) -> bool {
+        self.had_input
+    }
+
+    fn note_typed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.had_input {
+                return;
+            }
+            match b {
+                b'\r' | b'\n' => {
+                    let line = String::from_utf8_lossy(&self.typed);
+                    self.had_input = !matches!(line.trim(), "" | "exit" | "logout");
+                    self.typed.clear();
+                }
+                // C-c and C-u abandon the line; backspace takes one byte back.
+                0x03 | 0x15 => self.typed.clear(),
+                0x7f | 0x08 => {
+                    self.typed.pop();
+                }
+                _ if self.typed.len() >= 64 => self.had_input = true,
+                _ => self.typed.push(b),
+            }
+        }
     }
 
     /// Queue bytes that must not be lost: released only once the marker probe has ROUND-TRIPPED,

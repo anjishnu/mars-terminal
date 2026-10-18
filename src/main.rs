@@ -3314,6 +3314,7 @@ fn selfcheck() -> Result<()> {
         // Live rename: the socket moves, the attached client keeps working.
         let renamed = format!("{sname}-renamed");
         let rpath = session::socket_path(&renamed)?;
+        session::set_session_born(&sname, 4242);
         {
             let ctl = crate::sys::control::connect(&spath)?;
             let mut w = ctl.try_clone()?;
@@ -3325,6 +3326,8 @@ fn selfcheck() -> Result<()> {
             if rpath.exists() && !spath.exists() { moved = true; break; }
         }
         assert!(moved, "session rename did not move the socket");
+        assert_eq!(session::session_born(&renamed), Some(4242), "rename lost the session's place in ls");
+        assert!(session::session_born(&sname).is_none(), "rename left the old birth record behind");
         assert!(
             session::list_sessions()?.iter().any(|(n, alive, _)| n == &renamed && *alive),
             "renamed session missing from ls"
@@ -3786,9 +3789,11 @@ fn selfcheck() -> Result<()> {
                 .any(|(n, alive, attached)| n == &kname && *alive && !*attached),
             "fresh session should be alive and detached"
         );
+        session::set_session_born(&kname, 7);
         session::kill_main(&kname)?;
         kserver.join().expect("kill-test server panicked")?;
         assert!(!kpath.exists(), "socket not removed after kill");
+        assert!(session::session_born(&kname).is_none(), "an ended session kept its birth record");
         println!("[selfcheck] session status + kill ..... PASS");
 
         // 27b2. Quit = detach; kill is the deleting verb. In a session, Quit
@@ -3796,9 +3801,68 @@ fn selfcheck() -> Result<()> {
         //       confirm-gated ender; `mars killall` sweeps every live daemon
         //       (under the suite's isolated runtime dir, never the user's).
         {
+            let key = |c: KeyCode| KeyEvent::new(c, KeyModifiers::NONE);
+            let asks = |app: &App| {
+                matches!(app.prompt.as_ref().map(|p| &p.kind), Some(app::PromptKind::ConfirmEndEmpty))
+            };
+            // Nothing has happened here, so Quit asks, and each answer does what it says.
             let mut app = App::new(None)?;
             app.session_name = Some("some-session".into());
             app.run_action(palette::Action::Quit);
+            assert!(asks(&app), "Quit from an empty session did not ask about ending it");
+            app.handle_key(key(KeyCode::Char('n')))?;
+            assert!(app.detach_requested && !app.should_quit, "n did not leave the empty session running");
+            app.detach_requested = false;
+            app.run_action(palette::Action::Quit);
+            app.handle_key(key(KeyCode::Esc))?;
+            assert!(
+                app.prompt.is_none() && !app.detach_requested && !app.should_quit,
+                "Esc did not cancel the quit"
+            );
+            app.run_action(palette::Action::Quit);
+            app.handle_key(key(KeyCode::Enter))?;
+            assert!(app.should_quit && !app.detach_requested, "Enter did not end the empty session");
+
+            // A shell that has only started is still empty; one that was given a command is not,
+            // and stays used after the pane is gone.
+            let mut app = App::new(None)?;
+            app.session_name = Some("some-session".into());
+            app.open_terminal();
+            app.tick();
+            app.run_action(palette::Action::Quit);
+            assert!(asks(&app), "opening a shell counted as using the session");
+            app.handle_key(key(KeyCode::Esc))?;
+            // Leaving is not using: Enter on an empty prompt, a typo taken back, `exit`.
+            for t in app.terms.values_mut() {
+                t.send_bytes(b"\r");
+                t.send_bytes(b"lsx\x7f\x7f\x7fexit\r");
+                assert!(!t.had_input(), "Enter or `exit` counted as running a command");
+                t.send_bytes(b"echo partial\x03");
+                assert!(!t.had_input(), "a line abandoned with C-c counted as a command");
+            }
+            app.tick();
+            app.run_action(palette::Action::Quit);
+            assert!(asks(&app), "typing `exit` made the session look used");
+            app.handle_key(key(KeyCode::Esc))?;
+            for t in app.terms.values_mut() {
+                t.send_bytes(b"true\r");
+            }
+            app.tick();
+            app.terms.clear();
+            app.run_action(palette::Action::Quit);
+            assert!(!asks(&app) && app.detach_requested, "a session that ran a command was asked about");
+            app.detach_requested = false;
+
+            // An edit counts even once it is saved.
+            let mut app = App::new(None)?;
+            app.session_name = Some("some-session".into());
+            app.handle_key(key(KeyCode::Char('x')))?;
+            app.tick();
+            for b in app.buffers.values_mut() {
+                b.modified = false;
+            }
+            app.run_action(palette::Action::Quit);
+            assert!(!asks(&app), "a session with an edit was asked about");
             assert!(app.detach_requested, "in-session Quit did not request a detach");
             assert!(!app.should_quit, "in-session Quit ended the session");
             app.detach_requested = false;
@@ -3832,6 +3896,32 @@ fn selfcheck() -> Result<()> {
             }
         }
         println!("[selfcheck] quit=detach + killall ..... PASS");
+
+        // `mars ls` lists sessions in the order they were made, so a new one lands at the bottom
+        // instead of reshuffling the list. Stale sockets: listed once, then swept with their record.
+        {
+            let tag = std::process::id();
+            let made = [format!("zz-order-{tag}"), format!("10-order-{tag}"), format!("2-order-{tag}"), format!("aa-order-{tag}")];
+            for (i, n) in made.iter().enumerate() {
+                std::fs::write(session::socket_path(n)?, b"")?;
+                session::set_session_born(n, 1_000 + i as u64);
+            }
+            let listed: Vec<String> = session::list_sessions()?
+                .into_iter()
+                .map(|(n, _, _)| n)
+                .filter(|n| made.contains(n))
+                .collect();
+            assert_eq!(listed, made.to_vec(), "mars ls is not in creation order");
+            #[cfg(unix)]
+            for n in &made {
+                assert!(session::session_born(n).is_none(), "a swept session kept its birth record");
+            }
+            for n in &made {
+                let _ = std::fs::remove_file(session::socket_path(n)?);
+                let _ = std::fs::remove_file(session::socket_path(n)?.with_extension("born"));
+            }
+        }
+        println!("[selfcheck] ls lists sessions oldest first ..... PASS");
     }
 
     #[cfg(windows)]
