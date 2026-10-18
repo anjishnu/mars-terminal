@@ -142,9 +142,11 @@ If you *want* to use an API key instead, unset it from Mars's view is the wrong 
 ### Turning the manager on
 
 ```bash
-touch ~/.mars/manager/agent.enabled     # on
-rm    ~/.mars/manager/agent.enabled     # off
+mars setup --manager on                 # on (needs Claude Code; `mars setup` offers it)
+mars setup --manager off                # off
 ```
+
+That writes and removes `~/.mars/manager/agent.enabled`, which you can also touch by hand.
 
 Or flip **Manager agent** in the phone's side menu, which writes the same file.
 

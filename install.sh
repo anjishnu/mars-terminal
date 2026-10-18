@@ -110,11 +110,15 @@ case ":$PATH:" in
     export PATH=\"\$HOME/.cargo/bin:\$PATH\"" ;;
 esac
 
-# Agent setup: the editor works out of the box; the AI features need a free key.
+# Model setup: the editor works out of the box; summaries, briefings and Ask need a model.
+# Choose the integration now — Claude Code (your subscription) or Groq (a free key). Piped
+# installs (curl | sh) have no terminal on stdin, so ask on /dev/tty when there is one.
 echo
-if mars setup 2>/dev/null | grep -q "✓ a key is configured"; then
-  say "agent features: a key is already configured — you're all set."
+if mars setup --check >/dev/null 2>&1; then
+  say "model: already set up — you're all set.  (mars setup --check)"
+elif [ -t 1 ] && [ -r /dev/tty ] && [ -z "${MARS_NO_SETUP:-}" ]; then
+  say "one more step: choose how Mars reaches a model."
+  mars setup < /dev/tty || say "setup did not finish — run it any time:  mars setup"
 else
-  say "agent features (Ask, English→shell, briefings) need a free API key."
-  echo "    Get one in ~30s and set it up:  mars setup"
+  say "one more step: choose how Mars reaches a model (Claude Code or Groq):  mars setup"
 fi

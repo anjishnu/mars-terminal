@@ -84,6 +84,12 @@ pub struct Tuning {
     pub push_max_per_day: u64,
     /// How often a bridge riding another ngrok agent checks that its endpoint is still there.
     pub rover_tunnel_heal_secs: u64,
+    /// Claude Code path: `claude -p` calls one process may run at once.
+    pub claude_concurrency: u64,
+    /// Claude Code path: calls one process may make per hour. 0 = no cap.
+    pub claude_calls_per_hour: u64,
+    /// Claude Code path: seconds before a call is abandoned.
+    pub claude_timeout_secs: u64,
     pub max_panes: usize,
     pub scroll_margin: usize,
     pub page_overlap: usize,
@@ -222,6 +228,9 @@ impl Default for Tuning {
             push_max_per_hour: 1,
             push_max_per_day: 4,
             rover_tunnel_heal_secs: 30,
+            claude_concurrency: 2,
+            claude_calls_per_hour: 120,
+            claude_timeout_secs: 90,
             max_panes: 4,
             scroll_margin: 3,
             page_overlap: 2,
@@ -385,6 +394,16 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
              classifier were right it would not have this much to say. `mars manager health` \
              reports how often it fired instead of dropping it silently."
         )),
+        ("claude_concurrency", knob(json!(d.claude_concurrency),
+            "On the Claude Code path, how many `claude -p` calls one Mars process may run at \
+             once. Each is a short-lived process; more at once only queues on your plan's limits.")),
+        ("claude_calls_per_hour", knob(json!(d.claude_calls_per_hour),
+            "On the Claude Code path, the most calls one Mars process makes per hour. Summaries, \
+             briefings and names come out of your Claude plan's usage, so a busy machine is capped \
+             here; past it, Mars uses its model-free fallback until the hour turns over. 0 = no cap.")),
+        ("claude_timeout_secs", knob(json!(d.claude_timeout_secs),
+            "On the Claude Code path, seconds before a `claude -p` call is abandoned and the \
+             model-free fallback is used instead.")),
         ("rover_tunnel_heal_secs", knob(json!(d.rover_tunnel_heal_secs),
             "When `mars pair` rides an ngrok agent it did not start, how often (seconds) the bridge \
              checks that its endpoint is still on that agent and re-adds it if not. Runtime \
@@ -713,6 +732,9 @@ pub fn load() -> Tuning {
             .and_then(|e| e.value.as_bool())
             .unwrap_or(t.push_enabled);
         t.rover_tunnel_heal_secs = get_u64(&map, "rover_tunnel_heal_secs", t.rover_tunnel_heal_secs);
+        t.claude_concurrency = get_u64(&map, "claude_concurrency", t.claude_concurrency);
+        t.claude_calls_per_hour = get_u64(&map, "claude_calls_per_hour", t.claude_calls_per_hour);
+        t.claude_timeout_secs = get_u64(&map, "claude_timeout_secs", t.claude_timeout_secs);
         t.max_panes             = get_u64(&map, "max_panes", t.max_panes as u64) as usize;
         t.scroll_margin         = get_u64(&map, "scroll_margin", t.scroll_margin as u64) as usize;
         t.page_overlap          = get_u64(&map, "page_overlap", t.page_overlap as u64) as usize;

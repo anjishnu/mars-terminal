@@ -2204,47 +2204,10 @@ fn default_ngrok_tokens() -> Vec<String> {
     paths.iter().filter_map(|p| std::fs::read_to_string(p).ok()).filter_map(|t| yaml_authtoken(&t)).collect()
 }
 
-/// Read a token without echoing it. Piped stdin is read as one line, so the setup can be scripted
-/// (`mars pair --own-ngrok < token-file`) without the token ever reaching argv or shell history.
+/// Read a token without echoing it; piped stdin is read as one line, so `mars pair --own-ngrok <
+/// token-file` works without the token reaching argv or shell history.
 fn read_secret(prompt: &str) -> Result<String> {
-    print!("{prompt}");
-    let _ = std::io::stdout().flush();
-    if !crate::sys::tty::is_stdin_tty() {
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        println!();
-        return Ok(line.trim().to_string());
-    }
-    use crossterm::event::{read, Event, KeyCode, KeyEventKind, KeyModifiers};
-    crossterm::terminal::enable_raw_mode()?;
-    let mut s = String::new();
-    let outcome = loop {
-        match read() {
-            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => match k.code {
-                KeyCode::Enter => break Ok(()),
-                KeyCode::Esc => break Err(anyhow!("cancelled — nothing was changed")),
-                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Err(anyhow!("cancelled — nothing was changed"))
-                }
-                KeyCode::Backspace => {
-                    s.pop();
-                }
-                KeyCode::Char(c) => s.push(c),
-                _ => {}
-            },
-            Ok(Event::Paste(p)) => s.push_str(&p),
-            Ok(_) => {}
-            Err(e) => break Err(e.into()),
-        }
-    };
-    let _ = crossterm::terminal::disable_raw_mode();
-    println!();
-    outcome?;
-    let t = s.trim().to_string();
-    if !t.is_empty() {
-        println!("  received {} characters", t.chars().count());
-    }
-    Ok(t)
+    crate::setup::read_secret(prompt)
 }
 
 fn set_host_config(key: &str, value: serde_json::Value) -> Result<()> {

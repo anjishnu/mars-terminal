@@ -52,6 +52,20 @@ really closes it, and a workspace has one name.
   when that was its last pane, and the session when that was the last workspace (the manager's
   hidden tab does not count). A clean `exit` closes at once; a failed one keeps its notice until
   Enter. `C-x k` on a file with unsaved changes now asks first; it used to drop them.
+- **Summaries and briefings ran with no model, and nothing said so.** Keys came only from the
+  environment of whatever started the session daemon, so a key set in one shell never reached a
+  session started from another. Every summary was then a keyword guess ("failed: failure in
+  output" for any Claude Code pane), and every briefing was "nothing needs you".
+  - **`mars setup` now chooses a model integration** after install. The installer asks; it tests
+    the choice before saving it, and `--check` reports it. **Claude Code** runs every model
+    feature through an isolated `claude -p` on your subscription, with no key: no tools, MCP
+    servers, settings, CLAUDE.md or saved session. That is about 600 tokens a call instead of
+    ~30,000 for a plain `claude -p`, with Haiku for summaries and Sonnet for Ask, an hourly cap
+    and a timeout. It can also switch on the manager. **Groq** keeps its key in `config.json`,
+    private, rather than in the environment that every pane shell inherits.
+  - **The choice is read per call**, so running sessions switch without a restart. A chosen path
+    never rotates to some other key.
+  - **Sessions now say when there is no model**, and point at `mars setup`.
 - **One rename for a workspace.** "Rename pane" and "Rename tab" were two names for one place,
   and the board, tab bar and pane border could disagree. They are now **Rename workspace**
   (`r` in `C-t` space warp), the same rename Rover uses.

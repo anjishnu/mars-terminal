@@ -4870,7 +4870,7 @@ impl App {
         }
         let cfg = agent::AgentConfig::from_env();
         if !cfg.is_configured() {
-            self.status_msg = Some("No LLM key — run `mars setup` for a free key to translate".into());
+            self.status_msg = Some("No model — run `mars setup` to choose Claude Code or Groq".into());
             return;
         }
         self.agent_pending = true;
@@ -4962,9 +4962,11 @@ impl App {
         cfg.temperature = self.tuning.agent_temperature;
         if !cfg.is_configured() {
             self.agent_answer = Some(
-                "⚠ No LLM key set — agent features are off. Quit and run `mars setup` for a \
-                 free key (Groq/Gemini), or set GROQ_API_KEY, then relaunch."
-                    .into(),
+                format!(
+                    "⚠ No model — agent features are off ({}). Run `mars setup` in a terminal to \
+                     choose Claude Code or Groq; this session picks it up without a restart.",
+                    crate::setup::model_problem(&cfg, crate::integration::chosen()).unwrap_or_default()
+                ),
             );
             self.agent_directive = None;
             return;
@@ -6582,7 +6584,9 @@ impl App {
     /// agent features. Esc clears it like any other notice.
     pub fn notice_no_key(&mut self) {
         self.notices.push(Notice {
-            text: "No LLM key set — agent features are off. Run `mars setup` for a free key.".into(),
+            text: "No model yet — summaries and briefings are keyword guesses. Run `mars setup` to \
+                   choose Claude Code or Groq."
+                .into(),
             kind: NoticeKind::Info,
         });
     }

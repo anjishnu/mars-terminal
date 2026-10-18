@@ -210,10 +210,21 @@ pub mod fsperm {
     }
 
     /// Restrict a file or Unix-domain socket to its owner (`0600`).
-    #[cfg(feature = "ssh")]
     pub fn restrict_file(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+
+    /// Let the owner run a file (`0755`) — the selfcheck's stand-in programs.
+    pub fn make_executable(path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+    }
+
+    /// The permission bits, where the platform has them.
+    pub fn mode(path: &Path) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
     }
 }
 

@@ -481,9 +481,18 @@ pub mod fsperm {
     /// Rendezvous files currently inherit the same user-profile ACL as the
     /// containing directory. Explicit creation-time DACLs are the next hardening
     /// milestone documented in WINDOWS_PORT.md.
-    #[cfg(feature = "ssh")]
     pub fn restrict_file(_path: &Path) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Executability is the extension on Windows; nothing to set.
+    pub fn make_executable(_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// No Unix permission bits here.
+    pub fn mode(_path: &Path) -> Option<u32> {
+        None
     }
 }
 

@@ -156,7 +156,29 @@ different-sized terminal just reflows.
 > and you should still read them. **Rover** (phone and desk) and the **Windows** port are
 > the only beta surfaces left.
 
-Works out of the box with a free-tier key from any of:
+**Choose a model integration once, after installing** (the installer asks):
+
+```bash
+mars setup                      # pick Claude Code or Groq; it tests the choice, then saves it
+mars setup --check              # which model is in use, whether it works, and the manager
+```
+
+- **Claude Code** runs every model feature through the `claude` CLI on your own subscription,
+  with no key. Each call is isolated: no tools, no MCP servers, no settings or CLAUDE.md, and
+  no saved session, so a summary costs a few hundred tokens rather than a coding agent's full
+  context. Haiku writes summaries and briefings; Sonnet answers Ask. This path can also turn
+  on the **manager**, which writes mission briefings for the phone and desk
+  (`mars setup --manager on`). Calls are capped per hour (`claude_calls_per_hour` in
+  `tuning.json`), because they come out of your plan's usage.
+- **Groq** uses a free key from [console.groq.com](https://console.groq.com/keys). Setup keeps it
+  in `~/.mars/config.json` (readable only by you), not in your environment, so the shells in your
+  sessions never inherit it.
+
+The choice is read when each call is made, so a running session switches without a restart.
+A chosen path is never swapped for another key at its limit: past it, Mars uses its model-free
+fallback until it recovers.
+
+Without a choice, Mars uses whatever key is in its environment, as before. Any of:
 
 ```bash
 export ANTHROPIC_API_KEY=...   # Claude — defaults to claude-haiku-4-5
@@ -170,7 +192,7 @@ export MARS_LLM_MODEL=qwen/qwen3-32b
 ```
 
 Detection is **paid-first**: if several keys are set, Claude → OpenAI → Groq → Gemini
-(an explicit `MARS_LLM_KEY` always wins). Cheap defaults per provider — reach for a
+(an explicit `MARS_LLM_KEY` always wins, over a chosen path too). Cheap defaults per provider — reach for a
 bigger model with `MARS_LLM_MODEL`, not by default.
 
 **Calibrating cost/latency (debug mode).** To see where tokens and time actually go —
