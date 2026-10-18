@@ -82,6 +82,8 @@ pub struct Tuning {
     /// And per day. A ceiling being reached is a bug report about the classifier, not a
     /// valve doing its job — `mars manager health` says when it happens.
     pub push_max_per_day: u64,
+    /// How often a bridge riding another ngrok agent checks that its endpoint is still there.
+    pub rover_tunnel_heal_secs: u64,
     pub max_panes: usize,
     pub scroll_margin: usize,
     pub page_overlap: usize,
@@ -219,6 +221,7 @@ impl Default for Tuning {
             push_enabled: true,
             push_max_per_hour: 1,
             push_max_per_day: 4,
+            rover_tunnel_heal_secs: 30,
             max_panes: 4,
             scroll_margin: 3,
             page_overlap: 2,
@@ -381,6 +384,12 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
             "The hard ceiling. Reaching it is a defect signal rather than a success: if the \
              classifier were right it would not have this much to say. `mars manager health` \
              reports how often it fired instead of dropping it silently."
+        )),
+        ("rover_tunnel_heal_secs", knob(json!(d.rover_tunnel_heal_secs),
+            "When `mars pair` rides an ngrok agent it did not start, how often (seconds) the bridge \
+             checks that its endpoint is still on that agent and re-adds it if not. Runtime \
+             endpoints die with the agent, so a restart of that service would otherwise cut the \
+             phone off silently. 0 turns the check off."
         )),
         ("max_panes", knob(json!(d.max_panes),
             "Maximum panes per tab. Splits beyond this are refused.")),
@@ -703,6 +712,7 @@ pub fn load() -> Tuning {
             .get("push_enabled")
             .and_then(|e| e.value.as_bool())
             .unwrap_or(t.push_enabled);
+        t.rover_tunnel_heal_secs = get_u64(&map, "rover_tunnel_heal_secs", t.rover_tunnel_heal_secs);
         t.max_panes             = get_u64(&map, "max_panes", t.max_panes as u64) as usize;
         t.scroll_margin         = get_u64(&map, "scroll_margin", t.scroll_margin as u64) as usize;
         t.page_overlap          = get_u64(&map, "page_overlap", t.page_overlap as u64) as usize;
