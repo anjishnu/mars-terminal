@@ -339,7 +339,9 @@ pub fn load() -> KeyBindings {
         Some(r) => r.into_bindings(),
         None => {
             let defaults = RawBindings::defaults();
-            if let Some(path) = &config_path {
+            // Only where there is no file. One that does not parse is still somebody's bindings,
+            // and writing defaults over it threw them all away for one name an upgrade renamed.
+            if let Some(path) = config_path.as_ref().filter(|p| !p.exists()) {
                 let _ = write_defaults(path, &defaults);
             }
             defaults.into_bindings()

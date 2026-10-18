@@ -2698,6 +2698,17 @@ fn selfcheck() -> Result<()> {
     assert_eq!(app.tab_name_suggestion.get(&tid1).map(String::as_str), Some("auto-label"));
     app.run_action(palette::Action::AcceptTabName);
     assert_eq!(app.tab().name, "auto-label", "accepting the suggestion did not rename");
+    assert_eq!(
+        palette::Action::from_name("RenameTab"),
+        Some(palette::Action::RenameWorkspace),
+        "an old rename name no longer resolves"
+    );
+    let old: std::collections::HashMap<String, palette::Action> =
+        serde_json::from_str(r#"{"C-x r": "RenamePane", "C-x R": "RenameTab"}"#)?;
+    assert!(
+        old.values().all(|a| *a == palette::Action::RenameWorkspace),
+        "a keys.json binding the old renames no longer loads"
+    );
     println!("[selfcheck] renames + auto-name ........ PASS");
 
     // ── Phase 1 agentic workflows ────────────────────────────────────────────

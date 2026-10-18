@@ -29,6 +29,9 @@ pub enum Action {
     PrevTab,
     MoveTabLeft,
     MoveTabRight,
+    // The two renames this replaced. keys.json and `RUN:` directives name actions, and one name
+    // that no longer parses fails the whole bindings file.
+    #[serde(alias = "RenamePane", alias = "RenameTab")]
     RenameWorkspace,
     TabMode,
     // files / buffers
