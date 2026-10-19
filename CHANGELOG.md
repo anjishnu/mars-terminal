@@ -13,6 +13,10 @@ old rows on screen and answers keystrokes about 60 ms sooner.
 
 ### Fixed
 
+- **Every bridge start was unreachable for about two minutes.** `mars pair` tests its public URL
+  by fetching its own `/ws` through the tunnel, and only started accepting connections after that
+  test, so nothing could answer it. Every probe ran out its 12 s, phones queued in the backlog, and
+  the test then blamed a VPN. Connections are now accepted from the moment the port is bound.
 - **The web terminal showed stale rows after a resize, until a reload.** Re-registering a mirror
   dropped the bridge's handle on the old one, but its reader thread held the socket, so the
   daemon kept drawing the old-size target and the bridge kept forwarding it into the same browser
