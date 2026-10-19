@@ -98,6 +98,10 @@ pub mod control {
         pub fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
             self.0.set_write_timeout(dur)
         }
+        /// Same signature as `UnixStream::shutdown`, so callers need no platform branch.
+        pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+            self.0.shutdown(how)
+        }
     }
 
     impl Read for Stream {

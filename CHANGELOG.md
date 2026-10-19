@@ -8,10 +8,23 @@ agent of its own, which cannot get a hostname when the account's one domain is
 taken. The bridge now rides the agent that is already there, and can share a
 free plan's single domain by path. Sessions opened by mistake stop piling up,
 `mars ls` keeps its order as new ones are made, closing a file or a shell
-really closes it, and a workspace has one name.
+really closes it, and a workspace has one name. The web terminal stops leaving
+old rows on screen and answers keystrokes about 60 ms sooner.
 
 ### Fixed
 
+- **The web terminal showed stale rows after a resize, until a reload.** Re-registering a mirror
+  dropped the bridge's handle on the old one, but its reader thread held the socket, so the
+  daemon kept drawing the old-size target and the bridge kept forwarding it into the same browser
+  terminal. Replacing a mirror now ends its stream, a closed tab ends its mirror, and mirror state
+  is per connection, so two desk tabs no longer take over each other's keystrokes.
+- **Every web-terminal frame could wait up to 50 ms in the bridge.** Queued frames were sent only
+  after a 40 ms read timeout and a 10 ms sleep. They now go out within `bridge_poll_ms` (4), with
+  Nagle off. A mirror's size and ack notices share one ordered queue with its bytes, so they can
+  no longer overtake them, and consecutive frames go out as one message.
+- **A mirror redraw arrived in pieces.** ratatui flushes the cursor mid-draw, so one redraw left
+  as two or three frames a browser could paint between. Each is now one frame, wrapped in
+  synchronized output (DEC 2026).
 - **`mars pair` could not get a tunnel next to another ngrok agent.** It now asks the existing
   agent's local API for one endpoint, `mars-<port>`, forwarding to the bridge. Nothing about that
   agent's own endpoints, config or process changes. The endpoint is removed on Ctrl-C, `SIGTERM`

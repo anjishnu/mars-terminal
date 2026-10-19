@@ -3787,6 +3787,37 @@ fi
                 //    only one of them owns anything.
                 assert!(next_board(&mut sub_r, 5).is_some(),
                     "the subscriber stopped receiving boards once a mirror attached");
+
+                // 6. ONE DRAW, ONE FRAME, PAINTED WHOLE. ratatui flushes the cursor on its own
+                //    mid-draw, so a draw used to reach the browser as two or three frames it
+                //    could paint between. Every frame from a draw is now a synchronized update
+                //    carrying its own cursor move. (The clear at registration is earlier, and is
+                //    not a draw.)
+                {
+                    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                    owner.text("x")?;
+                    let mut whole = 0usize;
+                    let mut torn: Vec<String> = Vec::new();
+                    let deadline3 = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::time::Instant::now() < deadline3 {
+                        let mut line = String::new();
+                        match mr.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        if let Ok(session::ServerFrame::Output { b64 }) = serde_json::from_str(line.trim()) {
+                            let bytes = B64.decode(b64).unwrap_or_default();
+                            let text = String::from_utf8_lossy(&bytes).into_owned();
+                            if text.starts_with("\x1b[?2026h") && text.ends_with("\x1b[?2026l") && text.contains('H') {
+                                whole += 1;
+                            } else {
+                                torn.push(format!("{text:?}"));
+                            }
+                        }
+                    }
+                    assert!(whole > 0, "no mirror frame after typing was a whole synchronized draw");
+                    assert!(torn.is_empty(), "a mirror draw arrived in pieces: {torn:?}");
+                }
             }
             println!("[selfcheck] mirror: a second render target evicts nobody, and takes no size ... PASS");
 
@@ -8585,6 +8616,33 @@ fi
     // Ownership of a tunnel is its upstream address, nothing else. The agent API used to be
     // read as "the first public_url", which on a host already running ngrok for another
     // service pointed the QR at that service (issue #6).
+    // A REPLACED MIRROR ENDS. Dropping the bridge's handle left the reader thread holding the
+    // socket, so the daemon kept drawing the old target and its frames, at the old size, went on
+    // into the same browser terminal as the new one's. Ending or dropping it must close the far
+    // side, which is what makes the daemon prune it.
+    #[cfg(all(feature = "web", unix))]
+    {
+        let dir = std::path::PathBuf::from(format!("/tmp/msc-ml{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        for dropped in [false, true] {
+            let at = dir.join(if dropped { "d.sock" } else { "e.sock" });
+            let _ = std::fs::remove_file(&at);
+            let listener = crate::sys::control::bind(&at)?;
+            let client = crate::sys::control::connect(&at)?;
+            let mut daemon_side = listener.accept()?;
+            daemon_side.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            let gen = serve::end_mirror_for_test(client, dropped);
+            let mut b = [0u8; 1];
+            let n = std::io::Read::read(&mut daemon_side, &mut b);
+            assert!(matches!(n, Ok(0)), "ending a mirror (dropped={dropped}) left its stream open: {n:?}");
+            if !dropped {
+                assert_eq!(gen, 1, "ending a mirror did not move its generation on");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("[selfcheck] mirror: a replaced or closed mirror ends its stream ... PASS");
+    }
+
     #[cfg(feature = "web")]
     {
         use serve::{parse_ngrok_tunnels, pick_tunnel, NgrokTunnel};

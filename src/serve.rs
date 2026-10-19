@@ -2410,6 +2410,9 @@ fn content_type(path: &str) -> &'static str {
 /// pumps the daemon's output through a channel so the loop never blocks on it.
 fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(40))).ok();
+    // A keystroke's echo is a few dozen bytes. With Nagle on, a small frame written while the
+    // previous one is unacknowledged waits for that ACK, which the far side may delay by 40 ms.
+    stream.set_nodelay(true).ok();
     let mut ws = accept(stream).map_err(|e| anyhow!("ws handshake failed: {e}"))?;
 
     // ── Phase 1: authenticate, and learn WHICH session this phone wants ─────────────────────
@@ -2519,10 +2522,15 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
 
     // Daemon-reader thread → channel of already-JSON output frames for the WS.
     let (tx, rx) = mpsc::channel::<String>();
-    // MIRROR BYTES GO THEIR OWN WAY. A second channel rather than a sum type on the first,
+    // MIRROR FRAMES GO THEIR OWN WAY. A second channel rather than a sum type on the first,
     // because every one of the thirty-odd senders on `tx` is text and would otherwise have to say
     // so at each call site — thirty edits to express one fact about one frame.
-    let (btx, brx) = mpsc::channel::<Vec<u8>>();
+    //
+    // EVERYTHING the mirror says goes on it, text included. Its size and ack frames rode `tx`
+    // while its bytes rode this, and the loop below drains `tx` first — so a `mirror.size` could
+    // overtake the frames drawn at the old size, and an ack the frame before the one it answers.
+    let (btx, brx) = mpsc::channel::<MirrorOut>();
+    let mut mirror = MirrorLink::default();
     // A clone for async results (the LLM proxy) pushed from the inbound handler.
     let action_tx = tx.clone();
     let reader_stream = daemon.try_clone()?;
@@ -2648,6 +2656,13 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
         warm_rover(n);
     }
 
+    // WAKE FOR WHAT IS WAITING TO GO OUT. The loop below blocks in `ws.read`, and only reaches
+    // the queues when that times out — so a frame could sit for the whole read timeout plus the
+    // sleep after it, 50 ms, before it was sent. Every keystroke's echo paid that. Authentication
+    // is done; from here the read only has to be short enough that the queues never wait long.
+    let poll = Duration::from_millis(crate::tuning::load().bridge_poll_ms.max(1));
+    ws.get_ref().set_read_timeout(Some(poll)).ok();
+
     loop {
         // Reset: if the persisted token was rotated out from under us, drop this phone.
         if valid.is_some() && last_token_check.elapsed() >= Duration::from_secs(1) {
@@ -2660,25 +2675,42 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
         while let Ok(msg) = rx.try_recv() {
             ws.send(Message::Text(msg))?;
         }
-        // And the mirror's bytes, which never became text.
-        while let Ok(b) = brx.try_recv() {
-            ws.send(Message::Binary(b))?;
+        // The mirror's frames, in the order it produced them. Consecutive repaints are joined
+        // into one message: the bytes are the same, and a burst of output that drew three hundred
+        // frames a second no longer costs three hundred messages through the tunnel.
+        let mut bytes: Vec<u8> = Vec::new();
+        while let Ok(m) = brx.try_recv() {
+            match m {
+                MirrorOut::Bytes(b) => {
+                    if bytes.is_empty() {
+                        bytes.push(BIN_MIRROR);
+                    }
+                    bytes.extend_from_slice(&b);
+                }
+                MirrorOut::Text(t) => {
+                    if !bytes.is_empty() {
+                        ws.send(Message::Binary(std::mem::take(&mut bytes)))?;
+                    }
+                    ws.send(Message::Text(t))?;
+                }
+            }
+        }
+        if !bytes.is_empty() {
+            ws.send(Message::Binary(bytes))?;
         }
         // Read one inbound WS message (times out via the socket read timeout).
         match ws.read() {
             Ok(Message::Text(txt)) => {
-                handle_client_msg(&mut writer, &action_tx, &btx, client_bin, socket, &txt);
+                handle_client_msg(&mut writer, &action_tx, &btx, &mut mirror, client_bin, socket, &txt);
             }
             Ok(Message::Binary(b)) => {
-                handle_client_msg(&mut writer, &action_tx, &btx, client_bin, socket, &String::from_utf8_lossy(&b));
+                handle_client_msg(&mut writer, &action_tx, &btx, &mut mirror, client_bin, socket, &String::from_utf8_lossy(&b));
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
+            // The read timeout IS the wait; sleeping after it only delayed the queues further.
             Err(WsError::Io(e))
-                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
+                if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
             Err(_) => break,
         }
     }
@@ -2816,25 +2848,54 @@ fn agent_provenance(cfg: &crate::agent::AgentConfig) -> String {
 
 /// Handle an inbound Rover message. `ask`/`summarize` are proxied to the host LLM (async,
 /// result pushed back over `tx`); raw keystrokes/paste go to the pane.
-/// The mirror's own write half, so a keystroke reaches the connection its frames come from.
-///
-/// One per bridge process: a browser drives one session at a time, and a second desk tab replaces
-/// the first rather than typing into it by accident.
-static MIRROR_IN: std::sync::Mutex<Option<crate::sys::control::Stream>> = std::sync::Mutex::new(None);
-/// Which mirror connection is the live one. Bumped on every `mirror` request.
-///
-/// A REPLACED MIRROR IS NOT A DEAD SESSION. Re-mirroring drops the previous stream, whose reader
-/// thread then falls out of its loop and — before this — announced `mirror.gone`, "the session
-/// ended", to a browser that had merely resized. The page dutifully showed the death notice for
-/// the connection it had itself just replaced, cleared it when the new frames arrived, and did the
-/// whole thing again on the next resize. What looked like a flapping session was the page being
-/// told, correctly, about the end of something it no longer cared about.
-static MIRROR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// What a mirror's reader thread hands the websocket loop, on one queue so the order survives.
+enum MirrorOut {
+    Bytes(Vec<u8>),
+    Text(String),
+}
+
+/// One browser's mirror. PER CONNECTION: it was one per bridge process, so a second desk tab took
+/// over the first one's keystrokes, and ending a replaced mirror there would have blanked the
+/// other tab.
+#[derive(Default)]
+struct MirrorLink {
+    /// The current mirror's write half, so a keystroke reaches the connection its frames come from.
+    input: Option<crate::sys::control::Stream>,
+    /// Which `mirror` request is current. Bumped on every one.
+    ///
+    /// A REPLACED MIRROR IS NOT A DEAD SESSION. Its reader thread used to announce `mirror.gone`,
+    /// "the session ended", to a browser that had merely resized, so only the current one reports
+    /// a death. It is also what stops a replaced mirror's frames at once: the thread checks it
+    /// before forwarding each one.
+    gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MirrorLink {
+    /// End the current mirror. Dropping our handle was not enough: the reader thread held the
+    /// other half of the socket, so the daemon went on drawing that target and the bridge went on
+    /// forwarding it — two frame streams at two sizes interleaved into one terminal, which is the
+    /// band of `·` padding and half-old rows a resize left behind, and one more live render target
+    /// in the daemon per resize.
+    fn end(&mut self) {
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(old) = self.input.take() {
+            let _ = old.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for MirrorLink {
+    /// A closed tab ends its mirror now, not when the daemon next draws to a socket nobody reads.
+    fn drop(&mut self) {
+        self.end();
+    }
+}
 
 fn handle_client_msg(
     writer: &mut impl Write,
     tx: &mpsc::Sender<String>,
-    btx: &mpsc::Sender<Vec<u8>>,
+    btx: &mpsc::Sender<MirrorOut>,
+    mirror: &mut MirrorLink,
     bin: bool,
     socket: &std::path::Path,
     txt: &str,
@@ -3415,14 +3476,14 @@ fn handle_client_msg(
             // connection — so without this, every window drag would leave another live render
             // target behind, each drawing a full frame at a size nobody is looking at.
             //
-            // Dropping the old stream closes it; the daemon prunes the dead target on its next
+            // Ending the old stream closes it; the daemon prunes the dead target on its next
             // draw, which is the same path a closed tab takes.
-            let gen = MIRROR_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            drop(MIRROR_IN.lock().unwrap().take());
+            mirror.end();
+            let gen = mirror.gen.load(std::sync::atomic::Ordering::SeqCst);
             let Ok(sock) = crate::sys::control::connect(socket) else {
-                let _ = tx.send(serde_json::json!({
+                let _ = btx.send(MirrorOut::Text(serde_json::json!({
                     "t": "mirror.gone", "why": "could not reach the session",
-                }).to_string());
+                }).to_string()));
                 return;
             };
             let mut w = match sock.try_clone() { Ok(w) => w, Err(_) => return };
@@ -3433,10 +3494,10 @@ fn handle_client_msg(
             // keystroke on a different socket would reach a daemon that has no idea which mirror
             // it belongs to.
             if let Ok(w2) = sock.try_clone() {
-                *MIRROR_IN.lock().unwrap() = Some(w2);
+                mirror.input = Some(w2);
             }
-            let out = tx.clone();
             let bout = btx.clone();
+            let live = mirror.gen.clone();
             std::thread::spawn(move || {
                 let mut lines = BufReader::new(sock);
                 let mut line = String::new();
@@ -3445,6 +3506,9 @@ fn handle_client_msg(
                     match lines.read_line(&mut line) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
+                    }
+                    if live.load(std::sync::atomic::Ordering::SeqCst) != gen {
+                        break;
                     }
                     match serde_json::from_str(line.trim()) {
                         // Same envelope the pane path uses, under its own name so a desk shell and
@@ -3455,11 +3519,9 @@ fn handle_client_msg(
                             // in the browser as a character loop over a JSON string.
                             if bin {
                                 match B64.decode(&b64) {
+                                    // Tagged with `BIN_MIRROR` when it is sent, once per message.
                                     Ok(bytes) => {
-                                        let mut framed = Vec::with_capacity(bytes.len() + 1);
-                                        framed.push(BIN_MIRROR);
-                                        framed.extend_from_slice(&bytes);
-                                        if bout.send(framed).is_err() {
+                                        if bout.send(MirrorOut::Bytes(bytes)).is_err() {
                                             break;
                                         }
                                     }
@@ -3467,18 +3529,18 @@ fn handle_client_msg(
                                     // paper over, but it is also not worth dropping the mirror
                                     // for: fall back to the text path and let the client see it.
                                     Err(_) => {
-                                        if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
+                                        if bout.send(MirrorOut::Text(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string())).is_err() {
                                             break;
                                         }
                                     }
                                 }
-                            } else if out.send(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string()).is_err() {
+                            } else if bout.send(MirrorOut::Text(serde_json::json!({"t": "mirror.data", "b64": b64}).to_string())).is_err() {
                                 break;
                             }
                         }
                         // The keystroke the next frame answers — see `ServerFrame::MirrorAck`.
                         Ok(ServerFrame::MirrorAck { seq }) => {
-                            if out.send(serde_json::json!({"t": "mirror.ack", "seq": seq}).to_string()).is_err() {
+                            if bout.send(MirrorOut::Text(serde_json::json!({"t": "mirror.ack", "seq": seq}).to_string())).is_err() {
                                 break;
                             }
                         }
@@ -3488,7 +3550,7 @@ fn handle_client_msg(
                         // grid into its window instead of showing the top-left corner of it and
                         // looking, correctly but uselessly, like a rendering bug.
                         Ok(ServerFrame::GridSize { cols, rows, desk }) => {
-                            if out.send(serde_json::json!({"t": "mirror.size", "cols": cols, "rows": rows, "desk": desk}).to_string()).is_err() {
+                            if bout.send(MirrorOut::Text(serde_json::json!({"t": "mirror.size", "cols": cols, "rows": rows, "desk": desk}).to_string())).is_err() {
                                 break;
                             }
                         }
@@ -3497,8 +3559,8 @@ fn handle_client_msg(
                 }
                 // Only the CURRENT mirror gets to report a death. A superseded one is ending
                 // because the browser asked for a different size, which is the opposite of news.
-                if MIRROR_GEN.load(std::sync::atomic::Ordering::SeqCst) == gen {
-                    let _ = out.send(serde_json::json!({"t": "mirror.gone", "why": "the session ended"}).to_string());
+                if live.load(std::sync::atomic::Ordering::SeqCst) == gen {
+                    let _ = bout.send(MirrorOut::Text(serde_json::json!({"t": "mirror.gone", "why": "the session ended"}).to_string()));
                 }
             });
         }
@@ -3508,7 +3570,7 @@ fn handle_client_msg(
         Some("mirror.key") => {
             let data = v.get("data").and_then(|x| x.as_str()).unwrap_or("");
             if !data.is_empty() {
-                if let Some(w) = MIRROR_IN.lock().unwrap().as_mut() {
+                if let Some(w) = mirror.input.as_mut() {
                     // Carried straight through. The bridge does not read it — it belongs to the
                     // two ends that can actually time anything.
                     let seq = v.get("seq").and_then(|x| x.as_u64());
@@ -3523,7 +3585,7 @@ fn handle_client_msg(
         // so the client had to suppress it entirely rather than move MARS's selection every time
         // somebody read the screen. This gives it somewhere real to go.
         Some("mirror.wheel") => {
-            if let Some(w) = MIRROR_IN.lock().unwrap().as_mut() {
+            if let Some(w) = mirror.input.as_mut() {
                 let up = v.get("up").and_then(|x| x.as_bool()).unwrap_or(false);
                 let col = v.get("col").and_then(|x| x.as_u64()).unwrap_or(0).min(u16::MAX as u64) as u16;
                 let row = v.get("row").and_then(|x| x.as_u64()).unwrap_or(0).min(u16::MAX as u64) as u16;
@@ -3738,6 +3800,19 @@ fn contained(p: &Path, root: &Path) -> bool {
 /// Without this, one authenticated frame read `~/.ssh/id_rsa`, and one wrote `~/.zshrc` — which is
 /// remote code execution on the next shell. The bridge is reachable from a public tunnel, so a
 /// leaked pairing token meant total host compromise rather than "somebody can see my terminals".
+/// For the selfcheck: end a mirror holding `input` (or drop it, when `dropped`), as a resize or a
+/// closed tab does. Returns the generation afterwards.
+pub fn end_mirror_for_test(input: crate::sys::control::Stream, dropped: bool) -> u64 {
+    let mut link = MirrorLink::default();
+    link.input = Some(input);
+    if dropped {
+        drop(link);
+        return 0;
+    }
+    link.end();
+    link.gen.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub fn resolve_path_for_test(raw: &str) -> std::io::Result<PathBuf> {
     resolve_path(raw)
 }
