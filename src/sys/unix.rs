@@ -172,6 +172,30 @@ pub mod proc {
             kill_matching(needle);
         }
     }
+
+    static TERMINATE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    extern "C" fn on_terminate(sig: libc::c_int) {
+        TERMINATE.store(sig, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Turn SIGINT, SIGTERM and SIGHUP into a value someone polls, instead of an exit that runs
+    /// nothing. The handler only stores — the one thing a handler may safely do — so whoever
+    /// watches the returned cell does the cleanup and the exit. It holds the signal number, 0
+    /// until one arrives. Installed only by a process that has something to undo on the way out.
+    pub fn watch_terminate() -> &'static std::sync::atomic::AtomicI32 {
+        // SAFETY: a zeroed sigaction with only a handler and an empty mask is a valid
+        // argument, and the handler is async-signal-safe (one atomic store).
+        unsafe {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = on_terminate as extern "C" fn(libc::c_int) as usize;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(sig, &sa, std::ptr::null_mut());
+            }
+        }
+        &TERMINATE
+    }
 }
 
 /// Make a path private to its owning user.

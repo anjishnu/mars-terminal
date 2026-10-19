@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+`mars pair` next to a service that already runs ngrok. 0.7.3 stopped the
+bridge adopting that service's tunnel, but the bridge then always started an
+agent of its own, which cannot get a hostname when the account's one domain is
+taken. The bridge now rides the agent that is already there, and can share a
+free plan's single domain by path.
+
+### Fixed
+
+- **`mars pair` could not get a tunnel next to another ngrok agent.** It now asks the existing
+  agent's local API for one endpoint, `mars-<port>`, forwarding to the bridge. Nothing about that
+  agent's own endpoints, config or process changes. The endpoint is removed on Ctrl-C, `SIGTERM`
+  or `SIGHUP`, only when the one by that name still forwards to the bridge. A pinned domain the
+  agent already serves is refused before any request, and an endpoint that lands on such a host
+  is removed at once, because pooling would split that host's traffic. If the agent drops the
+  endpoint, the bridge adds it back every `rover_tunnel_heal_secs`. `MARS_NGROK_ATTACH=0`
+  restores the separate agent.
+- **A free plan's one domain can now carry the bridge too.** An `.internal` endpoint to the
+  bridge port, on an agent that serves the pinned domain, is adopted at that domain, so a traffic
+  policy can forward `/ws` to the bridge and leave the rest of the domain to the other service.
+  The reachability probe now asks for `/ws` rather than the root, since that is the path such a
+  policy routes. ROVER.md has the config.
+- **On a free plan whose one domain is taken, `mars pair` sets Rover up with its own account.**
+  It recognises the case from the other agent's domain, without sending that agent anything, and
+  in a terminal it asks for a second free account's authtoken once. It writes a config of its own
+  on its own API port, starts the agent, pins the domain the account was given and records the
+  config for every later start. A token that does not work never replaces one that did, and the
+  machine's existing token is refused. `mars pair --own-ngrok` runs it on demand or replaces the
+  account, and reads a piped token so it can be scripted. `--check` checks the account the bridge
+  will actually use.
+- **ngrok's own errors end the wait.** The bridge read only the URL from ngrok's log, so a
+  rejected token or a taken domain looked like a 25-second timeout. The first `ERR_NGROK_` line now
+  fails the start at once, with that error in words.
+- **`mars pair` on a running bridge with no tunnel** now adds the endpoint to a foreign agent and
+  prints the QR, instead of failing.
+
 ## 0.7.3
 
 The bridge stops adopting other people's tunnels. On a host that already runs

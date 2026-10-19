@@ -445,6 +445,14 @@ pub mod proc {
         )
     }
 
+    static TERMINATE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+    /// No console-control handler yet: the cell never fills, so a Windows bridge that attached an
+    /// endpoint to another agent leaves it behind on exit and the next `mars pair` adopts it.
+    pub fn watch_terminate() -> &'static std::sync::atomic::AtomicI32 {
+        &TERMINATE
+    }
+
     /// Force-stop every other `mars.exe`. `killall` has already asked reachable
     /// sessions to autosave, so this is the intentionally broad recovery path.
     pub fn kill_all_mars() {

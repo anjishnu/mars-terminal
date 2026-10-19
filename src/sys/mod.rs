@@ -15,7 +15,7 @@
 //!   - `control` — a named, same-machine, bidirectional byte channel (IPC)
 //!   - `tty`     — terminal hygiene (sane-mode restore, is-a-tty)
 //!   - `daemon`  — spawn a process detached from this terminal
-//!   - `proc`    — process/host identity + lifecycle (per-user tag, kill-by-pattern)
+//!   - `proc`    — process/host identity + lifecycle (per-user tag, kill-by-pattern, termination signals)
 //!   - `fsperm`  — restrict a directory/file to its owning user
 //!   - `shell`   — which shell a new terminal pane runs
 

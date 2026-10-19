@@ -416,16 +416,90 @@ this the QR survives restarts and reboots.
 
 Mars never uses a tunnel that does not forward to its own bridge port. If another agent is
 already up (a systemd service fronting some other app, say), `mars pair --check` names it and
-what it forwards to, and `mars pair` starts an agent of its own. Two things can stand in the way,
-and both are the account's, not Mars's:
+what it forwards to. What happens next depends on whether the account has a hostname to spare.
 
-- **A free plan allows one agent session.** Give the bridge its own: set `NGROK_AUTHTOKEN` to a
-  second account's token, or point `MARS_NGROK_CONFIG` at a config file that is not the service's.
-- **The agent API moved.** A second agent cannot bind `:4040`, so ngrok puts its API on the next
-  port. Mars looks at `4040`–`4044`; `MARS_NGROK_API` pins one address if that is not enough.
+**The account has one to spare** (a paid plan's random URLs, or a second reserved domain given
+to `--domain`). `mars pair` rides the agent that is already there: it adds one endpoint of its
+own, `mars-8787 → 127.0.0.1:8787`, through the agent's local API. There is no second agent, no
+config edit and no restart, and the agent's own endpoints are untouched.
 
-Or hand the bridge to the agent that is already there — add an endpoint for the bridge port to its
-config and Mars adopts it on the next `mars pair`, starting nothing:
+- **It never shares a hostname.** A pinned domain the agent already serves is refused before
+  anything is sent. An endpoint the agent puts on a host it already serves is removed at once.
+  With endpoint pooling, ngrok would split that host's traffic between the service and the bridge.
+- **It survives the other service restarting.** Runtime endpoints die with their agent. The bridge
+  checks every `rover_tunnel_heal_secs` (30 by default, in `tuning.json`) and adds its endpoint
+  back. If the URL changed, it prints the new link, and unpinned phones need to re-scan.
+- **Stopping it cleanly removes it.** Ctrl-C, `SIGTERM` or `SIGHUP` deletes the endpoint, and only
+  if the one by that name still forwards to the bridge. A bridge killed with `SIGKILL` leaves it
+  behind, and the next `mars pair` adopts it.
+- **Opting out.** `MARS_NGROK_ATTACH=0` makes `mars pair` start an agent of its own instead.
+
+If the agent refuses the endpoint, `mars pair` falls back to starting its own agent and, if that
+fails too, prints the agent's reason.
+
+**The account is on the free plan and its one domain is taken.** The free plan has exactly one
+domain and no random URLs, so there is no second hostname for the bridge on that account, however
+many agents it may run. Two ways in:
+
+1. **Share the domain by path.** The bridge needs one path, `/ws`. Give the existing endpoint a
+   traffic policy that forwards `/ws` to an internal endpoint for the bridge, and leave everything
+   else where it was. This edits that agent's config, so it costs one restart of that agent:
+
+   ```yaml
+   endpoints:
+     - name: webhooks                      # the endpoint that was already there, unchanged
+       url: https://your-name.ngrok-free.app
+       traffic_policy:
+         on_http_request:
+           - expressions:
+               - "req.url.path == '/ws'"
+             actions:
+               - type: forward-internal
+                 config:
+                   url: https://mars.internal
+       upstream:
+         url: 5000
+     - name: mars
+       url: https://mars.internal
+       upstream:
+         url: 8787
+   ```
+
+   Then `mars pair --domain your-name.ngrok-free.app`. Mars adopts an `.internal` endpoint to the
+   bridge port when the same agent serves the pinned domain, and `--check` proves the route from
+   outside before anything trusts it. When no bridge is running, `/ws` returns ngrok's error page
+   and the other service carries on.
+2. **Give Rover a free account of its own.** This is what `mars pair` offers by itself. It
+   recognises the case from the other agent's domain without sending that agent anything, and in a
+   terminal it asks for a second account's authtoken:
+
+   ```
+   Rover needs a tunnel of its own, and this machine's ngrok account cannot give it one:
+   this ngrok account is on the free plan, whose one domain (…) already carries the agent at …
+
+   Give Rover its own free ngrok account — two minutes, once:
+     1. sign up with a different email   https://dashboard.ngrok.com/signup
+     2. copy that account's authtoken    https://dashboard.ngrok.com/get-started/your-authtoken
+     3. paste it below (it is not shown; Esc cancels)
+   ```
+
+   The sign-up is the only manual step. Mars then:
+   - refuses the token the machine's default ngrok config already has;
+   - writes `~/.config/mars/ngrok.yml`, mode `0600`, with the token and an agent API port from
+     `4041`–`4044`, leaving the machine's default config to the other service;
+   - starts Rover's agent with it, failing in about a second with ngrok's own reason if the token
+     is wrong;
+   - pins the domain the account was given, so the QR survives restarts;
+   - records the config in `~/.mars/config.json`, so every later start uses it with no setup.
+
+   A config that has not worked yet never replaces one that has. Where no one can answer a prompt,
+   such as a supervised bridge, `mars pair` says to run `mars pair --own-ngrok` once in a terminal.
+   That flag also replaces the account later. Piped input is read as the token, so
+   `mars pair --own-ngrok < token-file` scripts it without the token reaching argv or history.
+
+For a URL that never changes on an account with a domain to spare, give the agent a permanent
+endpoint for the bridge port in its config and Mars adopts it on the next `mars pair`, adding
+nothing:
 
 ```yaml
 endpoints:
@@ -435,8 +509,9 @@ endpoints:
       url: 8787
 ```
 
-Mars will not stop, restart or reconfigure an agent it did not start. If `--check` ever tells you
-to, that is a bug.
+Mars will not stop, restart or edit the config of an agent it did not start. The one endpoint it
+adds is its own and goes when the bridge goes. If `--check` ever tells you to stop or restart
+that agent, that is a bug.
 
 To keep the bridge running across crashes and logouts:
 
@@ -530,6 +605,7 @@ mars pair --open               # open it here, already paired
 mars pair --all                # offer the machine, not one session
 mars pair --check              # preflight, with fixes
 mars pair --link               # reprint the link
+mars pair --own-ngrok          # give Rover an ngrok account of its own
 mars pair --domain <d>         # pin the tunnel URL
 mars qr [--all]                # just the code, for a camera
 mars pair --supervise          # hand the bridge to launchd
@@ -544,7 +620,8 @@ mars reboot [name]             # restart onto the installed binary
 | Path | What |
 |---|---|
 | `~/.mars/serve.token` | the pairing token (`0600`) |
-| `~/.mars/config.json` | `ngrok_domain`, and other host config |
+| `~/.mars/config.json` | `ngrok_domain`, `ngrok_config`, and other host config |
+| `~/.config/mars/ngrok.yml` | Rover's own ngrok account, written by `mars pair --own-ngrok` (`0600`) |
 | `~/.mars/manager/run.sh` | how the manager agent is invoked — yours to edit |
 | `~/.mars/manager/agent.enabled` | the manager's off switch |
 | `~/.mars/manager/memory/` | what the manager has learned |
@@ -556,8 +633,9 @@ mars reboot [name]             # restart onto the installed binary
 |---|---|
 | `MARS_NGROK_DOMAIN` | overrides the configured stable domain |
 | `MARS_NGROK_API` | the ngrok agent API to read tunnels from (default: `http://127.0.0.1:4040`, then 4041–4044) |
-| `MARS_NGROK_CONFIG` | an ngrok config file of Mars's own, passed as `--config` to the agent it starts |
+| `MARS_NGROK_CONFIG` | an ngrok config file of Mars's own, passed as `--config` to the agent it starts; overrides the one `--own-ngrok` recorded |
 | `NGROK_AUTHTOKEN` | read by ngrok itself — a second account for the bridge without touching the default config |
+| `MARS_NGROK_ATTACH` | `0` stops the bridge adding its endpoint to another ngrok agent; it starts its own instead |
 | `MARS_ROVER_MODEL` | model for Rover chat (default `claude-sonnet-5`) |
 | `MARS_ROVER_EFFORT` | effort for Rover chat (default `medium`) |
 | `MARS_BRIDGE_PORT` | port the bridge listens on (default `8787`; values ≤1024 ignored) |

@@ -240,7 +240,7 @@ pub const CLI_VERBS: &[&str] = &[
 #[cfg(feature = "web")]
 const PAIR_HELP: &str = "\
 usage: mars pair [session] [--all] [--check] [--link] [--open] [--desk [--web <dir>]]
-                 [--domain <name>] [--supervise] [--reset]
+                 [--domain <name>] [--own-ngrok] [--supervise] [--reset]
        mars serve …                 same verb, older name
        mars qr [session] [--all]    just the code, for a phone camera
 
@@ -250,17 +250,20 @@ usage: mars pair [session] [--all] [--check] [--link] [--open] [--desk [--web <d
   --open         open the paired app here, on this machine
   --desk         the link aimed at the desktop shell
   --domain <d>   pin the tunnel URL so the QR survives restarts
+  --own-ngrok    give Rover an ngrok account of its own (asks for its authtoken once);
+                 `mars pair` offers this by itself when the machine's account has no domain to spare
   --supervise    hand the bridge to launchd
   --reset        rotate the pairing token — drops every paired client
 
 environment: MARS_NGROK_DOMAIN, MARS_NGROK_API (agent API, default http://127.0.0.1:4040),
              MARS_NGROK_CONFIG (an ngrok config file of Mars's own), NGROK_AUTHTOKEN,
+             MARS_NGROK_ATTACH=0 (never add an endpoint to another agent),
              MARS_BRIDGE_PORT, MARS_BRIDGE_LOOPBACK. See ROVER.md.";
 
 /// Flags each Rover verb accepts. `--web` and `--domain` take a value.
 #[cfg(feature = "web")]
 const PAIR_FLAGS: &[&str] = &[
-    "--all", "--check", "--link", "--open", "--desk", "--web", "--domain", "--supervise", "--reset",
+    "--all", "--check", "--link", "--open", "--desk", "--web", "--domain", "--own-ngrok", "--supervise", "--reset",
 ];
 #[cfg(feature = "web")]
 const QR_FLAGS: &[&str] = &["--all"];
@@ -1034,6 +1037,9 @@ fn main() -> Result<()> {
             // making somebody discover and tap each one.
             if has("--all") {
                 std::env::set_var("MARS_PAIR_ALL", "1");
+            }
+            if has("--own-ngrok") {
+                std::env::set_var(serve::SETUP_ENV, "1");
             }
             if has("--check") {
                 return serve::check_main(session);
@@ -8223,11 +8229,179 @@ fn selfcheck() -> Result<()> {
         assert!(pick_tunnel(&[t("https://other.ngrok-free.app", "localhost:8787")], 8787, Some("pinned.ngrok-free.app")).is_none());
         assert_eq!(pick_tunnel(&[t("https://pinned.ngrok-free.app", "localhost:8787")], 8787, Some("https://pinned.ngrok-free.app/")).as_deref(),
             Some("https://pinned.ngrok-free.app"));
+        // One public domain shared by path: an internal endpoint to the bridge, fronted by the
+        // pinned domain on the same agent, is ours at the pinned URL — and only with both halves.
+        let shared = vec![t("https://static.ngrok-free.app", "http://localhost:5000"), t("https://mars.internal", "http://localhost:8787")];
+        assert_eq!(pick_tunnel(&shared, 8787, Some("static.ngrok-free.app")).as_deref(), Some("https://static.ngrok-free.app"));
+        assert!(pick_tunnel(&shared, 8787, None).is_none(), "an internal endpoint is not a public URL");
+        assert!(pick_tunnel(&shared, 8787, Some("elsewhere.ngrok-free.app")).is_none(), "adopted a domain this agent does not serve");
+        assert!(pick_tunnel(&shared[..1], 8787, Some("static.ngrok-free.app")).is_none(), "a front door with nothing behind it");
+        assert!(pick_tunnel(&[shared[0].clone(), t("https://mars.internal", "http://localhost:9999")], 8787, Some("static.ngrok-free.app")).is_none());
         // An agent whose body we cannot read is an agent with no tunnels we can name.
         assert!(parse_ngrok_tunnels("<html>not json</html>").is_empty());
         assert!(parse_ngrok_tunnels(r#"{"tunnels":[]}"#).is_empty());
     }
     println!("[selfcheck] pair: a foreign ngrok tunnel is never adopted ... PASS");
+
+    // ── mars pair: ride a foreign agent with one endpoint of our own, never its hostname ──
+    // A free account gets one agent session, so next to a service that already runs ngrok the
+    // bridge's own agent cannot come up. It adds an endpoint to that agent through its local API
+    // instead, and must never ask for a host the agent already serves: with pooling on, ngrok
+    // would split that service's traffic with the bridge. Driven against a fake agent API on a
+    // real socket, because the contract is which requests reach the agent.
+    #[cfg(feature = "web")]
+    {
+        use serve::{attach_name, attach_request, attach_tunnel, detach_tunnel, domain_collides, parse_attach_response, NgrokTunnel};
+        use std::sync::{Arc, Mutex};
+        let req = attach_request(8787, None);
+        assert_eq!(req["name"], "mars-8787");
+        assert_eq!(req["addr"], "127.0.0.1:8787", "the upstream must be the spelling tunnel_is_ours reads back");
+        assert_eq!(req["inspect"], false);
+        assert!(req.get("domain").is_none(), "an unpinned attach must let the agent pick the host");
+        assert_eq!(attach_request(8787, Some("https://pinned.ngrok-free.app/"))["domain"], "pinned.ngrok-free.app");
+        assert_eq!(parse_attach_response(r#"{"name":"mars-8787","public_url":"https://new.ngrok-free.app/","config":{"addr":"http://127.0.0.1:8787"}}"#),
+            Ok("https://new.ngrok-free.app".to_string()));
+        let refused = parse_attach_response(r#"{"error_code":102,"status_code":400,"msg":"invalid tunnel configuration","details":{"err":"ERR_NGROK_334 endpoint already online"}}"#);
+        assert!(refused.as_ref().is_err_and(|e| e.contains("ERR_NGROK_334")), "the agent's own reason was lost: {refused:?}");
+        assert!(parse_attach_response("<html>502</html>").is_err());
+        let webhooks = [NgrokTunnel { public_url: "https://static.ngrok-free.app".into(), addr: "http://localhost:5000".into() }];
+        for pin in ["static.ngrok-free.app", "https://static.ngrok-free.app/"] {
+            assert!(domain_collides(&webhooks, pin), "{pin} shares the foreign agent's host");
+        }
+        assert!(!domain_collides(&webhooks, "mine.ngrok-free.app"));
+
+        // A fake agent: lists one foreign tunnel, accepts a POST, and reports `named` for the
+        // per-name lookup. Records every request line and body it was sent.
+        let fresh = r#"{"name":"mars-8787","public_url":"https://fresh.ngrok-free.app","config":{"addr":"http://127.0.0.1:8787"}}"#;
+        let fake = |named: &'static str, posted: &'static str| -> anyhow::Result<(String, Arc<Mutex<Vec<String>>>)> {
+            let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let api = format!("http://{}", l.local_addr()?);
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                for mut c in l.incoming().map_while(|c| c.ok()) {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head, mut body) = loop {
+                        let n = c.read(&mut chunk).unwrap_or(0);
+                        if n == 0 { break (String::from_utf8_lossy(&buf).to_string(), String::new()); }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some((h, b)) = text.split_once("\r\n\r\n") { break (h.to_string(), b.to_string()); }
+                    };
+                    let len = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                    while body.len() < len {
+                        let n = c.read(&mut chunk).unwrap_or(0);
+                        if n == 0 { break; }
+                        body.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    }
+                    let line = head.lines().next().unwrap_or("").to_string();
+                    log.lock().unwrap().push(format!("{line} {body}"));
+                    let (status, out) = if line.starts_with("GET /api/tunnels ") {
+                        ("200 OK", r#"{"tunnels":[{"name":"webhooks","public_url":"https://static.ngrok-free.app","config":{"addr":"http://localhost:5000"}}]}"#.to_string())
+                    } else if line.starts_with("POST /api/tunnels ") {
+                        ("201 Created", posted.to_string())
+                    } else if line.starts_with("GET /api/tunnels/mars-8787 ") {
+                        ("200 OK", named.to_string())
+                    } else {
+                        ("204 No Content", String::new())
+                    };
+                    let _ = write!(c, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}", out.len());
+                }
+            });
+            Ok((api, seen))
+        };
+        let mine = r#"{"name":"mars-8787","public_url":"https://fresh.ngrok-free.app","config":{"addr":"http://127.0.0.1:8787"}}"#;
+        let (api, seen) = fake(mine, fresh)?;
+        assert_eq!(attach_tunnel(&api, 8787, None).as_deref(), Ok("https://fresh.ngrok-free.app"));
+        let posted: Vec<String> = seen.lock().unwrap().iter().filter(|r| r.starts_with("POST")).cloned().collect();
+        assert_eq!(posted.len(), 1, "expected exactly one POST: {posted:?}");
+        assert!(posted[0].contains("127.0.0.1:8787") && posted[0].contains(&attach_name(8787)) && !posted[0].contains("domain"),
+            "attach asked for the wrong endpoint: {}", posted[0]);
+        seen.lock().unwrap().clear();
+        let collided = attach_tunnel(&api, 8787, Some("static.ngrok-free.app"));
+        assert!(collided.is_err(), "attached on the foreign agent's own hostname");
+        assert!(!seen.lock().unwrap().iter().any(|r| r.starts_with("POST")), "a colliding pin still reached the agent");
+        seen.lock().unwrap().clear();
+        detach_tunnel(&api, 8787);
+        assert!(seen.lock().unwrap().iter().any(|r| r.starts_with("DELETE /api/tunnels/mars-8787 ")), "our endpoint was left behind");
+        // Same name, somebody else's upstream: not ours to remove.
+        let (api, seen) = fake(r#"{"name":"mars-8787","public_url":"https://x.ngrok-free.app","config":{"addr":"http://localhost:5000"}}"#, fresh)?;
+        detach_tunnel(&api, 8787);
+        assert!(!seen.lock().unwrap().iter().any(|r| r.starts_with("DELETE")), "deleted an endpoint that forwards elsewhere");
+        // The agent answered with the other service's host (pooling): refuse it and take it down.
+        let pooled = r#"{"name":"mars-8787","public_url":"https://static.ngrok-free.app","config":{"addr":"http://127.0.0.1:8787"}}"#;
+        let (api, seen) = fake(pooled, pooled)?;
+        assert!(attach_tunnel(&api, 8787, None).is_err(), "kept an endpoint on the foreign agent's hostname");
+        assert!(seen.lock().unwrap().iter().any(|r| r.starts_with("DELETE /api/tunnels/mars-8787 ")), "a pooled endpoint was left serving");
+    }
+    println!("[selfcheck] pair: a foreign agent carries one endpoint of ours, never its hostname ... PASS");
+
+    // ── mars pair: Rover's own ngrok account, set up once ───────────────────────────────
+    // A free account has one domain and no random URLs; when it fronts another service the
+    // bridge has no hostname. The setup takes a second account's token and must recognise that
+    // case without asking the other agent anything, read ngrok's own error codes instead of
+    // waiting out a timeout, and write a config that never collides with the default one.
+    #[cfg(feature = "web")]
+    {
+        use serve::{explain_ngrok_error, is_free_dev_domain, looks_like_authtoken, ngrok_error_in, own_ngrok_config,
+                    own_ngrok_yaml, pick_api_port, set_own_ngrok_config, yaml_authtoken};
+        for h in ["calm-otter-example.ngrok-free.app", "https://x.ngrok-free.dev/", "y.ngrok-free.app"] {
+            assert!(is_free_dev_domain(h), "{h} is a free-plan dev domain");
+        }
+        for h in ["x.ngrok.app", "x.ngrok.dev", "ngrok-free.app.example.com", "mars.internal"] {
+            assert!(!is_free_dev_domain(h), "{h} is not a free-plan dev domain");
+        }
+        // The two shapes ngrok logs a refusal in; the code sits after escaped newlines.
+        let refused = r#"t=2026-10-18T10:00:00+0000 lvl=crit msg="command failed" err="failed to start tunnel: The endpoint 'https://x.ngrok-free.app' is already online.\r\n\r\nERR_NGROK_334\r\n""#;
+        let f = ngrok_error_in(refused).expect("an ERR_NGROK_334 line was not recognised");
+        assert_eq!(f.code, Some(334));
+        assert!(f.detail.starts_with("failed to start tunnel") && !f.detail.contains("ERR_NGROK"), "detail: {}", f.detail);
+        let limited = r#"t=x lvl=eror msg="failed to reconnect session" err="authentication failed: Your account is limited to 1 simultaneous ngrok agent sessions.\n\nERR_NGROK_108\n""#;
+        assert_eq!(ngrok_error_in(limited).and_then(|f| f.code), Some(108));
+        assert!(ngrok_error_in(r#"t=x lvl=info msg="started tunnel" url=https://x.ngrok-free.app"#).is_none());
+        assert!(explain_ngrok_error(Some(107), "").contains("authtoken"));
+        assert!(explain_ngrok_error(Some(334), "").contains("one domain"));
+        assert!(explain_ngrok_error(Some(9999), "odd").contains("ERR_NGROK_9999") );
+        // The token is compared, never shown; the shape check keeps YAML quoting out of it.
+        assert!(looks_like_authtoken("2abcDEF0123456789_ghijKLMNOPqrstu"));
+        for bad in ["", "short", "has space in it 0123456789", "quote\"0123456789012345", "line\nbreak012345678901"] {
+            assert!(!looks_like_authtoken(bad), "{bad:?} passed as an authtoken");
+        }
+        assert_eq!(yaml_authtoken("version: \"3\"\nagent:\n  authtoken: abc123def456\n").as_deref(), Some("abc123def456"));
+        assert_eq!(yaml_authtoken("authtoken: \"quoted_tok\"\n").as_deref(), Some("quoted_tok"));
+        assert_eq!(yaml_authtoken("version: 3\n"), None);
+        let yaml = own_ngrok_yaml("2abcDEF0123456789_ghijKLMNOPqrstu", 4041);
+        assert_eq!(yaml_authtoken(&yaml).as_deref(), Some("2abcDEF0123456789_ghijKLMNOPqrstu"));
+        assert!(yaml.contains("web_addr: 127.0.0.1:4041") && yaml.contains("version: \"3\""), "{yaml}");
+        // Rover's agent API must land where `mars pair` looks for it, and not on 4040.
+        assert_eq!(pick_api_port(|_| false), Some(4041));
+        assert_eq!(pick_api_port(|p| p <= 4042), Some(4043));
+        assert_eq!(pick_api_port(|_| true), None);
+        // Recorded once, read by every later start; the env var still wins for one run.
+        let home = std::env::var_os("HOME");
+        let ownhome = cfg_dir.join("ownhome");
+        std::fs::create_dir_all(&ownhome)?;
+        std::env::set_var("HOME", &ownhome);
+        std::env::remove_var("MARS_NGROK_CONFIG");
+        assert_eq!(own_ngrok_config(), None);
+        let cfg = ownhome.join("ngrok.yml");
+        std::fs::write(&cfg, &yaml)?;
+        set_own_ngrok_config(&cfg.to_string_lossy())?;
+        assert_eq!(own_ngrok_config().as_deref(), Some(cfg.to_string_lossy().as_ref()));
+        std::env::set_var("MARS_NGROK_CONFIG", "/elsewhere/ngrok.yml");
+        assert_eq!(own_ngrok_config().as_deref(), Some("/elsewhere/ngrok.yml"));
+        std::env::remove_var("MARS_NGROK_CONFIG");
+        // A recorded config whose file has gone is no config: the next start asks again.
+        std::fs::remove_file(&cfg)?;
+        assert_eq!(own_ngrok_config(), None);
+        match home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    println!("[selfcheck] pair: Rover's own ngrok account is set up once and read everywhere ... PASS");
 
     // ── mars pair --help prints usage, starts nothing, prints no token ──────────────────
     // `--help` fell through to the default action, which started the bridge and printed the
