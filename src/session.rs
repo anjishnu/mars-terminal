@@ -867,14 +867,39 @@ struct FrameWriter {
     stream: crate::sys::control::Stream,
     buf: Vec<u8>,
     dead: bool,
+    /// Set around a mirror's draw: flushes wait for the end of it. Shared, because ratatui 0.29
+    /// keeps its backend's writer behind an unstable accessor.
+    hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FrameWriter {
     fn new(stream: crate::sys::control::Stream) -> Self {
         // Don't let one wedged client stall the whole session forever.
         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-        FrameWriter { stream, buf: Vec::new(), dead: false }
+        FrameWriter { stream, buf: Vec::new(), dead: false, hold: Default::default() }
     }
+}
+
+/// Draw one mirror frame as ONE `Output`, painted whole.
+///
+/// ratatui flushes mid-draw — showing the cursor and moving it are each flushed on their own — so
+/// a draw left as two or three frames, and a browser could paint between them: the cursor at the
+/// end of the last cell written, then back where it belongs. The synchronized-update markers
+/// (DEC 2026) also stop a terminal painting a large frame it has only partly parsed. A terminal
+/// that does not know them ignores them.
+fn draw_whole(
+    term: &mut Terminal<CrosstermBackend<FrameWriter>>,
+    hold: &std::sync::atomic::AtomicBool,
+    draw: impl FnOnce(&mut ratatui::Frame),
+) -> io::Result<()> {
+    use std::sync::atomic::Ordering;
+    hold.store(true, Ordering::SeqCst);
+    let drawn = term.backend_mut().write_all(b"\x1b[?2026h").and_then(|_| term.draw(draw).map(|_| ()));
+    let closed = term.backend_mut().write_all(b"\x1b[?2026l");
+    hold.store(false, Ordering::SeqCst);
+    drawn?;
+    closed?;
+    Write::flush(term.backend_mut())
 }
 
 impl Write for FrameWriter {
@@ -886,6 +911,9 @@ impl Write for FrameWriter {
         Ok(b.len())
     }
     fn flush(&mut self) -> io::Result<()> {
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         if self.buf.is_empty() || self.dead {
             self.buf.clear();
             return Ok(());
@@ -994,7 +1022,11 @@ fn make_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<Terminal<CrosstermBackend<FrameWriter>>> {
-    let backend = CrosstermBackend::new(FrameWriter::new(stream));
+    make_terminal_on(FrameWriter::new(stream), cols, rows)
+}
+
+fn make_terminal_on(writer: FrameWriter, cols: u16, rows: u16) -> Result<Terminal<CrosstermBackend<FrameWriter>>> {
+    let backend = CrosstermBackend::new(writer);
     // Fixed viewport: the daemon has no TTY to query for a size.
     let term = Terminal::with_options(
         backend,
@@ -1121,6 +1153,8 @@ struct MirrorTarget {
     surface: Option<String>,
     id: u64,
     term: Terminal<CrosstermBackend<FrameWriter>>,
+    /// The writer's hold flag — see `draw_whole`.
+    hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// A private handle on the same socket, for the frames that are not rendered bytes.
     sock: crate::sys::control::Stream,
     cols: u16,
@@ -1513,7 +1547,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     if let Some(seq) = m.pending_ack.take() {
                         let _ = write_frame(&mut m.sock, &ServerFrame::MirrorAck { seq });
                     }
-                    m.term.draw(|f| blit(f, &src.buf, cursor)).is_ok()
+                    draw_whole(&mut m.term, &m.hold, |f| blit(f, &src.buf, cursor)).is_ok()
                 });
             }
         }
@@ -1642,13 +1676,16 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     debug_log("srv: mirror: could not clone socket");
                     continue;
                 };
-                match make_terminal(stream, cols, rows) {
+                let writer = FrameWriter::new(stream);
+                let hold = writer.hold.clone();
+                match make_terminal_on(writer, cols, rows) {
                     Ok(mut m) => {
                         let _ = m.clear();
                         mirrors.push(MirrorTarget {
                             surface,
                             id,
                             term: m,
+                            hold,
                             sock,
                             cols,
                             rows,

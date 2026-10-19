@@ -90,6 +90,8 @@ pub struct Tuning {
     pub claude_calls_per_hour: u64,
     /// Claude Code path: seconds before a call is abandoned.
     pub claude_timeout_secs: u64,
+    /// The bridge's websocket loop: longest a queued frame waits to be sent, in ms.
+    pub bridge_poll_ms: u64,
     pub max_panes: usize,
     pub scroll_margin: usize,
     pub page_overlap: usize,
@@ -231,6 +233,7 @@ impl Default for Tuning {
             claude_concurrency: 2,
             claude_calls_per_hour: 120,
             claude_timeout_secs: 90,
+            bridge_poll_ms: 4,
             max_panes: 4,
             scroll_margin: 3,
             page_overlap: 2,
@@ -404,6 +407,11 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
         ("claude_timeout_secs", knob(json!(d.claude_timeout_secs),
             "On the Claude Code path, seconds before a `claude -p` call is abandoned and the \
              model-free fallback is used instead.")),
+        ("bridge_poll_ms", knob(json!(d.bridge_poll_ms),
+            "How long (ms) the Rover bridge waits for the browser before it sends what is queued \
+             for it. Every frame of the web terminal, and so every keystroke's echo, can wait up \
+             to this long on top of the network. Lower is snappier and wakes the bridge more \
+             often per open browser; 1 is the floor.")),
         ("rover_tunnel_heal_secs", knob(json!(d.rover_tunnel_heal_secs),
             "When `mars pair` rides an ngrok agent it did not start, how often (seconds) the bridge \
              checks that its endpoint is still on that agent and re-adds it if not. Runtime \
@@ -735,6 +743,7 @@ pub fn load() -> Tuning {
         t.claude_concurrency = get_u64(&map, "claude_concurrency", t.claude_concurrency);
         t.claude_calls_per_hour = get_u64(&map, "claude_calls_per_hour", t.claude_calls_per_hour);
         t.claude_timeout_secs = get_u64(&map, "claude_timeout_secs", t.claude_timeout_secs);
+        t.bridge_poll_ms = get_u64(&map, "bridge_poll_ms", t.bridge_poll_ms);
         t.max_panes             = get_u64(&map, "max_panes", t.max_panes as u64) as usize;
         t.scroll_margin         = get_u64(&map, "scroll_margin", t.scroll_margin as u64) as usize;
         t.page_overlap          = get_u64(&map, "page_overlap", t.page_overlap as u64) as usize;
