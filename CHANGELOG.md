@@ -6,7 +6,8 @@
 bridge adopting that service's tunnel, but the bridge then always started an
 agent of its own, which cannot get a hostname when the account's one domain is
 taken. The bridge now rides the agent that is already there, and can share a
-free plan's single domain by path.
+free plan's single domain by path. Sessions opened by mistake stop piling up,
+and `mars ls` keeps its order as new ones are made.
 
 ### Fixed
 
@@ -36,6 +37,14 @@ free plan's single domain by path.
   fails the start at once, with that error in words.
 - **`mars pair` on a running bridge with no tunnel** now adds the endpoint to a foreign agent and
   prints the QR, instead of failing.
+- **Opening `mars` and quitting at once left a session behind.** Quit detaches, so every session
+  ever opened stayed in `mars ls` until killed. Quitting a session nothing has happened in (no
+  command sent to a shell, no edit, no agent turn, nothing running) now asks first: `y` or Enter
+  ends it, `n` keeps it running. A session that has been used is never asked about, even after its
+  pane is closed or its file saved.
+- **`mars ls` reshuffled as sessions were made.** It sorted by name, so each new auto-numbered
+  session landed above the named ones, and `10` above `2`. Sessions are now listed oldest first,
+  by a birth record kept beside the socket that moves with a rename and survives a reboot.
 
 ## 0.7.3
 

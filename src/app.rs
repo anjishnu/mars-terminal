@@ -137,6 +137,8 @@ pub enum PromptKind {
     QueryReplace,
     /// Quit with modified buffers: s = save all & quit, q = quit anyway.
     ConfirmQuit,
+    /// Quit from a session nothing has happened in: y / Enter ends it, n leaves it running.
+    ConfirmEndEmpty,
     /// Confirm a destructive agent-proposed action: y runs it, anything else cancels.
     ConfirmAction(Action),
 }
@@ -507,6 +509,9 @@ pub struct App {
     pub session_instance_id: Option<String>,
     /// Action::Detach sets this; the session server consumes it.
     pub detach_requested: bool,
+    /// Sticky: the session has been used — a shell got a command, a buffer an edit, the agent a
+    /// turn. Kept as a flag because the evidence can go away (a pane closed, a file saved).
+    pub session_used: bool,
     /// Action::RenameSession sets this; the session server consumes it.
     pub rename_session_to: Option<String>,
     // ── LLM agent ──
@@ -776,6 +781,7 @@ impl App {
             session_name: None,
             session_instance_id: None,
             detach_requested: false,
+            session_used: false,
             rename_session_to: None,
             agent_tx,
             agent_rx,
@@ -3665,6 +3671,7 @@ impl App {
         match kind {
             PromptKind::Search => self.handle_isearch_key(key),
             PromptKind::ConfirmQuit => self.handle_confirm_quit_key(key),
+            PromptKind::ConfirmEndEmpty => self.handle_confirm_end_empty_key(key),
             PromptKind::ConfirmAction(action) => self.handle_confirm_action_key(key, action),
             PromptKind::QueryReplace => self.handle_query_replace_key(key),
             _ => self.handle_line_prompt_key(key),
@@ -3812,6 +3819,37 @@ impl App {
         }
     }
 
+    fn handle_confirm_end_empty_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('g') if ctrl => self.close_prompt(),
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.close_prompt();
+                self.quit_reason.get_or_insert_with(|| "quit an empty session".into());
+                self.should_quit = true;
+            }
+            KeyCode::Char('n') => {
+                self.close_prompt();
+                self.detach_requested = true;
+            }
+            KeyCode::Esc => self.close_prompt(),
+            _ => {}
+        }
+    }
+
+    fn used_now(&self) -> bool {
+        self.agent_pending
+            || !self.agent_history.is_empty()
+            || self.buffers.values().any(|b| b.modified)
+            || self.terms.values().any(|t| t.had_input())
+    }
+
+    /// Nothing to come back to. A command still running counts as something even if Mars never
+    /// saw it typed.
+    pub fn session_is_empty(&self) -> bool {
+        !self.session_used && !self.used_now() && !self.terms.values().any(|t| t.foreground_busy() == Some(true))
+    }
+
     fn handle_confirm_action_key(&mut self, key: KeyEvent, action: Action) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -3891,7 +3929,7 @@ impl App {
                 }
             }
             // Search / confirms / query-replace are handled key-by-key, never via finish.
-            PromptKind::Search | PromptKind::ConfirmQuit
+            PromptKind::Search | PromptKind::ConfirmQuit | PromptKind::ConfirmEndEmpty
             | PromptKind::ConfirmAction(_) | PromptKind::QueryReplace => {}
         }
     }
@@ -5472,12 +5510,20 @@ impl App {
             // Quit = detach (2026-07 ruling): leaving mars never ends a
             // session — kill is the deleting verb (KillSession here, `mars
             // kill`/`mars killall` outside). Standalone has nothing to keep
-            // running, so Quit still exits there (dirty-guarded).
+            // running, so Quit still exits there (dirty-guarded). A session
+            // nothing has happened in asks instead: left running, every
+            // `mars` opened by mistake stays in `mars ls` for good.
             Action::Quit               => {
-                if self.session_name.is_some() {
-                    self.detach_requested = true;
-                } else {
+                if self.session_name.is_none() {
                     self.request_quit();
+                } else if self.session_is_empty() {
+                    let name = self.session_name.clone().unwrap_or_default();
+                    self.start_prompt(
+                        PromptKind::ConfirmEndEmpty,
+                        &format!("session '{name}' is empty:  y end it · n keep it running · C-g cancel "),
+                    );
+                } else {
+                    self.detach_requested = true;
                 }
             }
             Action::KillSession        => self.request_quit(),
@@ -6008,6 +6054,9 @@ impl App {
     /// Called every loop iteration whether or not a client is attached.
     pub fn tick(&mut self) {
         self.frame_tick = self.frame_tick.wrapping_add(1);
+        if !self.session_used && self.used_now() {
+            self.session_used = true;
+        }
 
         // Live elapsed on the workspaces board: while the command bar is open, repaint
         // ~once a second if any workstream is running, so its counter ticks. Cheap —

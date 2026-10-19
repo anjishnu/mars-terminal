@@ -121,9 +121,12 @@ The daily rhythm:
 4. **Finish for real**: quitting (`C-x C-c`) just detaches — a session only ends
    when you *kill* it: **Kill session** in the command bar (confirm-gated),
    `mars kill work` from outside, or `mars killall` to sweep every session and
-   start fresh.
+   start fresh. The one exception is a session nothing has happened in yet:
+   quitting it asks whether to end it (`y` or Enter ends it, `n` keeps it
+   running), so a `mars` opened by mistake does not linger in `mars ls`.
 
-`mars ls` tells you the state at a glance:
+`mars ls` tells you the state at a glance, oldest session first, so a new one
+lands at the bottom:
 
 ```
 SESSION              STATUS
