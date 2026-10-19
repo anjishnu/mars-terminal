@@ -65,6 +65,12 @@ really closes it, and a workspace has one name.
     private, rather than in the environment that every pane shell inherits.
   - **The choice is read per call**, so running sessions switch without a restart. A chosen path
     never rotates to some other key.
+  - **A key broker that has gone no longer blocks the chosen path.** A session keeps the broker
+    route it was attached with, so after the ssh forward it came through closed, every call
+    still went to that socket and failed ("Connection reset by peer"). A dead route now gives
+    way to the chosen path at once, and so does a forward that accepts and hangs up because
+    nothing listens at its far end. A broker that answered and refused (a spent plan) still
+    has the last word. `--check` names the broker and the path behind it.
   - **Sessions now say when there is no model**, and point at `mars setup`.
 - **One rename for a workspace.** "Rename pane" and "Rename tab" were two names for one place,
   and the board, tab bar and pane border could disagree. They are now **Rename workspace**

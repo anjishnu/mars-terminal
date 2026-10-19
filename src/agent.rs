@@ -406,7 +406,7 @@ impl AgentConfig {
             && !std::env::var("MARS_NO_BROKER").is_ok_and(|v| v == "1")
         {
             if let Some(sock) = crate::broker::detect_broker_sock() {
-                return AgentConfig {
+                let brokered = AgentConfig {
                     url: String::new(),
                     key: String::new(),
                     // None-equivalent: empty → the broker picks its own model.
@@ -416,6 +416,12 @@ impl AgentConfig {
                     temperature: 0.3,
                     broker_sock: Some(sock),
                 };
+                // A session keeps the route it was attached with, so one attached through an
+                // ssh forward that has since closed still names that socket. A machine with a
+                // path of its own must not have every call pinned to a broker that is gone.
+                if crate::integration::chosen().is_none() || brokered.is_configured() {
+                    return brokered;
+                }
             }
         }
         if env_var("LLM_KEY").is_err() {
@@ -1139,8 +1145,16 @@ fn chat_inner(
                 if !class.recoverable() {
                     return Err(e);
                 }
-                // Fall through to the direct candidates, built from this process's own keys.
-                let direct = rotation_candidates("broker");
+                // Fall through to the direct candidates, built from this process's own keys. A
+                // chosen path is the one this machine has, and only a broker that could not be
+                // reached gives way to it: one that answered "no" (a spent plan) has spoken.
+                let direct = match crate::integration::chosen() {
+                    Some(path) if env_var("LLM_KEY").is_err() => {
+                        let own = AgentConfig::for_path(path);
+                        if class == Failure::Unreachable && own.is_configured() { vec![own] } else { Vec::new() }
+                    }
+                    _ => rotation_candidates("broker"),
+                };
                 if direct.is_empty() {
                     return Err(e);
                 }
@@ -1261,6 +1275,8 @@ pub fn classify(e: &anyhow::Error) -> Failure {
         "network is unreachable",
         "no route to host",
         "broken pipe",
+        "closed the connection",
+        "broker unreachable",
         "tls",
         "certificate",
     ];

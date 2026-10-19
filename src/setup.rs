@@ -87,6 +87,17 @@ pub fn model_problem(cfg: &AgentConfig, chosen: Option<Path>) -> Option<String> 
 
 /// What the model status line says when it works.
 fn model_ok(cfg: &AgentConfig, chosen: Option<Path>) -> String {
+    if cfg.provider == "broker" {
+        let sock = cfg.broker_sock.clone().unwrap_or_default();
+        // The daemon a session starts for itself, serving this machine's own path.
+        let local = crate::sys::paths::home_dir().is_some_and(|h| h.join(".mars").join("auth.sock").to_string_lossy() == sock);
+        let at = tilde(std::path::Path::new(&sock));
+        return match (chosen, local) {
+            (Some(p), true) => format!("{} through the local key daemon (mars keyd, {at})", p.label()),
+            (Some(p), false) => format!("key broker at {at}; {} answers whenever it can't be reached", p.label()),
+            (None, _) => format!("key broker at {at} (no path chosen — `mars setup` to pick one)"),
+        };
+    }
     match (chosen, cfg.provider) {
         (Some(Path::ClaudeCode), _) => format!("Claude Code ({} for summaries, sonnet for Ask) via {}", cfg.model, tilde(std::path::Path::new(&cfg.url))),
         (Some(Path::Groq), _) => "Groq".to_string(),

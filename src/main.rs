@@ -1950,6 +1950,40 @@ fi
             "saving the path dropped the rest of config.json"
         );
 
+        // A broker that has gone gives way to the chosen path: a dead socket at once, and one
+        // that accepts and hangs up (an ssh forward with nothing at its far end) on the call.
+        #[cfg(feature = "ssh")]
+        {
+            let session_env: Vec<_> = ["MARS_SESSION", "MARS_SESSION_ID"].iter().map(|v| (*v, std::env::var_os(v))).collect();
+            for (v, _) in &session_env {
+                std::env::remove_var(v);
+            }
+            broker::reset_session_broker();
+            std::env::remove_var("MARS_NO_BROKER");
+            std::env::set_var("MARS_AUTH_SOCK", dir.join("gone.sock"));
+            assert_eq!(agent::AgentConfig::from_env().provider, "claude-cli", "a dead broker socket shadowed the chosen path");
+            let hangup = dir.join("hangup.sock");
+            let listener = sys::control::bind(&hangup)?;
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    drop(conn);
+                }
+            });
+            std::env::set_var("MARS_AUTH_SOCK", &hangup);
+            let via = agent::AgentConfig::from_env();
+            assert_eq!(via.provider, "broker", "a listening broker was not used");
+            let out = agent::chat(&via, agent::format_task_messages("s", "cargo build ok"), "watch")?;
+            assert_eq!(out, "done: build ok", "a broker that hung up did not give way to the chosen path");
+            std::env::remove_var("MARS_AUTH_SOCK");
+            std::env::set_var("MARS_NO_BROKER", "1");
+            let _ = std::fs::remove_file(&hangup);
+            for (v, val) in session_env {
+                if let Some(val) = val {
+                    std::env::set_var(v, val);
+                }
+            }
+        }
+
         std::env::set_var("MARS_CLAUDE_BIN", dir.join("not-installed"));
         let gone = agent::AgentConfig::from_env();
         assert!(!gone.is_configured(), "a missing claude looked configured");
