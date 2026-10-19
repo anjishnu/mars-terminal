@@ -898,6 +898,14 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
+    // ACCEPT FIRST, THEN PROVE THE PATH. The check below fetches this bridge's own public URL and
+    // waits for an answer; when connections were only accepted after it, nothing could answer, so
+    // every probe ran out its 12 s and every start was unreachable for about two minutes — phones
+    // and desk tabs queued in the backlog while the bridge tested whether they could connect.
+    let accepting = {
+        let (socket, instance_id, session_dir) = (socket.clone(), instance_id.clone(), session_dir.clone());
+        thread::spawn(move || accept_loop(listener, socket, instance_id, session_dir))
+    };
     let (_tunnel, base, attached) = start_tunnel(port)?;
     if let Some(api) = attached {
         println!("  riding the ngrok agent at {api} — endpoint {} added, removed when this bridge stops", attach_name(port));
@@ -979,6 +987,13 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     println!("  bridge live · Ctrl-C to stop");
     println!("  {app_url}");
 
+    // The tunnel lives as long as `_tunnel` does, so wait here for the accept loop.
+    let _ = accepting.join();
+    Ok(())
+}
+
+/// Serve every connection to the bridge port, each on its own thread.
+fn accept_loop(listener: TcpListener, socket: std::path::PathBuf, instance_id: String, session_dir: String) {
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -1017,7 +1032,6 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
             }
         });
     }
-    Ok(())
 }
 
 /// Read the live public tunnel URL from ngrok's local inspection API (`MARS_NGROK_API`, default
