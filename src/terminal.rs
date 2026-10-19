@@ -13,6 +13,41 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 pub type TermId = usize;
 
+/// What has been typed at a shell since the last line end: enough to tell a command from
+/// leaving. Enter on an empty prompt, `exit` and `logout` are how you close a session opened by
+/// mistake, so they do not count as using it.
+#[derive(Default)]
+pub struct TypedLine {
+    buf: Vec<u8>,
+    ran: bool,
+}
+
+impl TypedLine {
+    /// Feed bytes on their way to the shell; true once any of them ran a command.
+    pub fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            if self.ran {
+                break;
+            }
+            match b {
+                b'\r' | b'\n' => {
+                    let line = String::from_utf8_lossy(&self.buf);
+                    self.ran = !matches!(line.trim(), "" | "exit" | "logout");
+                    self.buf.clear();
+                }
+                // C-c and C-u abandon the line; backspace takes one byte back.
+                0x03 | 0x15 => self.buf.clear(),
+                0x7f | 0x08 => {
+                    self.buf.pop();
+                }
+                _ if self.buf.len() >= 64 => self.ran = true,
+                _ => self.buf.push(b),
+            }
+        }
+        self.ran
+    }
+}
+
 /// Emitted when terminal `id`'s screen changes or its child process exits.
 pub enum TermEvent {
     Output(TermId),
@@ -184,11 +219,7 @@ pub struct Term {
     pub assigned_chat_len: u64,
     /// The shell has exited; the pane shows a notice until the user closes it.
     pub exited: bool,
-    /// A command has reached the shell. Enter on an empty prompt, `exit` or `logout` is leaving,
-    /// not using: it is how you close a session opened by mistake.
-    had_input: bool,
-    /// What has been typed since the last line end, to tell the two apart.
-    typed: Vec<u8>,
+    typed: TypedLine,
     /// Where the shell was spawned (the work journal's cwd). The shell may
     /// `cd` later — a PTY can't see that without shell integration, so this
     /// is honest spawn-time truth, not a live value.
@@ -397,8 +428,7 @@ pub fn spawn(
         assigned_chat: None,
         assigned_chat_len: 0,
         exited: false,
-        had_input: false,
-        typed: Vec::new(),
+        typed: TypedLine::default(),
         spawn_cwd,
         parser,
         writer,
@@ -494,7 +524,7 @@ impl Term {
     }
 
     pub fn send_bytes(&mut self, bytes: &[u8]) {
-        self.note_typed(bytes);
+        self.typed.feed(bytes);
         if let Some(startup) = self.startup_input.as_mut() {
             startup.bytes.extend_from_slice(bytes);
             startup.last_probe.get_or_insert_with(Instant::now);
@@ -504,30 +534,9 @@ impl Term {
         self.write_input(bytes);
     }
 
+    /// A command has reached this shell.
     pub fn had_input(&self) -> bool {
-        self.had_input
-    }
-
-    fn note_typed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if self.had_input {
-                return;
-            }
-            match b {
-                b'\r' | b'\n' => {
-                    let line = String::from_utf8_lossy(&self.typed);
-                    self.had_input = !matches!(line.trim(), "" | "exit" | "logout");
-                    self.typed.clear();
-                }
-                // C-c and C-u abandon the line; backspace takes one byte back.
-                0x03 | 0x15 => self.typed.clear(),
-                0x7f | 0x08 => {
-                    self.typed.pop();
-                }
-                _ if self.typed.len() >= 64 => self.had_input = true,
-                _ => self.typed.push(b),
-            }
-        }
+        self.typed.ran
     }
 
     /// Queue bytes that must not be lost: released only once the marker probe has ROUND-TRIPPED,

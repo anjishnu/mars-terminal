@@ -22,7 +22,6 @@ pub enum Action {
     PrevPane,
     SwapPane,
     ZoomPane,
-    RenamePane,
     // tabs
     NewTab,
     CloseTab,
@@ -30,7 +29,10 @@ pub enum Action {
     PrevTab,
     MoveTabLeft,
     MoveTabRight,
-    RenameTab,
+    // The two renames this replaced. keys.json and `RUN:` directives name actions, and one name
+    // that no longer parses fails the whole bindings file.
+    #[serde(alias = "RenamePane", alias = "RenameTab")]
+    RenameWorkspace,
     TabMode,
     // files / buffers
     Save,
@@ -118,14 +120,13 @@ impl Action {
             Action::PrevPane           => "prev pane",
             Action::SwapPane           => "move pane",
             Action::ZoomPane           => "zoom pane",
-            Action::RenamePane         => "rename pane",
             Action::NewTab             => "new tab",
             Action::CloseTab           => "close tab",
             Action::NextTab            => "next tab",
             Action::PrevTab            => "prev tab",
             Action::MoveTabLeft        => "move tab left",
             Action::MoveTabRight       => "move tab right",
-            Action::RenameTab          => "rename tab",
+            Action::RenameWorkspace    => "rename workspace",
             Action::TabMode            => "space warp (tabs/panes)",
             Action::Save               => "save",
             Action::ToggleFileTree     => "navigator (browse & jump to files)",
@@ -305,7 +306,7 @@ fn edit_menu() -> Vec<MenuItem> {
         MenuItem::run_desc("Kill to line end",  Action::KillLine,       "Cut from the cursor to the end of the line"),
         MenuItem::run_desc("Kill word forward", Action::KillWordForward, "Cut the word after the cursor"),
         MenuItem::run_desc("Kill word back",    Action::KillWordBackward, "Cut the word before the cursor"),
-        MenuItem::run_desc("Close file (kill buffer)", Action::KillBuffer, "Close the current buffer (C-x k)"),
+        MenuItem::run_desc("Close file (kill buffer)", Action::KillBuffer, "Close this file and its pane; the last pane closes its workspace (C-x k)"),
     ]
 }
 
@@ -317,17 +318,16 @@ fn window_menu() -> Vec<MenuItem> {
         MenuItem::run_desc("Previous window", Action::PrevPane,          "Focus the previous pane"),
         MenuItem::run_desc("Zoom pane",      Action::ZoomPane,           "Maximize this pane / restore (also C-t z)"),
         MenuItem::run_desc("Move pane",      Action::SwapPane,           "Swap this pane with the next"),
-        MenuItem::run_desc("Rename pane",    Action::RenamePane,         "Set a custom title for this pane"),
         MenuItem::run_desc("Only this",      Action::DeleteOtherWindows, "Close the other panes"),
-        MenuItem::run_desc("Close pane",     Action::ClosePane,          "Close this pane"),
+        MenuItem::run_desc("Close pane",     Action::ClosePane,          "Close this pane; the last pane closes its workspace"),
     ]
 }
 
 fn tab_menu() -> Vec<MenuItem> {
     vec![
         MenuItem::run_desc("New tab",        Action::NewTab,       "Open a new tab with a scratch buffer"),
-        MenuItem::run_desc("Close tab",      Action::CloseTab,     "Close the current tab"),
-        MenuItem::run_desc("Rename tab",     Action::RenameTab,    "Name this tab (also r in C-t space warp)"),
+        MenuItem::run_desc("Close tab",      Action::CloseTab,     "Close this workspace; the last one ends the session"),
+        MenuItem::run_desc("Rename workspace", Action::RenameWorkspace, "Name this workspace (also r in C-t space warp)"),
         MenuItem::run_desc("Next tab",       Action::NextTab,      "Switch to the next tab (also M-1..9)"),
         MenuItem::run_desc("Prev tab",       Action::PrevTab,      "Switch to the previous tab"),
         MenuItem::run_desc("Move tab right", Action::MoveTabRight, "Reorder: move this tab right"),

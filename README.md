@@ -124,6 +124,10 @@ The daily rhythm:
    start fresh. The one exception is a session nothing has happened in yet:
    quitting it asks whether to end it (`y` or Enter ends it, `n` keeps it
    running), so a `mars` opened by mistake does not linger in `mars ls`.
+   Closing things closes them: `exit` in a shell, `C-x k` on a file or `C-x 0`
+   on a pane closes that pane, its workspace when it was the last pane there,
+   and the session when it was the last workspace (unsaved files are asked
+   about first).
 
 `mars ls` tells you the state at a glance, oldest session first, so a new one
 lands at the bottom:
