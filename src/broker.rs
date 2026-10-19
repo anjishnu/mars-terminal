@@ -486,7 +486,11 @@ pub fn chat_via_broker(
         },
     )?;
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    // An ssh forward accepts the connection even when nothing listens at its far end, and then
+    // hangs up. That is an unreachable broker, not a malformed one.
+    if reader.read_line(&mut line)? == 0 {
+        anyhow::bail!("home broker closed the connection without replying; is `mars keyd` running at the other end?");
+    }
     match serde_json::from_str::<BrokerResponse>(line.trim())
         .map_err(|e| anyhow::anyhow!("broker sent a malformed reply: {e}"))?
     {

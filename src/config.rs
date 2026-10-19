@@ -356,6 +356,12 @@ pub fn state_path() -> Option<std::path::PathBuf> {
 
 /// The global MARS config file `~/.mars/config.json` (env overrides + theme).
 pub fn config_json_path() -> Option<std::path::PathBuf> {
+    // The selfcheck points this at a scratch file: the model path is read from here on every
+    // call, and a developer's own choice of Claude Code must not turn the suite's keyless
+    // checks into real calls.
+    if let Some(p) = std::env::var_os("MARS_CONFIG_FILE").filter(|p| !p.is_empty()) {
+        return Some(std::path::PathBuf::from(p));
+    }
     crate::sys::paths::home_dir().map(|h| h.join(".mars").join("config.json"))
 }
 

@@ -10,23 +10,21 @@ use std::sync::mpsc;
 /// commands that need a key, by `install.sh`, and surfaced as a dismissible notice
 /// when the editor launches unconfigured. Plain text, wrapped for an 80-col terminal.
 pub const SETUP_HELP: &str = "\
-Mars uses an LLM for its agent features — Ask, English→shell, watch summaries, and
-away briefings. The editor and terminal multiplexer work fully without one.
+Mars uses a model for summaries, the welcome-back briefing, session missions, Ask,
+English→shell and tab names. The editor and terminal multiplexer work fully without one.
 
-Get a free API key in about 30 seconds:
-  • Groq   (recommended — fast, generous free tier):  https://console.groq.com/keys
-  • Gemini (Google, free tier):                       https://aistudio.google.com/apikey
+Choose how Mars reaches one — run `mars setup` in a terminal to pick:
+  • Claude Code  every feature through the `claude` CLI on your own subscription, and the
+                 manager writes mission briefings for the phone and desk. No key.
+                   mars setup --path claude-code
+  • Groq         fast, generous free tier. Get a key at https://console.groq.com/keys
+                   mars setup --path groq        (asks for the key; or pipe it in)
 
-Then give it to Mars either way:
-  • Shell rc (~/.zshrc or ~/.bashrc), then restart your shell:
-      export GROQ_API_KEY=\"gsk_your_key_here\"
-  • Or ~/.mars/config.json (Mars reads this on startup):
-      { \"env\": { \"GROQ_API_KEY\": \"gsk_your_key_here\" } }
+`mars setup --check` says which path is in use and whether it works.
 
-Other providers also work: ANTHROPIC_API_KEY, OPENAI_API_KEY, or MARS_LLM_KEY
-(+ MARS_LLM_URL for a custom or local endpoint such as Ollama).
-
-Re-print these instructions anytime with:  mars setup";
+Without a choice, Mars uses whatever key is in its environment, paid providers first:
+ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, or MARS_LLM_KEY
+(+ MARS_LLM_URL for a custom or local endpoint such as Ollama).";
 
 #[cfg(feature = "ssh")]
 pub const PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
@@ -123,6 +121,8 @@ pub enum AgentEvent {
 pub fn provenance(cfg: &AgentConfig) -> String {
     if cfg.provider == "broker" {
         "laptop".to_string()
+    } else if cfg.provider == "claude-cli" {
+        format!("Claude Code · {}", cfg.model)
     } else if cfg.model.is_empty() {
         cfg.provider.to_string()
     } else {
@@ -364,6 +364,11 @@ fn provider_chain() -> Vec<Provider> {
 /// when the user pinned a model/URL or keyed a custom endpoint (an explicit
 /// choice is never rotated away from) — and, trivially, with one key.
 pub fn rotation_candidates(current_provider: &str) -> Vec<AgentConfig> {
+    // A path chosen in `mars setup` is an explicit choice too: Claude Code at its limit must
+    // not quietly start spending an API key from the environment.
+    if crate::integration::chosen().is_some() && env_var("LLM_KEY").is_err() {
+        return Vec::new();
+    }
     if env_var("LLM_MODEL").is_ok()
         || env_var("LLM_URL").is_ok()
         || current_provider == "custom"
@@ -401,7 +406,7 @@ impl AgentConfig {
             && !std::env::var("MARS_NO_BROKER").is_ok_and(|v| v == "1")
         {
             if let Some(sock) = crate::broker::detect_broker_sock() {
-                return AgentConfig {
+                let brokered = AgentConfig {
                     url: String::new(),
                     key: String::new(),
                     // None-equivalent: empty → the broker picks its own model.
@@ -411,6 +416,17 @@ impl AgentConfig {
                     temperature: 0.3,
                     broker_sock: Some(sock),
                 };
+                // A session keeps the route it was attached with, so one attached through an
+                // ssh forward that has since closed still names that socket. A machine with a
+                // path of its own must not have every call pinned to a broker that is gone.
+                if crate::integration::chosen().is_none() || brokered.is_configured() {
+                    return brokered;
+                }
+            }
+        }
+        if env_var("LLM_KEY").is_err() {
+            if let Some(path) = crate::integration::chosen() {
+                return Self::for_path(path);
             }
         }
         let (key, provider, default_url, default_model) =
@@ -427,7 +443,36 @@ impl AgentConfig {
         AgentConfig { url, key, model, provider, max_tokens: 512, temperature: 0.3, broker_sock: None }
     }
 
+    /// The config for a path chosen in `mars setup`. Unconfigured (and so the model-free
+    /// fallback) when that path cannot run here: no `claude` binary, or no Groq key.
+    pub fn for_path(path: crate::integration::Path) -> Self {
+        match path {
+            crate::integration::Path::ClaudeCode => AgentConfig {
+                // The binary rides in `url`: it is where this provider's calls go.
+                url: crate::integration::claude_bin().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+                key: String::new(),
+                model: env_var("LLM_MODEL").unwrap_or_else(|_| "haiku".to_string()),
+                provider: "claude-cli",
+                max_tokens: 512,
+                temperature: 0.3,
+                broker_sock: None,
+            },
+            crate::integration::Path::Groq => AgentConfig {
+                url: "https://api.groq.com/openai/v1".to_string(),
+                key: crate::integration::groq_key().unwrap_or_default(),
+                model: env_var("LLM_MODEL").unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string()),
+                provider: "groq",
+                max_tokens: 512,
+                temperature: 0.3,
+                broker_sock: None,
+            },
+        }
+    }
+
     pub fn is_configured(&self) -> bool {
+        if self.provider == "claude-cli" {
+            return !self.url.is_empty();
+        }
         if self.provider == "broker" {
             // Honest on the remote: "configured" iff the tunnel is actually up.
             return self
@@ -1100,8 +1145,16 @@ fn chat_inner(
                 if !class.recoverable() {
                     return Err(e);
                 }
-                // Fall through to the direct candidates, built from this process's own keys.
-                let direct = rotation_candidates("broker");
+                // Fall through to the direct candidates, built from this process's own keys. A
+                // chosen path is the one this machine has, and only a broker that could not be
+                // reached gives way to it: one that answered "no" (a spent plan) has spoken.
+                let direct = match crate::integration::chosen() {
+                    Some(path) if env_var("LLM_KEY").is_err() => {
+                        let own = AgentConfig::for_path(path);
+                        if class == Failure::Unreachable && own.is_configured() { vec![own] } else { Vec::new() }
+                    }
+                    _ => rotation_candidates("broker"),
+                };
                 if direct.is_empty() {
                     return Err(e);
                 }
@@ -1222,6 +1275,8 @@ pub fn classify(e: &anyhow::Error) -> Failure {
         "network is unreachable",
         "no route to host",
         "broken pipe",
+        "closed the connection",
+        "broker unreachable",
         "tls",
         "certificate",
     ];
@@ -1258,6 +1313,9 @@ fn is_provider_exhausted(e: &anyhow::Error) -> bool {
         "billing",
         "payment required",
         " 402",
+        // The Claude Code path: a plan's usage limit, and Mars's own hourly cap.
+        "usage limit",
+        "calls this hour",
     ]
     .iter()
     .any(|p| m.contains(p))
@@ -1301,6 +1359,7 @@ fn attempt(
         match cfg.provider {
             "anthropic" => chat_anthropic(cfg, messages, provider_sink),
             "bedrock" => chat_bedrock(cfg, messages, provider_sink),
+            "claude-cli" => crate::claude_cli::chat(cfg, messages, provider_sink),
             _ => chat_openai(cfg, messages, provider_sink),
         }
     };
@@ -1325,6 +1384,13 @@ fn attempt(
             Err(e)
         }
     }
+}
+
+/// One call on exactly `cfg`: no rotation, no tier lookup. `mars setup` proves a choice with
+/// this before saving it, so a bad key fails here instead of succeeding on some other key.
+pub fn probe(cfg: &AgentConfig) -> anyhow::Result<String> {
+    let messages = format_task_messages("Reply with the single word: ok", "ok?");
+    attempt(cfg, &messages, "setup", "n/a", None).map(|(t, _)| t)
 }
 
 /// Convenience wrapper for callers that don't need the `call_id` correlation

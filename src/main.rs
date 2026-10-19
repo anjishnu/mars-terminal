@@ -1,4 +1,7 @@
 mod agent;
+mod claude_cli;
+mod integration;
+mod setup;
 mod app;
 mod banner;
 mod briefing;
@@ -135,9 +138,14 @@ ROVER  (BETA — your sessions on a phone or a second screen; needs the `web` fe
   the bridge up only while you are using it. See SECURITY.md.
 
 AGENT  (an assistant, not an authority — review what it proposes)
-  mars setup                     how to get a free API key and turn on the agent
+  mars setup                     choose the model: Claude Code (your subscription, no
+                                 key) or Groq (a free key) — tests it, then saves it
+  mars setup --check             which model is in use and whether it works
+  mars setup --path claude-code|groq   the same choice without the prompts
+                                 (Groq reads a piped key: mars setup --path groq < key)
+  mars setup --manager on|off    mission briefings from the manager (needs Claude Code)
   mars ask \"<question>\"          one-shot answer from the LLM agent
-  Keys (paid-first): ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY,
+  No path chosen? Keys from the environment, paid-first: ANTHROPIC_API_KEY, OPENAI_API_KEY, GROQ_API_KEY,
                      GEMINI_API_KEY, or MARS_LLM_KEY + MARS_LLM_URL (any
                      OpenAI-compatible endpoint, e.g. local Ollama).
                      MARS_LLM_MODEL overrides the model for any provider.
@@ -192,7 +200,7 @@ MORE
 /// Path to the global MARS config file: `~/.mars/config.json`, alongside the rest of
 /// MARS's state (worklog, briefings, logs). `None` only when `$HOME` is unset.
 fn config_path() -> Option<std::path::PathBuf> {
-    crate::sys::paths::home_dir().map(|h| h.join(".mars").join("config.json"))
+    crate::config::config_json_path()
 }
 
 fn apply_config_from(path: &std::path::Path) {
@@ -418,15 +426,8 @@ fn main() -> Result<()> {
         }
         // Setup instructions: how to get and configure a free LLM API key.
         Some("setup") | Some("keys") => {
-            println!("{}", agent::SETUP_HELP);
-            let cfg = agent::AgentConfig::from_env();
-            println!();
-            if cfg.is_configured() {
-                println!("Status: ✓ a key is configured (provider: {}).", cfg.provider);
-            } else {
-                println!("Status: ✗ no key detected yet — agent features are off until you add one.");
-            }
-            return Ok(());
+            let rest: Vec<String> = args.collect();
+            return setup::setup_main(&rest);
         }
         // Color themes: list, or switch (writes ~/.mars/config.json "theme").
         Some("theme") => {
@@ -1328,9 +1329,16 @@ fn selfcheck() -> Result<()> {
         // drives), and MARS_SESSION/_ID send detect_broker_sock() to the PARENT
         // session for a route instead of this process's own.
         "MARS_SESSION", "MARS_SESSION_ID", "MARS_OPEN_TERMINAL",
+        "MARS_CLAUDE_BIN",
     ] {
         std::env::remove_var(key);
     }
+    // Hermetic, part 1b: the model path is read from config.json on every call, so a
+    // developer who chose Claude Code would otherwise turn the keyless checks into real calls.
+    std::env::set_var(
+        "MARS_CONFIG_FILE",
+        std::env::temp_dir().join(format!("mars-selfcheck-config-{}.json", std::process::id())),
+    );
     // Hermetic, part 2: keyless watch fires now produce deterministic verdicts
     // that land in the work journal — point the WHOLE suite at a scratch file so
     // no block can pollute the user's real ~/.mars/worklog.jsonl. Blocks that
@@ -1826,6 +1834,180 @@ fn selfcheck() -> Result<()> {
         println!("[selfcheck] ask agent (no key) ......... PASS");
     }
     app.handle_key(k(KeyCode::Esc))?;
+
+    // 13b. The model integration chosen after install. Claude Code runs every feature through an
+    //      isolated `claude -p` on the user's subscription; Groq keeps its key in Mars's config,
+    //      out of every shell's environment. A chosen path is read per call and never rotated
+    //      away from.
+    {
+        let (system, prompt) = claude_cli::flatten(&[
+            serde_json::json!({"role": "system", "content": "be brief"}),
+            serde_json::json!({"role": "user", "content": "first"}),
+            serde_json::json!({"role": "assistant", "content": "reply"}),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "second"}]}),
+        ]);
+        assert_eq!(system, "be brief");
+        assert!(
+            prompt.contains("User: first") && prompt.contains("Assistant: reply") && prompt.ends_with("second"),
+            "a conversation did not flatten into one prompt: {prompt:?}"
+        );
+        assert_eq!(claude_cli::flatten(&agent::format_task_messages("s", "only")).1, "only");
+        let found = integration::claude_candidates(None, "/opt/a:/opt/b", Some(std::path::Path::new("/h")));
+        assert_eq!(found.first().map(|p| p.to_string_lossy().into_owned()).as_deref(), Some("/opt/a/claude"));
+        assert!(found.iter().any(|p| p.ends_with(".local/bin/claude")), "the usual install place is not searched");
+        assert_eq!(integration::claude_candidates(Some("/x/claude"), "/opt/a", None), vec![std::path::PathBuf::from("/x/claude")]);
+        let a = claude_cli::args("haiku", std::path::Path::new("/t/s.txt"), false);
+        for want in ["--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands", "--system-prompt-file"] {
+            assert!(a.iter().any(|x| x == want), "claude call is missing {want}: {a:?}");
+        }
+        let at = |flag: &str| a.iter().position(|x| x == flag).and_then(|i| a.get(i + 1)).cloned();
+        assert_eq!(at("--tools").as_deref(), Some(""), "tools are not switched off");
+        assert_eq!(at("--setting-sources").as_deref(), Some(""), "user settings would load");
+        assert!(claude_cli::SCRUB.contains(&"ANTHROPIC_API_KEY"));
+        let err = claude_cli::parse_result(&serde_json::json!({"is_error": true, "result": "Not logged in · Please run /login"}))
+            .unwrap_err();
+        assert_eq!(agent::classify(&err), agent::Failure::Auth, "signed out is not an auth failure: {err}");
+        let spent = claude_cli::parse_result(&serde_json::json!({"is_error": true, "result": "Claude usage limit reached"}))
+            .unwrap_err();
+        assert_eq!(agent::classify(&spent), agent::Failure::Exhausted, "a used-up plan is not exhaustion: {spent}");
+    }
+    #[cfg(unix)]
+    {
+        let dir = cfg_dir.join("claude-path");
+        std::fs::create_dir_all(&dir)?;
+        let cfg_file = dir.join("config.json");
+        let prev_cfg = std::env::var_os("MARS_CONFIG_FILE");
+        std::env::set_var("MARS_CONFIG_FILE", &cfg_file);
+        // A stand-in `claude` that records how it was called and answers the way the real one
+        // does, in both output formats.
+        let log = dir.join("calls.log");
+        let fake = dir.join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                r#"#!/bin/sh
+sys=""; stream=0; prev=""
+for a in "$@"; do
+  [ "$prev" = "--system-prompt-file" ] && sys="$a"
+  [ "$a" = "stream-json" ] && stream=1
+  prev="$a"
+done
+prompt=$(cat)
+{{ echo "ARGS $*"; echo "KEY ${{ANTHROPIC_API_KEY:-unset}}"; echo "SYS $(cat "$sys")"; echo "PROMPT $prompt"; }} >> "{log}"
+case "$prompt" in *signed-out*) echo '{{"type":"result","subtype":"success","is_error":true,"result":"Not logged in · Please run /login"}}'; exit 1;; esac
+if [ $stream = 1 ]; then
+  echo '{{"type":"system","subtype":"init"}}'
+  echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"hello "}}}}}}'
+  echo '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"there"}}}}}}'
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"hello there","usage":{{"input_tokens":3,"cache_read_input_tokens":500,"output_tokens":2}}}}'
+else
+  echo '{{"type":"result","subtype":"success","is_error":false,"result":"done: build ok","usage":{{"input_tokens":3,"output_tokens":4}}}}'
+fi
+"#,
+                log = log.display()
+            ),
+        )?;
+        sys::fsperm::make_executable(&fake)?;
+        std::env::set_var("MARS_CLAUDE_BIN", &fake);
+
+        assert!(!agent::AgentConfig::from_env().is_configured(), "no choice and no key looked configured");
+        std::fs::write(&cfg_file, r#"{"theme": "kept"}"#)?;
+        integration::save(integration::Path::ClaudeCode, None)?;
+        let cfg = agent::AgentConfig::from_env();
+        assert_eq!(cfg.provider, "claude-cli", "choosing Claude Code did not take effect on the next call");
+        assert!(cfg.is_configured());
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-must-not-reach-claude");
+        let reply = agent::chat(&cfg, agent::format_task_messages("You summarize panes.", "cargo build ok"), "watch")?;
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        assert_eq!(reply, "done: build ok");
+        let calls = std::fs::read_to_string(&log)?;
+        assert!(calls.contains("KEY unset"), "the API key reached claude, which would bill it: {calls}");
+        assert!(calls.contains("SYS You summarize panes."), "the system prompt did not arrive: {calls}");
+        assert!(calls.contains("PROMPT cargo build ok"), "the prompt did not arrive on stdin: {calls}");
+        assert!(calls.contains("--model haiku"), "a summary did not use the cheap tier: {calls}");
+
+        let mut streamed = String::new();
+        let (text, _) = agent::chat_with_id_streaming(
+            &cfg,
+            agent::format_task_messages("s", "hi"),
+            "ask",
+            "n/a",
+            &mut |d| streamed.push_str(d),
+        )?;
+        assert_eq!((text.as_str(), streamed.as_str()), ("hello there", "hello there"), "the reply did not stream");
+        assert!(std::fs::read_to_string(&log)?.contains("--model sonnet"), "Ask did not use the high tier");
+
+        let err = agent::chat(&cfg, agent::format_task_messages("s", "signed-out"), "watch").unwrap_err();
+        assert!(err.to_string().contains("sign in"), "signing out did not say how to fix it: {err}");
+        let leftovers = std::fs::read_dir(std::env::temp_dir().join(format!("mars-claude-{}", sys::proc::uid_tag())))?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("system-{}-", std::process::id())))
+            .count();
+        assert_eq!(leftovers, 0, "a system prompt file was left on disk");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&cfg_file)?)?["theme"],
+            "kept",
+            "saving the path dropped the rest of config.json"
+        );
+
+        // A broker that has gone gives way to the chosen path: a dead socket at once, and one
+        // that accepts and hangs up (an ssh forward with nothing at its far end) on the call.
+        #[cfg(feature = "ssh")]
+        {
+            let session_env: Vec<_> = ["MARS_SESSION", "MARS_SESSION_ID"].iter().map(|v| (*v, std::env::var_os(v))).collect();
+            for (v, _) in &session_env {
+                std::env::remove_var(v);
+            }
+            broker::reset_session_broker();
+            std::env::remove_var("MARS_NO_BROKER");
+            std::env::set_var("MARS_AUTH_SOCK", dir.join("gone.sock"));
+            assert_eq!(agent::AgentConfig::from_env().provider, "claude-cli", "a dead broker socket shadowed the chosen path");
+            let hangup = dir.join("hangup.sock");
+            let listener = sys::control::bind(&hangup)?;
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    drop(conn);
+                }
+            });
+            std::env::set_var("MARS_AUTH_SOCK", &hangup);
+            let via = agent::AgentConfig::from_env();
+            assert_eq!(via.provider, "broker", "a listening broker was not used");
+            let out = agent::chat(&via, agent::format_task_messages("s", "cargo build ok"), "watch")?;
+            assert_eq!(out, "done: build ok", "a broker that hung up did not give way to the chosen path");
+            std::env::remove_var("MARS_AUTH_SOCK");
+            std::env::set_var("MARS_NO_BROKER", "1");
+            let _ = std::fs::remove_file(&hangup);
+            for (v, val) in session_env {
+                if let Some(val) = val {
+                    std::env::set_var(v, val);
+                }
+            }
+        }
+
+        std::env::set_var("MARS_CLAUDE_BIN", dir.join("not-installed"));
+        let gone = agent::AgentConfig::from_env();
+        assert!(!gone.is_configured(), "a missing claude looked configured");
+        assert!(
+            setup::model_problem(&gone, integration::chosen()).is_some_and(|p| p.contains("no `claude`")),
+            "a missing claude did not say so"
+        );
+
+        integration::save(integration::Path::Groq, Some("gsk_selfcheck"))?;
+        let g = agent::AgentConfig::from_env();
+        assert_eq!((g.provider, g.key.as_str()), ("groq", "gsk_selfcheck"), "the saved Groq key was not used");
+        assert!(std::env::var_os("GROQ_API_KEY").is_none(), "the saved key was exported to the environment");
+        assert_eq!(sys::fsperm::mode(&cfg_file), Some(0o600), "config.json holds a key but is readable by others");
+        std::env::set_var("OPENAI_API_KEY", "sk-other");
+        assert!(agent::rotation_candidates("groq").is_empty(), "a chosen path rotated to another key");
+        std::env::remove_var("OPENAI_API_KEY");
+
+        std::env::remove_var("MARS_CLAUDE_BIN");
+        match prev_cfg {
+            Some(p) => std::env::set_var("MARS_CONFIG_FILE", p),
+            None => std::env::remove_var("MARS_CONFIG_FILE"),
+        }
+    }
+    println!("[selfcheck] model path: Claude Code / Groq ..... PASS");
 
     // 14. kill_buffer with two panes on one buffer closes both and leaves no dangling id. When
     //     they were everything open, closing the file is quitting, and asks quit's question.

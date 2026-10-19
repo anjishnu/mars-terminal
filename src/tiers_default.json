@@ -35,6 +35,11 @@
       "low":  ["us.anthropic.claude-3-5-haiku-20241022-v1:0"],
       "mid":  ["us.anthropic.claude-sonnet-4-20250514-v1:0"],
       "high": ["us.anthropic.claude-opus-4-20250514-v1:0"]
+    },
+    "claude-cli": {
+      "low":  ["haiku"],
+      "mid":  ["haiku"],
+      "high": ["sonnet"]
     }
   }
 }

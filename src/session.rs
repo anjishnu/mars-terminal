@@ -1287,6 +1287,11 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // started by hand it dies with whatever terminal launched it, and under a supervisor it needs
     // a plist and a PATH that both drift. The session knows, and the session is here.
     ensure_bridge(&name);
+    // Say so once, in the session, when there is no model: every summary would be a keyword
+    // guess and nothing on screen would say why.
+    if !crate::agent::AgentConfig::from_env().is_configured() {
+        app.notice_no_key();
+    }
 
     // A no-file session opens straight into a terminal (multiplexer default) — or, after a
     // reboot, back into the workspaces it had.
