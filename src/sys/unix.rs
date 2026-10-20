@@ -72,6 +72,9 @@ pub mod control {
             {
                 Probe::Dead
             }
+            // A path that is not a socket cannot be a session. Linux reports it as refused; macOS
+            // reports ENOTSOCK, which fell through to Indeterminate and was never swept there.
+            Err(e) if e.raw_os_error() == Some(libc::ENOTSOCK) => Probe::Dead,
             Err(_) => Probe::Indeterminate,
         }
     }

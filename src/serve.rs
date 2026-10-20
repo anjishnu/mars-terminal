@@ -194,6 +194,21 @@ fn daemon_fingerprint(session: &str) -> String {
     crate::session::daemon_fingerprint(session)
 }
 
+/// `&i=<instance id>` for a link, or nothing when the session cannot be asked.
+///
+/// A session's name is not stable: Mars names a new one with a number and replaces it with an AI
+/// label minutes later. A link that only carries the name stops working at that moment, and the
+/// bridge can follow the instance id to the session under whatever name it has now.
+fn instance_param(session: &str) -> String {
+    crate::session::socket_path(session)
+        .ok()
+        .and_then(|p| crate::session::identify(&p))
+        .map(|(_, id, _)| id)
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("&i={id}"))
+        .unwrap_or_default()
+}
+
 // ── mars qr ──────────────────────────────────────────────────────────────────
 
 /// The LAN pairing link: the bundle served by THIS host, with the credentials in the fragment.
@@ -259,7 +274,8 @@ pub fn build_pair_link_all(session: &str, reach: Reach<'_>, all: bool) -> Result
     // Appended last and only when set, so a link for one session is byte-identical to what it
     // has always been — an older client parses it exactly as before.
     let all = if all { "&all=1" } else { "" };
-    Ok(format!("{page}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1{all}"))
+    let inst = instance_param(session);
+    Ok(format!("{page}#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1{all}{inst}"))
 }
 
 pub fn pair_link(session: &str, tunnel_base: &str, route: &str) -> Result<String> {
@@ -313,7 +329,8 @@ pub fn desk_main(session_arg: Option<String>, web: Option<String>) -> Result<()>
     }
     println!("  \x1b[38;5;208mmars\x1b[0m — the web terminal  ·  session \x1b[1m{session}\x1b[0m");
     println!();
-    println!("  {web}/desk#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1");
+    let inst = instance_param(&session);
+    println!("  {web}/desk#h={endpoint}&id={fp}&t={token}&s={session}&v=rover-1{inst}");
     println!();
     println!("  Paste that into a browser ON THIS MACHINE. The session must be running on a binary");
     println!("  that knows `Mirror` — if the screen stays black, `mars reboot {session}` is why.");
@@ -2438,6 +2455,7 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     // older phone sends no `s` and gets the bridge's own session, exactly as before.
     let valid = read_token();
     let mut wanted: Option<String> = None;
+    let mut wanted_instance: Option<String> = None;
     // Whether this client said it can read binary mirror frames. See `BIN_MIRROR`.
     let mut client_bin = false;
     let auth_deadline = Instant::now() + Duration::from_secs(5);
@@ -2450,6 +2468,8 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
                     if v.get("t").and_then(|t| t.as_str()) == Some("hello") {
                         wanted = v.get("s").and_then(|s| s.as_str()).map(String::from).filter(|s| !s.is_empty());
+                        wanted_instance =
+                            v.get("i").and_then(|s| s.as_str()).map(String::from).filter(|s| !s.is_empty());
                         // OPT-IN, and base64 stays for a release. A client that predates binary
                         // frames says nothing here and keeps the old path; one that has been
                         // updated says so and gets bytes. Two-sided changes that assume the far
@@ -2510,8 +2530,26 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
             // keeps its directory's birth name, which is exactly the name the phone paired
             // under, so a stale `s` still finds the live session instead of a refusal.
             let direct = session::socket_path(name).ok().filter(|p| session::identify(p).is_some());
-            match direct.or_else(|| session::socket_for_session_dir(name).map(|(_, p)| p)) {
-                Some(p) => p,
+            // RENAMED IS NOT GONE. A link names the session it was made for, and Mars renames a
+            // session minutes after it starts. Follow the instance id to wherever it is now, and
+            // tell the client the new name so its next link is current.
+            let followed = session::socket_for_instance(wanted_instance.as_deref().unwrap_or(""));
+            let renamed_to = followed.as_ref().map(|(now, _)| now.clone()).filter(|now| now != name);
+            let resolved = direct
+                .or_else(|| session::socket_for_session_dir(name).map(|(_, p)| p))
+                .map(|p| (p, None))
+                .or_else(|| followed.map(|(_, p)| (p, renamed_to)));
+            match resolved {
+                Some((p, renamed)) => {
+                    if let Some(now) = renamed {
+                        let _ = ws.send(Message::Text(
+                            serde_json::json!({ "t": "renamed", "from": name, "to": now })
+                                .to_string()
+                                .into(),
+                        ));
+                    }
+                    p
+                }
                 None => {
                     // Refuse LOUDLY: an empty board wearing the right name is the failure mode
                     // that makes a misrouted bridge indistinguishable from a broken phone.
@@ -3484,6 +3522,11 @@ fn handle_client_msg(
             // WHERE THIS MIRROR IS. Forwarded verbatim; the daemon decides what it means. An
             // absent field is a client older than it, not a phone.
             let surface = v.get("surface").and_then(|x| x.as_str()).map(|x| x.to_string());
+            // The pane to show alone, as a number or a numeric string — boards name panes as
+            // strings. Anything else is no pane at all: the whole screen, as before this field.
+            let pane = v.get("pane").and_then(|x| {
+                x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+            }).map(|p| p as usize);
             // ONE MIRROR PER BROWSER, REPLACED RATHER THAN STACKED.
             //
             // A resize re-sends `mirror` at the new size, and the daemon's handshake is once per
@@ -3501,7 +3544,7 @@ fn handle_client_msg(
                 return;
             };
             let mut w = match sock.try_clone() { Ok(w) => w, Err(_) => return };
-            if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows, surface: surface.clone() }).is_err() {
+            if session::write_frame(&mut w, &ClientFrame::Mirror { cols, rows, surface: surface.clone(), pane }).is_err() {
                 return;
             }
             // Kept so `mirror.key` can write to the same connection the frames come from — a
