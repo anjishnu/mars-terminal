@@ -3388,6 +3388,28 @@ fi
                     })
                 })
             }
+            /// Read whatever frames are waiting, without waiting for more. A real terminal
+            /// client always reads; a test that watches a mirror for seconds and leaves the
+            /// owner's socket unread lets it fill, and the daemon's write timeout then declares
+            /// the owner gone. On macOS a Unix socket buffer is small enough for one grid-size
+            /// repaint to do it.
+            fn pump(&mut self) {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                let _ = self.reader.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(5)));
+                for _ in 0..200 {
+                    let mut line = String::new();
+                    match self.reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Ok(session::ServerFrame::Output { b64 }) = serde_json::from_str(line.trim()) {
+                                if let Ok(bytes) = B64.decode(b64) {
+                                    self.screen.process(&bytes);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             fn read_until_matching(
                 &mut self,
                 secs: u64,
@@ -3623,6 +3645,19 @@ fi
             // Read the next Board frame's parsed JSON payload, within `secs`.
             // The reader must carry a read timeout so read_line returns to check
             // the deadline between pushes.
+            /// Drop whatever board frames are waiting — see `TestClient::pump`. The subscriber is a
+            /// socket too, and the daemon drops a reader that lets its buffer fill.
+            fn drain_boards(reader: &mut BufReader<UnixStream>) {
+                let _ = reader.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(5)));
+                for _ in 0..200 {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                let _ = reader.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(200)));
+            }
             fn next_board(
                 reader: &mut BufReader<UnixStream>,
                 secs: u64,
@@ -3690,7 +3725,7 @@ fi
                 // The owner is 100x30 (see `TestClient::connect`).
                 let mirror = crate::sys::control::connect(&bpath)?;
                 let mut mw = mirror.try_clone()?;
-                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 64, rows: 20 , surface: None })?;
+                session::write_frame(&mut mw, &session::ClientFrame::Mirror { cols: 64, rows: 20 , surface: None, pane: None })?;
                 std::thread::sleep(std::time::Duration::from_millis(400));
 
                 // 1. The owner was not told to go away.
@@ -3726,6 +3761,8 @@ fi
                 // implementation first read as a broken one here.
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while std::time::Instant::now() < deadline {
+                    owner.pump();
+                    drain_boards(&mut sub_r);
                     let mut line = String::new();
                     match mr.read_line(&mut line) {
                         Ok(0) => break,
@@ -3764,6 +3801,8 @@ fi
                 let mut moved: Option<(u16, u16)> = None;
                 let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(6);
                 while std::time::Instant::now() < deadline2 {
+                    owner.pump();
+                    drain_boards(&mut sub_r);
                     let mut line = String::new();
                     match mr.read_line(&mut line) {
                         Ok(0) | Err(_) => break,
@@ -3800,6 +3839,8 @@ fi
                     let mut torn: Vec<String> = Vec::new();
                     let deadline3 = std::time::Instant::now() + std::time::Duration::from_secs(3);
                     while std::time::Instant::now() < deadline3 {
+                        owner.pump();
+                        drain_boards(&mut sub_r);
                         let mut line = String::new();
                         match mr.read_line(&mut line) {
                             Ok(0) | Err(_) => break,
@@ -3836,6 +3877,90 @@ fi
                 assert!(allowed.contains(&v), "board verdict '{v}' is not a contract state");
             }
 
+            // ── A PANE, NOT THE SCREEN ────────────────────────────────────────────────────
+            //
+            // A desk showing one workspace asks for that pane. It must receive the pane's text
+            // and nothing around it — the owner's screen carries the tab bar and the status line,
+            // the desk already draws its own — and once it is the one in use, the PANE must be
+            // its size: the session grows by the chrome rather than squeezing the pane smaller.
+            {
+                use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+                let pane: usize = rows[0]["paneId"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .expect("board row without a numeric paneId");
+                let (owner_has_chrome, _) = owner.read_until("C-Spc", 5)?;
+                assert!(owner_has_chrome, "the owner's screen has no status line to crop — this check would prove nothing");
+
+                let pm = crate::sys::control::connect(&bpath)?;
+                let mut pw = pm.try_clone()?;
+                session::write_frame(
+                    &mut pw,
+                    &session::ClientFrame::Mirror { cols: 70, rows: 18, surface: Some("desk".into()), pane: Some(pane) },
+                )?;
+                let pr = pm.try_clone()?;
+                pr.set_read_timeout(Some(std::time::Duration::from_millis(400)))?;
+                let mut pr = BufReader::new(pr);
+                let mut sizes: Vec<(u16, u16)> = Vec::new();
+                let mut vt = vt100::Parser::new(18, 70, 0);
+                let mut read_for = |secs: u64, sizes: &mut Vec<(u16, u16)>, vt: &mut vt100::Parser| {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                    while std::time::Instant::now() < deadline {
+                        owner.pump();
+                        drain_boards(&mut sub_r);
+                        let mut line = String::new();
+                        match pr.read_line(&mut line) {
+                            Ok(0) => break,
+                            Err(_) => continue,
+                            Ok(_) => {}
+                        }
+                        match serde_json::from_str::<session::ServerFrame>(line.trim()) {
+                            Ok(session::ServerFrame::GridSize { cols, rows, .. }) => {
+                                sizes.push((cols, rows));
+                                *vt = vt100::Parser::new(rows, cols, 0);
+                            }
+                            Ok(session::ServerFrame::Output { b64 }) => {
+                                vt.process(&B64.decode(b64).unwrap_or_default());
+                            }
+                            _ => {}
+                        }
+                    }
+                };
+                read_for(2, &mut sizes, &mut vt);
+                let first = sizes.first().copied();
+                assert!(
+                    first.is_some_and(|s| s != (100, 30) && s.0 < 100 && s.1 < 30),
+                    "a pane-only mirror was told the whole grid's size ({first:?}), not its pane's"
+                );
+                // Using it — a wheel DOWN, which claims the grid like typing and, at the bottom of
+                // the pane already, moves nothing. Up would scroll into history and hide the owner's
+                // next keystrokes from the check below.
+                session::write_frame(&mut pw, &session::ClientFrame::MirrorWheel { up: false, col: 1, row: 1 })?;
+                read_for(3, &mut sizes, &mut vt);
+                assert_eq!(
+                    sizes.last().copied(),
+                    Some((70, 18)),
+                    "once in use, the pane should be the mirror's own size — the session grows by \
+                     the chrome around it instead of shrinking the pane; sizes seen: {sizes:?}"
+                );
+                let shown = vt.screen().contents();
+                assert!(
+                    !shown.contains("C-Spc") && !shown.contains("M-x"),
+                    "a pane-only mirror still carries the status line:\n{shown}"
+                );
+                // Close BOTH halves. A mirror that stays open and stops reading is not a mirror that
+                // left: the daemon keeps writing to it until the socket buffer fills.
+                drop(read_for);
+                drop(pr);
+                drop(pw);
+                drop(pm);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                owner.text("afterpane")?;
+                let (back, seen) = owner.read_until("afterpane", 5)?;
+                assert!(back, "the owner stopped receiving frames after a pane-only mirror left (pane {pane}); sessions {:?}; owner screen:\n{}", session::list_sessions().ok(), seen.unwrap_or_else(|| owner.screen.screen().contents()));
+            }
+            println!("[selfcheck] mirror: a desk can ask for one pane, sized to itself and without the screen's chrome ... PASS");
+
             // Task 2: the glance is NON-TAKEOVER — the owning client is still
             // attached and still drives the session.
             owner.text("stillhere")?;
@@ -3863,6 +3988,8 @@ fi
             let mut last_board = serde_json::Value::Null;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             while std::time::Instant::now() < deadline {
+                owner.pump();
+                drain_boards(&mut sub_r);
                 if let Some(b) = next_board(&mut sub_r, 2) {
                     if b["rows"]
                         .as_array()
@@ -3877,7 +4004,8 @@ fi
             }
             assert!(
                 saw_running,
-                "a live shell pane never surfaced as verdict 'running'; last board: {last_board}"
+                "a live shell pane never surfaced as verdict 'running'; last board: {last_board}\nowner screen:\n{}",
+                owner.screen.screen().contents()
             );
 
             // Task 3: the transcript over the WIRE. `Term::lines` is covered above; this is the

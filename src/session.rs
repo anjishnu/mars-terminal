@@ -118,6 +118,12 @@ pub enum ClientFrame {
         /// — the behaviour they were written against — rather than guessed at.
         #[serde(default)]
         surface: Option<String>,
+        /// ONE PANE, NOT THE SCREEN. A desk showing one workspace asks for that pane: the session
+        /// focuses it, and this mirror receives only its text area — no tab bar, frame or status
+        /// line, which the desk already draws in its own chrome. Absent means the whole screen,
+        /// which is what every client before this field gets.
+        #[serde(default)]
+        pane: Option<usize>,
     },
     /// Keystrokes from a mirror, as the bytes a terminal would send.
     ///
@@ -958,7 +964,7 @@ enum SrvEvent {
     },
     /// A second render target joined. Carries its own stream and size: one `Terminal` has one
     /// `Viewport::Fixed`, so a browser and a phone at different sizes cannot share one.
-    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64, surface: Option<String> },
+    Mirror { stream: crate::sys::control::Stream, cols: u16, rows: u16, id: u64, surface: Option<String>, pane: Option<usize> },
     MirrorKeys { data: String, id: u64, seq: Option<u64> },
     MirrorWheel { up: bool, col: u16, row: u16, id: u64 },
     /// A read-only mobile subscriber joined: start pushing board/briefing frames
@@ -1151,6 +1157,8 @@ struct MirrorTarget {
     /// Which surface this mirror is — see `ClientFrame::Mirror::surface`. `None` for a client
     /// older than the field, which is treated as a plain terminal.
     surface: Option<String>,
+    /// The pane this mirror shows alone — see `ClientFrame::Mirror::pane`.
+    pane: Option<usize>,
     id: u64,
     term: Terminal<CrosstermBackend<FrameWriter>>,
     /// The writer's hold flag — see `draw_whole`.
@@ -1190,8 +1198,15 @@ fn grid_size(
     client: Option<(u16, u16)>,
     mirrors: &[MirrorTarget],
     last: Option<LastInput>,
+    chrome: (u16, u16),
 ) -> Option<(u16, u16)> {
-    let fallback = || client.or_else(|| mirrors.last().map(|m| (m.cols, m.rows)));
+    // A pane-only mirror asks for its PANE to be its size, so the session is drawn that much
+    // larger: the frame, tab bar and status line around the pane are cropped away, not squeezed in.
+    let want = |m: &MirrorTarget| match m.pane {
+        Some(_) => (m.cols.saturating_add(chrome.0), m.rows.saturating_add(chrome.1)),
+        None => (m.cols, m.rows),
+    };
+    let fallback = || client.or_else(|| mirrors.last().map(want));
     if std::env::var("MARS_GRID_SIZE").as_deref() == Ok("owner") {
         return fallback();
     }
@@ -1212,7 +1227,7 @@ fn grid_size(
             .iter()
             .find(|m| m.id == id)
             .filter(|m| m.surface.as_deref() != Some("phone"))
-            .map(|m| (m.cols, m.rows))
+            .map(want)
             .or_else(fallback),
         Some(LastInput::Owner) | None => fallback(),
     }
@@ -1224,6 +1239,19 @@ fn grid_size(
 /// should look unmistakably like one, because the alternative — blank space that could equally be
 /// the app's own background — is a rendering bug you cannot tell from a design.
 fn blit(frame: &mut Frame, src: &Buffer, cursor: Option<Position>) {
+    blit_from(frame, src, cursor, Position::new(0, 0), None)
+}
+
+/// `blit`, reading the source from `origin` and no further than `limit` — the pane-only crop.
+/// Cells past the pane are padded like any other shortfall, and a cursor outside the pane is left
+/// unplaced rather than drawn somewhere it is not.
+fn blit_from(
+    frame: &mut Frame,
+    src: &Buffer,
+    cursor: Option<Position>,
+    origin: Position,
+    limit: Option<Rect>,
+) {
     let area = frame.area();
     let mut pad = Cell::new("·");
     pad.set_style(Style::new().fg(Color::DarkGray));
@@ -1231,8 +1259,10 @@ fn blit(frame: &mut Frame, src: &Buffer, cursor: Option<Position>) {
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             let at = Position::new(x, y);
+            let from = Position::new(x.saturating_add(origin.x), y.saturating_add(origin.y));
+            let inside = limit.is_none_or(|l| l.contains(from));
             let Some(cell) = dst.cell_mut(at) else { continue };
-            *cell = match src.cell(at) {
+            *cell = match src.cell(from).filter(|_| inside) {
                 Some(s) => s.clone(),
                 None => pad.clone(),
             };
@@ -1241,8 +1271,12 @@ fn blit(frame: &mut Frame, src: &Buffer, cursor: Option<Position>) {
     // A cropped-away cursor is left unplaced rather than clamped to the edge: a cursor sitting
     // somewhere it is not is worse than no cursor at all.
     if let Some(p) = cursor {
-        if area.contains(p) {
-            frame.set_cursor_position(p);
+        let inside = limit.is_none_or(|l| l.contains(p));
+        if inside && p.x >= origin.x && p.y >= origin.y {
+            let q = Position::new(p.x - origin.x, p.y - origin.y);
+            if area.contains(q) {
+                frame.set_cursor_position(q);
+            }
         }
     }
 }
@@ -1390,6 +1424,9 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // nothing is drawn at all until some target exists to say what the size should be.
     let mut grid = make_grid(120, 32)?;
     let mut grid_dims = (120u16, 32u16);
+    // What surrounds the focused pane's text at the current layout — tab bar, frame, status line —
+    // measured on each render so a pane-only mirror can ask for its pane to be its own size.
+    let mut chrome = (0u16, 0u16);
     // Who typed most recently. `None` until somebody does, which is why merely attaching moves
     // nothing: with no input recorded the owner decides, exactly as before.
     let mut last_input: Option<LastInput> = None;
@@ -1475,7 +1512,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             // the session itself, twice a frame. See `GridBackend`.
             //
             // Everything below this line is a copy, and a copy cannot resize anything.
-            if let Some(want) = grid_size(client_size, &mirrors, last_input) {
+            if let Some(want) = grid_size(client_size, &mirrors, last_input, chrome) {
                 if want != grid_dims {
                     // Rebuilt rather than resized: a fresh `Terminal` has an empty previous
                     // buffer, so the next draw is a full repaint, which is exactly what a size
@@ -1488,6 +1525,10 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 }
                 let src = grid.backend();
                 let cursor = src.cursor();
+                let pane_text = app.focused_pane_text_rect();
+                if let Some(r) = pane_text {
+                    chrome = (grid_dims.0.saturating_sub(r.width), grid_dims.1.saturating_sub(r.height));
+                }
 
                 if let Some(t) = term.as_mut() {
                     if let Err(e) = t.draw(|f| blit(f, &src.buf, cursor)) {
@@ -1531,23 +1572,34 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                     // The question a mirror is actually asking is "is this MY size" — so the
                     // answer is computed against the same `last` that decided the grid.
                     let mine = matches!(last_input, Some(LastInput::Mirror(id)) if id == m.id);
-                    if m.announced != Some(grid_dims) {
+                    // A pane-only mirror is told the size of what it is sent: the pane, not the
+                    // grid around it. While the pane is not what owns the screen it falls back to
+                    // the whole frame, so an open bar or prompt is never cropped out of view.
+                    let crop = m.pane.and(pane_text);
+                    let view = crop.map(|r| (r.width, r.height)).unwrap_or(grid_dims);
+                    if m.announced != Some(view) {
                         let frame = ServerFrame::GridSize {
-                            cols: grid_dims.0,
-                            rows: grid_dims.1,
+                            cols: view.0,
+                            rows: view.1,
                             desk: !mine,
                         };
                         if write_frame(&mut m.sock, &frame).is_err() {
                             return false;
                         }
-                        m.announced = Some(grid_dims);
+                        m.announced = Some(view);
                     }
                     // BEFORE the bytes, so a client reading in order stamps arrival against the
                     // frame that actually carried the echo rather than the one after it.
                     if let Some(seq) = m.pending_ack.take() {
                         let _ = write_frame(&mut m.sock, &ServerFrame::MirrorAck { seq });
                     }
-                    draw_whole(&mut m.term, &m.hold, |f| blit(f, &src.buf, cursor)).is_ok()
+                    match crop {
+                        Some(r) => draw_whole(&mut m.term, &m.hold, |f| {
+                            blit_from(f, &src.buf, cursor, Position::new(r.x, r.y), Some(r))
+                        })
+                        .is_ok(),
+                        None => draw_whole(&mut m.term, &m.hold, |f| blit(f, &src.buf, cursor)).is_ok(),
+                    }
                 });
             }
         }
@@ -1668,7 +1720,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 push_mobile(&mut app, &mut subscribers);
                 last_mobile_push = Some(std::time::Instant::now());
             }
-            Ok(SrvEvent::Mirror { stream, cols, rows, id, surface }) => {
+            Ok(SrvEvent::Mirror { stream, cols, rows, id, surface, pane }) => {
                 // NOTHING IS EVICTED. No `client` assignment, no `send_exit`, no `attached` flag.
                 // That is the whole property, and the selfcheck asserts it by watching the
                 // client's socket rather than by reading this code.
@@ -1681,8 +1733,14 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 match make_terminal_on(writer, cols, rows) {
                     Ok(mut m) => {
                         let _ = m.clear();
+                        // Asking for a pane is asking to see it: bring it forward, so the pane on
+                        // the desk and the pane its keys reach are the same one.
+                        if let Some(p) = pane {
+                            app.focus_pane(p);
+                        }
                         mirrors.push(MirrorTarget {
                             surface,
+                            pane,
                             id,
                             term: m,
                             hold,
@@ -2217,7 +2275,7 @@ fn client_connection(
             let _ = send_exit(&stream, &format!("drafting {title:?} in pane {pane}"));
             return;
         }
-        Ok(ClientFrame::Mirror { cols, rows, surface }) => {
+        Ok(ClientFrame::Mirror { cols, rows, surface, pane }) => {
             // Non-takeover, exactly like `Subscribe` — it registers a stream and never touches
             // client ownership. The difference is what it receives: rendered frames, not board
             // JSON.
@@ -2225,7 +2283,7 @@ fn client_connection(
             let mid = MIRROR_IDS.fetch_add(1, Ordering::SeqCst);
             let Ok(render_stream) = stream.try_clone() else { return };
             let _ = render_stream.set_write_timeout(Some(Duration::from_secs(2)));
-            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows, id: mid, surface: surface.clone() }).is_err() {
+            if tx.send(SrvEvent::Mirror { stream: render_stream, cols: *cols, rows: *rows, id: mid, surface: surface.clone(), pane: *pane }).is_err() {
                 return;
             }
             // Held open — dropping here would close the socket the daemon is drawing to — and

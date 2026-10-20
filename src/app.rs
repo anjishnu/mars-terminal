@@ -3040,6 +3040,40 @@ impl App {
         self.tab_mut().focused_pane = next;
     }
 
+    /// Bring a pane forward by id, switching tab if it lives in another one. A desk mirror asks
+    /// for this when somebody picks a workspace, so the pane on screen and the pane keys reach
+    /// are the same one. Left alone mid-prompt or mid-bar: a browser click must not yank the
+    /// person at the keyboard out of something they are typing into.
+    pub fn focus_pane(&mut self, id: PaneId) -> bool {
+        if !matches!(self.mode, Mode::Edit | Mode::Terminal) {
+            return false;
+        }
+        let Some(tab) = self.tabs.iter().position(|t| t.layout.pane_ids().contains(&id)) else {
+            return false;
+        };
+        if self.active_tab == tab && self.tabs[tab].focused_pane == id {
+            return true;
+        }
+        self.active_tab = tab;
+        self.tabs[tab].focused_pane = id;
+        self.mode = self.mode_for_focused_pane();
+        self.needs_redraw = true;
+        true
+    }
+
+    /// The text area of the focused pane in the last render, without its frame: what a desk
+    /// mirror shows when it asks for the pane alone. `None` while something other than the pane
+    /// owns the screen — the bar, a prompt, travel mode — because cropping would hide it.
+    pub fn focused_pane_text_rect(&self) -> Option<Rect> {
+        if !matches!(self.mode, Mode::Edit | Mode::Terminal) {
+            return None;
+        }
+        let id = self.focused_pane_id();
+        let r = self.pane_rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r)?;
+        // Every pane is drawn as `Block::borders(ALL)`, so its text is one cell in on each side.
+        (r.width > 2 && r.height > 2).then(|| Rect::new(r.x + 1, r.y + 1, r.width - 2, r.height - 2))
+    }
+
     /// M-arrows — focus the nearest pane in a screen direction, using the
     /// real geometry from the last render.
     fn focus_direction(&mut self, dx: i32, dy: i32) {
