@@ -5044,7 +5044,7 @@ fi
         }
         assert_eq!(
             tiers::model_above("groq", "translate").as_deref(),
-            Some("llama-3.3-70b-versatile"),
+            Some("openai/gpt-oss-120b"),
             "mid-tier translate must escalate to groq high"
         );
         assert_eq!(
@@ -5265,9 +5265,9 @@ fi
         }
         // The naming task tags must match the ring's keys, or tier routing
         // silently skips them (the bug this refactor caught).
-        assert_eq!(tiers::model_for("groq", "auto_name", "x"), "llama-3.1-8b-instant");
-        assert_eq!(tiers::model_for("groq", "name_session", "x"), "llama-3.1-8b-instant");
-        assert_eq!(tiers::model_for("groq", "mission", "x"), "llama-3.1-8b-instant");
+        assert_eq!(tiers::model_for("groq", "auto_name", "x"), "openai/gpt-oss-20b");
+        assert_eq!(tiers::model_for("groq", "name_session", "x"), "openai/gpt-oss-20b");
+        assert_eq!(tiers::model_for("groq", "mission", "x"), "openai/gpt-oss-20b");
         // EVERY call-site tag routes: agent::TASKS ⊆ the default tier map, so a
         // tag rename can't silently fall through to the provider default model
         // again (the "shell"/"translate" bug, fixed 0.4).
@@ -5275,13 +5275,13 @@ fi
         for t in agent::TASKS {
             assert!(ring.task_tier.contains_key(*t), "task tag {t:?} is unmapped in tiers defaults");
         }
-        assert_eq!(tiers::model_for("groq", "translate", "x"), "qwen/qwen3.6-27b",
+        assert_eq!(tiers::model_for("groq", "translate", "x"), "qwen/qwen3.8-27b",
             "translate must route to the head of the mid tier");
         // In-tier fallback: each tier is a LIST, so a retired head has a live
         // successor before the call ever leaves the provider.
         assert!(tiers::models_for("groq", "translate", "x").len() >= 2,
             "groq mid tier must list fallback models, not a single point of failure");
-        assert_eq!(tiers::models_for("groq", "translate", "x")[0], "qwen/qwen3.6-27b");
+        assert_eq!(tiers::models_for("groq", "translate", "x")[0], "qwen/qwen3.8-27b");
         println!("[selfcheck] prompt templates ......... PASS");
     }
 
@@ -7216,7 +7216,7 @@ fi
         assert_eq!(worklog::load_goals("demo"), vec!["ship the overlay", "fix the OOM"], "goals round-trip");
         assert!(worklog::load_goals("other").is_empty(), "goals leaked across sessions");
         // Routes at the cheap tier; the tag is pinned in TASKS (checked in 29h).
-        assert_eq!(tiers::model_for("groq", "capture_goals", "x"), "llama-3.1-8b-instant",
+        assert_eq!(tiers::model_for("groq", "capture_goals", "x"), "openai/gpt-oss-20b",
             "capture_goals must route to low");
         // The Goals event persists what the model returned.
         let mut app = App::new(None)?;
@@ -10693,6 +10693,80 @@ fi
             "an unwatched session spent a model call on a summary: {:?}",
             app.rover_summaries.values().map(|s| s.provider.clone()).collect::<Vec<_>>());
         println!("[selfcheck] rover: an unwatched board is enriched free, never paid ... PASS");
+
+        // Under attention, only a tail triage could NOT settle earns a model look. A settled one
+        // (blocked on a prompt, visibly progressing, a clean exit) is already the answer, and
+        // rewording it was most of the board's traffic. The endpoint refuses at once.
+        std::env::set_var("MARS_LLM_KEY", "selfcheck");
+        std::env::set_var("MARS_LLM_URL", "http://127.0.0.1:9");
+        app.rover_active = true;
+        let spend = |app: &mut App| -> bool {
+            for _ in 0..6 {
+                // The map is throttled to multiples of its interval; land each tick on one.
+                app.frame_tick = u64::MAX;
+                app.tick();
+                if app.rover_map_inflight.is_some() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            false
+        };
+        for s in app.rover_summaries.values_mut() {
+            s.ambiguous = false;
+        }
+        assert!(!spend(&mut app), "a model was asked to reword a tail triage had already settled");
+        if let Some(s) = app.rover_summaries.values_mut().next() {
+            s.ambiguous = true;
+        }
+        assert!(spend(&mut app), "a tail triage could not settle was never sent for a model look");
+        std::env::remove_var("MARS_LLM_KEY");
+        std::env::remove_var("MARS_LLM_URL");
+        app.rover_active = false;
+        for _ in 0..100 {
+            app.tick();
+            if !app.bg_busy {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        println!("[selfcheck] rover: a tail triage settled is never sent to a model ... PASS");
+
+        // A phone's "summarize" is answered from the board the host already built: the model was
+        // being asked about a workspace it was never shown.
+        #[cfg(feature = "web")]
+        {
+        let board = r#"{"rows":[{"id":"1","why":"cargo test","summary":{"text":"tests passing","computedBy":""}},{"id":"2","why":"waiting on your input"}]}"#;
+        let one: serde_json::Value = serde_json::from_str(&serve::summary_from_board(board, "1"))?;
+        assert_eq!(one["summary"]["text"], "tests passing");
+        assert_eq!(one["summary"]["computedBy"], "computed");
+        let two: serde_json::Value = serde_json::from_str(&serve::summary_from_board(board, "2"))?;
+        assert_eq!(two["summary"]["text"], "waiting on your input", "a row without a summary must fall back to its why");
+        assert_eq!(two["id"], "2");
+        assert!(two["summary"].get("fallback").is_none(), "a board answer must never send the phone to a fallback");
+        println!("[selfcheck] rover: summarize answers from the board, no model ... PASS");
+        }
+
+        // Naming needs no model: a tab is named from what it shows, a session from where it
+        // works. One tick is too soon for any model to have answered, so these came from the panes.
+        {
+            let dir = std::env::temp_dir().join(format!("mars-name-{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            let file = dir.join("train_sweep.py");
+            std::fs::write(&file, "for trial in range(10):\n    run(trial, batch=32)  # the sweep\n")?;
+            let mut named = App::new(Some(file.display().to_string()))?;
+            named.session_name = Some("0".into());
+            let tab_id = named.tab().id;
+            named.frame_tick = u64::MAX;
+            named.tick();
+            assert_eq!(named.tab_name_suggestion.get(&tab_id).map(String::as_str), Some("train-sweep"),
+                "a tab showing a file was not named after it");
+            assert_eq!(named.session_name_suggestion.as_deref(), Some("train-sweep"),
+                "a session was not named from its panes");
+            assert_eq!(named.tab().name, "1", "a derived name was applied without being accepted");
+            let _ = std::fs::remove_dir_all(&dir);
+            println!("[selfcheck] naming: tabs and sessions are named from their panes, no model ... PASS");
+        }
     }
 
     let _ = std::fs::remove_file(&worklog_default);

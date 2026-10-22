@@ -2585,6 +2585,9 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
     let mut mirror = MirrorLink::default();
     // A clone for async results (the LLM proxy) pushed from the inbound handler.
     let action_tx = tx.clone();
+    // The newest board, so a `summarize` is answered from what the host already computed.
+    let last_board = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let board_for_reader = last_board.clone();
     let reader_stream = daemon.try_clone()?;
     thread::spawn(move || {
         let mut lines = BufReader::new(reader_stream);
@@ -2624,6 +2627,9 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
                             }
                         }
                         let wrapped = format!("{{\"t\":\"snapshot\",{}", &json[1..]);
+                        if let Ok(mut b) = board_for_reader.lock() {
+                            b.clone_from(&json);
+                        }
                         if tx.send(wrapped).is_err() {
                             break;
                         }
@@ -2753,10 +2759,10 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
         // Read one inbound WS message (times out via the socket read timeout).
         match ws.read() {
             Ok(Message::Text(txt)) => {
-                handle_client_msg(&mut writer, &action_tx, &btx, &mut mirror, client_bin, socket, &txt);
+                handle_client_msg(&mut writer, &action_tx, &btx, &mut mirror, client_bin, socket, &last_board, &txt);
             }
             Ok(Message::Binary(b)) => {
-                handle_client_msg(&mut writer, &action_tx, &btx, &mut mirror, client_bin, socket, &String::from_utf8_lossy(&b));
+                handle_client_msg(&mut writer, &action_tx, &btx, &mut mirror, client_bin, socket, &last_board, &String::from_utf8_lossy(&b));
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
@@ -2774,9 +2780,9 @@ fn bridge_ws(stream: TcpStream, socket: &std::path::Path) -> Result<()> {
 /// (chat/ask/summarize): generous for two thumbs, ruinous for a loop. Refusals are said out
 /// loud on the same channel the answer would have used, never silently dropped.
 pub fn llm_spend_allowed() -> bool {
-    // 20, not 12: Mission Control legitimately prefetches one summarize per workspace on board
-    // load, so an 8-workspace board plus a few chat turns brushed the old ceiling in its first
-    // minute — the limit exists to stop loops, not to tax opening the app.
+    // 20, not 12: Mission Control used to prefetch one summarize per workspace on board load.
+    // Summaries are now answered from the board without a model, so this only meters asks and
+    // chat — the limit exists to stop loops, not to tax opening the app.
     const MAX_PER_MIN: u32 = 20;
     static WINDOW: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
     let now = crate::worklog::now_secs() / 60;
@@ -2789,6 +2795,20 @@ pub fn llm_spend_allowed() -> bool {
     }
     w.1 += 1;
     true
+}
+
+/// The `summary` frame for row `id`: its host-computed summary, else its `why`.
+pub(crate) fn summary_from_board(board: &str, id: &str) -> String {
+    let rows: serde_json::Value = serde_json::from_str(board).unwrap_or_default();
+    let row = rows["rows"].as_array().and_then(|r| r.iter().find(|r| r["id"].as_str() == Some(id)));
+    let (text, by) = match row {
+        Some(r) => match r["summary"]["text"].as_str().filter(|t| !t.trim().is_empty()) {
+            Some(t) => (t, r["summary"]["computedBy"].as_str().filter(|b| !b.is_empty()).unwrap_or("computed")),
+            None => (r["why"].as_str().unwrap_or_default(), "computed"),
+        },
+        None => ("", "computed"),
+    };
+    serde_json::json!({"t": "summary", "id": id, "summary": {"text": text, "computedBy": by}}).to_string()
 }
 
 enum AuthCheck { Ok, Bad, Other }
@@ -2889,7 +2909,7 @@ fn looks_like_key_failure(text: &str) -> bool {
 }
 
 /// A short "who answered" label for the phone: provider + the model's short name
-/// (`groq · llama-3.3-70b-versatile`). The broker path hides the model it picks.
+/// (`groq · openai/gpt-oss-120b`). The broker path hides the model it picks.
 fn agent_provenance(cfg: &crate::agent::AgentConfig) -> String {
     if cfg.provider == "broker" {
         return "broker".to_string();
@@ -2950,6 +2970,7 @@ fn handle_client_msg(
     mirror: &mut MirrorLink,
     bin: bool,
     socket: &std::path::Path,
+    last_board: &std::sync::Mutex<String>,
     txt: &str,
 ) {
     let v: serde_json::Value = match serde_json::from_str(txt) {
@@ -3156,14 +3177,17 @@ fn handle_client_msg(
                 }
             }
         }
+        // A model asked about a workspace it was never shown can only reword the row's own label,
+        // so the answer is the row as the host already computed it.
+        Some("summarize") => {
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or_default();
+            let board = last_board.lock().map(|b| b.clone()).unwrap_or_default();
+            let _ = tx.send(summary_from_board(&board, id));
+        }
         // LLM proxy — the phone asks, the host answers with its own key.
-        Some(kind @ ("ask" | "summarize")) => {
+        Some("ask") => {
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("session").to_string();
-            let q = if kind == "summarize" {
-                format!("In one or two sentences, what is workspace '{id}' doing and what's the next step?")
-            } else {
-                v.get("q").and_then(|x| x.as_str()).unwrap_or("").to_string()
-            };
+            let q = v.get("q").and_then(|x| x.as_str()).unwrap_or("").to_string();
             if q.trim().is_empty() {
                 return;
             }
@@ -4360,23 +4384,29 @@ pub fn preflight_manager(probe: bool) -> Vec<Check> {
 /// this check confirms the result rather than leaving them to discover it from a briefing that
 /// never changes.
 fn claude_can_run() -> Check {
+    // `auth status` answers "is this machine signed in" without spending a model turn; the
+    // manager's own first turn is what proves the plan has usage left.
     let out = std::process::Command::new("env")
-        .args(["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "claude", "-p", "ok"])
+        .args(["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "claude", "auth", "status"])
         .output();
+    let signed_in = |o: &std::process::Output| {
+        serde_json::from_slice::<serde_json::Value>(&o.stdout)
+            .is_ok_and(|v| v["loggedIn"].as_bool() == Some(true))
+    };
     match out {
-        Ok(o) if o.status.success() => {
+        Ok(o) if o.status.success() && signed_in(&o) => {
             let keyed = std::env::var("ANTHROPIC_API_KEY").is_ok();
             Check::ok(
-                "can run",
+                "signed in",
                 if keyed { "on your subscription (API key ignored)" } else { "on your subscription" },
             )
         }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
-            let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output").trim();
-            Check::fail("can run", line.chars().take(90).collect::<String>(), "run `claude` once to sign in")
+            let line = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("not signed in").trim();
+            Check::fail("signed in", line.chars().take(90).collect::<String>(), "run `claude` once to sign in")
         }
-        Err(e) => Check::fail("can run", e.to_string(), "run `claude` once to sign in"),
+        Err(e) => Check::fail("signed in", e.to_string(), "run `claude` once to sign in"),
     }
 }
 
@@ -4450,8 +4480,8 @@ pub fn check_main(session_arg: Option<String>) -> Result<()> {
     let bridge = preflight_bridge(session.as_deref());
     print_checks("bridge", &bridge);
     println!();
-    // Probe for real here: `--check` is the one place a developer explicitly asked us to find out,
-    // so spending one tiny turn to answer "can the manager actually run" is what they came for.
+    // Probe for real here: `--check` is the one place a developer explicitly asked us to find out
+    // whether the manager can run, so its sign-in is asked of `claude` itself.
     print_checks("manager", &preflight_manager(true));
     println!();
     if bridge.iter().any(|c| c.failed()) {
