@@ -466,9 +466,40 @@ fn parse_option(trimmed: &str) -> Option<DecisionOption> {
 
 /// Every decision in a brief, with its options intact.
 pub fn parse_decisions(body: &str) -> Vec<Decision> {
+    // AN OPTION IS A BULLET, NOT A LINE, and real briefs are hard-wrapped.
+    //
+    // `parse_option` reads one line, so an option whose `*Why this and not the others:*` fell on a
+    // continuation line lost its rationale entirely. Two things broke downstream and both looked
+    // like something else: the second reader objected "ruled without naming why the others lose"
+    // on almost every decision — measured at 4 to 9 objections across all five briefs a real
+    // planner wrote, every one of them false — and the refinement card, which exists so that an
+    // override is an informed act rather than a guess, had no reason to show.
+    //
+    // An audit louder than its evidence is one people learn to discount, so this is joined before
+    // parsing rather than made lenient after it. A wrapped bullet is folded onto its own first
+    // line; a new bullet, a heading or a blank line ends it.
+    let mut joined: Vec<String> = Vec::new();
+    for raw in body.lines() {
+        let t = raw.trim();
+        let starts_bullet = t.starts_with("- ") || t.starts_with("* ");
+        let continues = !t.is_empty()
+            && !starts_bullet
+            && !t.starts_with('#')
+            && joined.last().is_some_and(|p| {
+                let p = p.trim_start();
+                p.starts_with("- ") || p.starts_with("* ")
+            });
+        if continues {
+            let last = joined.last_mut().expect("checked above");
+            last.push(' ');
+            last.push_str(t);
+        } else {
+            joined.push(raw.to_string());
+        }
+    }
     let mut out: Vec<Decision> = Vec::new();
     let mut cur: Option<Decision> = None;
-    for line in body.lines() {
+    for line in &joined {
         let trimmed = line.trim();
         if let Some((id, layer, question)) = decision_heading(trimmed) {
             if let Some(d) = cur.take() {
@@ -1015,6 +1046,64 @@ fn strip_made_lines(body: &str, pred: impl Fn(&str) -> bool) -> String {
 ///
 /// Only the staleness note is removed; the override that caused it stays, because it is still a
 /// decision that was made.
+/// Has a human said this brief may be built?
+///
+/// **A fourth file, and deliberately not a fourth state.** `state_of` answers *how far has this
+/// got* from the three files the work produces; approval answers a different question — *may this
+/// run without me* — and it is the human's answer, not the work's. Folding it into the state
+/// machine would have made a permission look like a stage.
+///
+/// It is still a presence check over siblings, for the same reason everything else here is: a
+/// `state:` field can disagree with reality and a file cannot disagree with its own existence.
+pub fn is_approved(brief_dir: &Path) -> bool {
+    brief_dir.join("approved.md").exists()
+}
+
+/// Record that a human approved this brief, and what they were looking at when they did.
+///
+/// **The gate is arithmetic, not judgement.** A brief with a stale decision has a hole in its
+/// design — some ruling assumed a fork that was later overridden — and approving it is approving
+/// something nobody has read. That is a dangling reference, which is why it may gate; the second
+/// reader's objections are judgements about design and deliberately may not.
+///
+/// **What this file is for.** Under autopilot the manager assigns without a press, so something
+/// has to carry the human's consent forward in time from the moment it was given. This is that
+/// thing, and it names who and when because an action ledger with no accountable person is a log,
+/// not a ledger. It also records the decisions as ruled at approval time: the brief is editable
+/// afterwards, and *"what was actually approved"* must not be a question answered by reading a
+/// file that has since changed.
+pub fn approve(brief_dir: &Path, who: &str, ts: u64) -> std::io::Result<()> {
+    if !brief_dir.join("brief.md").exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no brief.md"));
+    }
+    let decisions = decisions_of(brief_dir);
+    let stale: Vec<&str> = decisions.iter().filter(|d| d.stale).map(|d| d.id.as_str()).collect();
+    if !stale.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "approve is withheld: {} still stale. Each assumes a ruling that was overridden — \
+                 re-rule it in brief.md, then `mars brief clear-stale <id>`.",
+                stale.join(", ")
+            ),
+        ));
+    }
+    let ruled: String = decisions
+        .iter()
+        .map(|d| {
+            let chosen = d.options.iter().find(|o| o.chosen).map(|o| o.key.as_str()).unwrap_or("—");
+            format!("- [{}] {} → {}\n", d.id, d.question, chosen)
+        })
+        .collect();
+    let body = format!(
+        "---\napproved_by: {who}\napproved_ts: {ts}\ndecisions: {}\n---\n# Approved\n\n\
+         The rulings as they stood when this was approved. The brief stays editable; this does \
+         not, so that what was consented to remains answerable after the fact.\n\n{ruled}",
+        decisions.len(),
+    );
+    std::fs::write(brief_dir.join("approved.md"), body)
+}
+
 pub fn clear_stale(brief_dir: &Path, id: &str) -> std::io::Result<()> {
     let path = brief_dir.join("brief.md");
     let body = std::fs::read_to_string(&path)?;
@@ -1205,6 +1294,277 @@ pub fn audit(b: &Brief, brief_dir: &Path, timeout: std::time::Duration) -> Audit
         })
         .collect();
     Audit { tier0, tier1 }
+}
+
+/// How much of this may happen without a person, and it is a CEILING rather than a grant.
+///
+/// The governing rule: an agent may act autonomously in proportion to how reversible and how
+/// verifiable the action is, bounded by blast radius. These are the four prices that rule pays out
+/// at, ordered so that `min` is the safe combinator — every check may only lower the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Autonomy {
+    /// Nobody may do this unattended, whatever else is true.
+    Never,
+    /// A person must LOOK. No machine oracle decides it — rendered UI, copy, taste, a schema
+    /// whose blast radius outruns what a test can see.
+    Look,
+    /// Build and verify unattended; a person presses to land.
+    Press,
+    /// Green means land it, with a receipt and an undo.
+    Land,
+}
+
+impl Autonomy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Autonomy::Never => "never",
+            Autonomy::Look => "must be seen",
+            Autonomy::Press => "needs a press",
+            Autonomy::Land => "lands on green",
+        }
+    }
+}
+
+/// Paths whose blast radius outruns any check a worker can run.
+///
+/// **Deliberately NOT added to `WORKER_DENY`, and the difference matters.** The deny-list forbids
+/// *editing*; this forbids *landing unattended*. A schema change is not work nobody may do — it is
+/// work nobody may merge while asleep, which is a checkpoint rather than a prohibition. Denying
+/// the wire contract outright would make a large class of approved work impossible to build at
+/// all, including work a human explicitly asked for; the honest control sits at the gate that
+/// ends the loop, not at the one that starts it.
+///
+/// `session.rs` is the same argument twice over: it holds the frame enums AND most of the daemon,
+/// so a file-level deny would ban ordinary work to reach a few type declarations.
+const SCHEMA_PATHS: &[&str] = &[
+    "protocol.ts",
+    "src/rover/protocol.ts",
+    "session.rs",
+    "sw.js",
+    "Cargo.toml",
+    "package.json",
+    "build.rs",
+    "Makefile",
+    ".envrc",
+];
+
+/// Lines whose removal means the verifier got weaker.
+const CHECK_MARKS: &[&str] = &["assert", "panic!", "[selfcheck]", "#[test]", ".expect("];
+
+/// Did this diff REMOVE or ALTER a check?
+///
+/// **The oracle is a file workers edit.** Mars grades a brief with `mars --selfcheck`, which is
+/// compiled from `src/main.rs` — and the one brief that ever ran end to end added 61 lines to that
+/// file. Mars already fixed the adjacent problem by running the verify commands itself rather than
+/// trusting a worker's account of them; that stops an agent writing down its own exit codes, and
+/// does nothing about an agent editing what the codes are testing.
+///
+/// Denying `main.rs` would be the wrong fix: adding a selfcheck beside a change is the house
+/// standard and should stay cheap. So the rule is about DIRECTION. Additions are free; a removal
+/// or a modification is never self-graded, and the specific lines go to a person.
+///
+/// A line removed and added back unchanged is a move, not a weakening — reindentation and block
+/// shuffling would otherwise flag every large diff and train everyone to ignore this.
+pub fn weakened_checks(diff: &str) -> Vec<String> {
+    let added: Vec<&str> = diff
+        .lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .map(|l| l[1..].trim())
+        .collect();
+    diff.lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .map(|l| l[1..].trim())
+        .filter(|l| CHECK_MARKS.iter().any(|m| l.contains(m)))
+        .filter(|l| !added.contains(l))
+        .map(str::to_string)
+        .collect()
+}
+
+/// What a classification decided, and why — because a refusal that does not say what to do about
+/// it is a button that does nothing for a reason nobody can see.
+#[derive(Clone, Debug)]
+pub struct Classified {
+    pub autonomy: Autonomy,
+    pub why: String,
+    /// The checks this diff removed, if any. Shown verbatim: the whole point is that a person
+    /// reads the actual lines rather than a claim about them.
+    pub weakened: Vec<String>,
+}
+
+/// Price a finished brief against reversibility, verifiability and blast radius.
+///
+/// **Demote-only, and that asymmetry is the safety property.** A model may propose a ceiling by
+/// writing one into the brief; this function may only lower it. The manager reads untrusted
+/// terminal output all day and section headers in that input are forgeable, so anything a model
+/// says about how safe its own work is has to be incapable of raising the limit.
+pub fn classify(proposed: Autonomy, changed: &[String], diff: &str, verify: &[String]) -> Classified {
+    let mut a = proposed;
+    let mut why = String::from("small, verified, and reversible");
+
+    let mut demote = |to: Autonomy, reason: &str, a: &mut Autonomy, why: &mut String| {
+        if to < *a {
+            *a = to;
+            *why = reason.to_string();
+        }
+    };
+
+    if verify.is_empty() {
+        demote(Autonomy::Look, "no verify: commands — nothing but a person can decide this", &mut a, &mut why);
+    }
+    if let Some(p) = changed.iter().find(|c| SCHEMA_PATHS.iter().any(|s| c.ends_with(s))) {
+        demote(Autonomy::Look, &format!("{p} is a wire contract or a file that executes without being run"), &mut a, &mut why);
+    }
+    // More than three files is the line the work model already draws for what earns a brief, and
+    // it draws it on blast radius. The same measure decides what may land unwatched.
+    if changed.len() > 3 {
+        demote(Autonomy::Press, &format!("{} files changed — wide enough to want a pair of eyes", changed.len()), &mut a, &mut why);
+    }
+    let weakened = weakened_checks(diff);
+    if !weakened.is_empty() {
+        demote(
+            Autonomy::Look,
+            &format!("{} check(s) removed or altered — the gate cannot be moved by the thing it gates", weakened.len()),
+            &mut a,
+            &mut why,
+        );
+    }
+    Classified { autonomy: a, why, weakened }
+}
+
+/// One git command, argv only, no shell — the same rule the verify path is built on, for the same
+/// reason. Every argument here is composed by this file rather than read from a brief.
+fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// What happened when we tried to end the loop.
+#[derive(Clone, Debug)]
+pub struct Landing {
+    pub merged: bool,
+    /// The merge commit, and the one command that takes it back.
+    pub undo: Option<String>,
+    pub why: String,
+    pub autonomy: Autonomy,
+    pub weakened: Vec<String>,
+}
+
+/// Land a reported brief, or say precisely why not.
+///
+/// **This is the only place in the system that makes a change nobody asked for at the moment it
+/// happens**, so every rule it enforces is one somebody has to be able to check afterwards:
+///
+/// * the work must be REPORTED and every criterion met — a tally, not an opinion;
+/// * a human must have left `approved.md` behind, and this cannot write one;
+/// * `verify:` must be green, run here rather than taken from the worker's account of itself;
+/// * the diff must price out at `Land` — small, reversible, no wire contract, no moved gate;
+/// * the tree must be clean, because merging over somebody's uncommitted work is not reversible
+///   in the way everything else here is.
+///
+/// **A merge, and not a push.** `--no-ff` so the whole brief is one commit to revert; local so the
+/// louder, public half stays a human act. The undo is printed rather than described, because an
+/// undo you have to look up is one you will not run in the ten seconds you have decided to spend.
+pub fn land(
+    b: &Brief,
+    brief_dir: &Path,
+    autopilot: bool,
+    timeout: std::time::Duration,
+) -> Landing {
+    let no = |why: String, a: Autonomy| Landing { merged: false, undo: None, why, autonomy: a, weakened: Vec::new() };
+
+    if state_of(brief_dir) != State::Reported {
+        return no("no completed.md — there is nothing reported to land".into(), Autonomy::Never);
+    }
+    if !is_approved(brief_dir) {
+        return no("no approved.md — nobody has said this may be built, and landing cannot say it".into(), Autonomy::Never);
+    }
+    let Some(repo) = b.repo.clone() else {
+        return no("the brief records no repo, so nothing can be merged or checked".into(), Autonomy::Never);
+    };
+    let branch = b.branch.clone().unwrap_or_else(|| b.id.clone());
+    if git(&repo, &["rev-parse", "--verify", &branch]).is_err() {
+        return no(format!("branch {branch} does not exist in {}", repo.display()), Autonomy::Never);
+    }
+
+    // TIER 0, RUN HERE. The worker's own account of its exit codes is a claim; this is the fact.
+    let a = audit(b, brief_dir, timeout);
+    // RED FIRST, BECAUSE RED IS THE CAUSE. A failing command marks every criterion it covers as
+    // unmet, so checking criteria first reports the symptom — "criteria [1] are not met" — for a
+    // brief whose actual problem is one named command that exited non-zero. Both are true and
+    // only one of them can be acted on.
+    if a.tier0.iter().any(|r| r.exit != Some(0)) {
+        let red: Vec<&str> = a.tier0.iter().filter(|r| r.exit != Some(0)).map(|r| r.cmd.as_str()).collect();
+        return no(format!("verify is not green: {}", red.join(" · ")), Autonomy::Press);
+    }
+    let unmet = a.unmet();
+    if !unmet.is_empty() {
+        return no(format!("criteria {unmet:?} are not met — supersede rather than land"), Autonomy::Press);
+    }
+
+    let changed: Vec<String> = git(&repo, &["diff", "--name-only", &format!("main...{branch}")])
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let diff = git(&repo, &["diff", &format!("main...{branch}")]).unwrap_or_default();
+    let c = classify(Autonomy::Land, &changed, &diff, &b.verify);
+    if c.autonomy < Autonomy::Land {
+        return Landing { merged: false, undo: None, why: c.why, autonomy: c.autonomy, weakened: c.weakened };
+    }
+    if !autopilot {
+        return no("policy.md has autopilot off — everything else about this says land it".into(), Autonomy::Land);
+    }
+    // A DIRTY TREE IS NOT A MERGE CONFLICT, it is somebody's unsaved work, and it is the one thing
+    // here a revert would not give back.
+    if !git(&repo, &["status", "--porcelain"]).unwrap_or_default().trim().is_empty() {
+        return no("the working tree has uncommitted changes — merging over them is the one thing revert cannot undo".into(), Autonomy::Land);
+    }
+    // THE WORKER LEAVES THE REPO ON ITS OWN BRANCH, so merging without moving first merges the
+    // branch into itself: git says "Already up to date", this reports a landing, and `main` never
+    // moved. Found by running a real worker end to end — every gate was green and nothing shipped.
+    //
+    // Checking out is safe here only because the tree was just proven clean, and it is where you
+    // want to be standing after a landing anyway. Once a brief builds in its own worktree this
+    // becomes a no-op, which is the right direction for it to age in.
+    let head = git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default().trim().to_string();
+    if head != "main" {
+        if let Err(e) = git(&repo, &["checkout", "main"]) {
+            return no(format!("on {head}, and checking out main failed: {e}"), Autonomy::Land);
+        }
+    }
+    // Captured AFTER the checkout: the undo has to restore main's head, and main's head is only
+    // knowable once we are on it.
+    let before = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default().trim().to_string();
+    if let Err(e) = git(&repo, &["merge", "--no-ff", "-m", &format!("Land {}: {}", b.id, b.title), &branch]) {
+        return no(format!("merge refused: {e}"), Autonomy::Land);
+    }
+    // A MERGE THAT CHANGED NOTHING IS NOT A LANDING. `git merge` succeeds and prints "Already up
+    // to date" when the branch is an ancestor, so an unchanged head is the signal that the work
+    // was already in, or that we merged the wrong thing.
+    if git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default().trim() == before {
+        return no(format!("merging {branch} into main changed nothing — it is already in"), Autonomy::Land);
+    }
+    let sha = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default().trim().to_string();
+    Landing {
+        merged: true,
+        undo: Some(if before.is_empty() {
+            format!("git -C {} revert -m 1 {sha}", repo.display())
+        } else {
+            format!("git -C {} reset --hard {before}", repo.display())
+        }),
+        why: format!("{} file(s), verify green, {} criteria met", changed.len(), a.tier1.len()),
+        autonomy: Autonomy::Land,
+        weakened: Vec::new(),
+    }
 }
 
 /// Mint the next brief from what this one did not finish.
@@ -1454,6 +1814,267 @@ pub fn draft_assignment(id: &str, home: &Path) -> Option<String> {
         briefs.join("PLANNING-MODEL.md").display(),
         briefs.join(id).join("brief.md").display(),
     ))
+}
+
+/// Something worth planning against, and the evidence it came from.
+///
+/// **`cite` is not optional and is why this type exists.** An idea with no citation is a wish, and
+/// a night shift that admits wishes fills the morning with confident work nobody asked for — the
+/// exact failure the corpus refuses under "missions are inferred, never asked". Every constructor
+/// below reads its citation off disk, so the cite names a file a reader can open rather than a
+/// claim the planner made about one.
+#[derive(Clone, Debug)]
+pub struct Observation {
+    pub headline: String,
+    pub cite: String,
+    pub body: String,
+    pub repo: Option<PathBuf>,
+}
+
+/// What the night shift has to plan against, gathered from what is already on disk.
+///
+/// Two sources, and neither of them is a model:
+///
+/// * **nominations** — memos carrying `kind: nomination`, which `nominate` writes with the
+///   snapshot it was read out of. The designed entry to the loop.
+/// * **`## Notes for later`** — what workers wrote down and were forbidden from acting on. The
+///   orders promise these are read by somebody; until now nothing read them, which makes the
+///   promise the same shape of lie as a permission with no parser.
+///
+/// `design_ideas/` is deliberately not a source. Those are visions, and `AGENTS.md` already warns
+/// they may be unbuilt or partly built — feeding a vision corpus to an autonomous builder produces
+/// confident work on premises nobody checked.
+pub fn observations() -> Vec<Observation> {
+    let mut out = Vec::new();
+    let Some(home) = crate::sys::paths::home_dir() else { return out };
+
+    // 1. Nominations, from every session's memo folder.
+    let sessions = home.join(".mars").join("sessions");
+    for sess in std::fs::read_dir(&sessions).into_iter().flatten().flatten() {
+        for memo in std::fs::read_dir(sess.path().join("memos")).into_iter().flatten().flatten() {
+            let Ok(text) = std::fs::read_to_string(memo.path()) else { continue };
+            let Some((front, body)) = crate::manager::split_front(&text) else { continue };
+            if !front.lines().any(|l| l.trim() == "kind: nomination") {
+                continue;
+            }
+            if front.lines().any(|l| l.trim() == "expired: true") {
+                continue;
+            }
+            let field = |k: &str| {
+                front.lines().find_map(|l| {
+                    l.trim().strip_prefix(&format!("{k}:")).map(|v| v.trim().trim_matches('"').to_string())
+                })
+            };
+            let cite = front
+                .lines()
+                .find(|l| l.trim().starts_with("- {snapshot:"))
+                .map(|l| l.trim().to_string())
+                .unwrap_or_else(|| memo.path().display().to_string());
+            out.push(Observation {
+                headline: field("headline").unwrap_or_else(|| field("title").unwrap_or_default()),
+                cite,
+                body: body.trim().to_string(),
+                repo: None,
+            });
+        }
+    }
+
+    // 2. Notes for later, from every report ever filed — live and archived.
+    let bdir = dir();
+    for root in bdir.iter().flat_map(|d| [d.clone(), d.join("archive")]) {
+        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            let bd = e.path();
+            let Ok(done) = std::fs::read_to_string(bd.join("completed.md")) else { continue };
+            let Some(notes) = section_after(&done, "## Notes for later") else { continue };
+            let repo = read(&bd).and_then(|b| b.repo);
+            for line in notes.lines().map(str::trim).filter(|l| l.starts_with('-') && l.len() > 4) {
+                out.push(Observation {
+                    headline: line.trim_start_matches(['-', ' ']).chars().take(90).collect(),
+                    cite: format!("{}/completed.md § Notes for later", bd.display()),
+                    body: line.to_string(),
+                    repo: repo.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The body of one `## ` section, to the next one.
+fn section_after(body: &str, heading: &str) -> Option<String> {
+    let start = body.find(heading)? + heading.len();
+    let rest = &body[start..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    Some(rest[..end].trim().to_string())
+}
+
+/// What the night shift estimated about a brief before anybody built it.
+///
+/// **Distinct from `classify`, and the difference is the whole point.** `classify` prices a real
+/// diff at landing time and is authoritative. This prices a brief's *declared intent* at planning
+/// time, from what it says it will touch — an estimate, used only to decide whether a thing is
+/// queued for tonight or written up and stored. Being wrong here costs an item sitting in the
+/// wrong pile until morning; being wrong at landing time costs a merge.
+///
+/// So this may only ever be more cautious than the real thing, and the real thing still runs.
+pub fn triage(b: &Brief, body: &str) -> Classified {
+    // TWO CHECKS, AND DELIBERATELY NOT A FILE COUNT.
+    //
+    // The first version counted anything file-shaped in the document and handed that to
+    // `classify`, whose `> 3 files` rule then fired on prose. Measured against five briefs a real
+    // planner wrote: all five came back "must be seen", and one reported **59 files changed** —
+    // a number counted out of an argument, shown to a human as if it were a fact.
+    //
+    // The count is not knowable here and `PLANNING-MODEL.md` says so about its own sizing rule:
+    // *"the file count cannot be known before the design exists — you cannot count files you have
+    // not decided to change."* An estimate dressed as a measurement is worse than no estimate, so
+    // blast radius is left to `classify`, at landing time, off the real diff.
+    //
+    // What IS knowable now: whether the brief declares an oracle, and whether the section that
+    // binds where files land names something whose blast radius outruns any check. Both are read
+    // off `## LLD` only — the evidence and the rejected options mention paths the work will never
+    // touch, and reading those as intent is what made every pile the same pile.
+    let lld = section_after(body, "## LLD").unwrap_or_default();
+    let touches: Vec<&str> = lld
+        .split(['`', ' ', '(', ')', ',', '\n'])
+        // Path-shaped, not merely dotted: `src/session.rs` is a path and "i.e." is not.
+        .filter(|w| w.contains('/') && w.contains('.') && w.len() > 4)
+        .collect();
+
+    if b.verify.is_empty() {
+        return Classified {
+            autonomy: Autonomy::Look,
+            why: "no verify: commands — nothing but a person can decide this".into(),
+            weakened: Vec::new(),
+        };
+    }
+    if let Some(p) = touches.iter().find(|c| SCHEMA_PATHS.iter().any(|s| c.ends_with(s))) {
+        return Classified {
+            autonomy: Autonomy::Look,
+            why: format!("its LLD puts work in {p} — a wire contract, or a file that executes without being run"),
+            weakened: Vec::new(),
+        };
+    }
+    Classified {
+        autonomy: Autonomy::Land,
+        why: "declares a check and names nothing protected — blast radius is decided by the diff".into(),
+        weakened: Vec::new(),
+    }
+}
+
+/// Draft one brief from one observation, with a real planner.
+///
+/// **The daemon mints and the planner fills**, exactly as the pane flow does — an agent told to
+/// "write a brief" chooses its own path and produces a file nothing downstream can find. Here the
+/// file exists, scoped, before the model is started.
+///
+/// Headless `-p` rather than a pane: a night shift has no pane to take, and the planner's whole
+/// output is one file. The scope is the same one the interactive planner gets, so the role's
+/// boundary is one list rather than two that will drift.
+pub fn plan_one(obs: &Observation, repo: Option<&Path>, ts: u64, model: &str) -> std::io::Result<String> {
+    let home = crate::sys::paths::home_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    // `create` hands back the path to brief.md, not the directory that holds it. Reading
+    // `dir/brief.md` against that gives `…/brief.md/brief.md`, which is never there — so every
+    // planner run reported "wrote nothing readable" AFTER the model had already spent nine
+    // minutes writing a perfectly good brief, and the cleanup that follows silently did nothing
+    // because `remove_dir_all` on a file fails. Measured: five briefs drafted, five recorded as
+    // failures, five scaffolds left behind.
+    let (id, brief_path) = create(&obs.headline, ts, repo)?;
+    let dir = brief_path.parent().unwrap_or(&brief_path).to_path_buf();
+    let assignment = draft_assignment(&id, &home)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad id"))?;
+    // THE OBSERVATION IS HANDED OVER AS EVIDENCE, WITH ITS CITE. `## Problem + evidence` binds the
+    // worker as "what is true", so the planner is told where this came from and told to check it —
+    // a brief whose premise turns out to be wrong costs a whole worker run.
+    let prompt = format!(
+        "{assignment}\n\nThe observation you are planning against, and its provenance:\n\n\
+         HEADLINE: {}\n  CITED: {}\n\n{}\n\n\
+         Open the cited evidence before you write anything. If the premise does not survive \
+         reading the code, say so in `## Problem + evidence` and stop — that is the most valuable \
+         brief you can write.",
+        obs.headline, obs.cite, obs.body,
+    );
+    let mut cmd = std::process::Command::new("claude");
+    cmd.current_dir(repo.unwrap_or(&home))
+        // Same reason the manager scrubs these: a key here bypasses the subscription and fails
+        // outright when it has no credit.
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .arg("-p")
+        .arg(&prompt)
+        .arg("--permission-mode")
+        .arg("acceptEdits")
+        .arg("--add-dir")
+        .arg(home.join(".mars").join("briefs"));
+    for a in PLANNER_ALLOW {
+        cmd.arg("--allowedTools").arg(a);
+    }
+    for p in planner_deny() {
+        cmd.arg("--disallowedTools").arg(format!("Edit({p})")).arg(format!("Write({p})"));
+    }
+    // The hardest job in the system reads code and rules six forks, and a wrong premise costs a
+    // whole worker run — so this is the one role that gets the better model.
+    cmd.arg("--model").arg(model).arg("--effort").arg("high");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = cmd.output()?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(std::io::Error::other(format!(
+            "planner exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    // DID IT ACTUALLY WRITE ONE? An empty brief in the queue every time a planner run fails is
+    // how the morning list fills with nothing, and the scaffold looks identical to a real brief
+    // until somebody opens it.
+    let Some(b) = read(&dir) else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(std::io::Error::other("planner wrote nothing readable"));
+    };
+    // AN UNFILLED SCAFFOLD PARSES AS A COMPLETE BRIEF, which is the trap here. The template ships
+    // with all six headings and an `Option C ✅ chosen` placeholder, so `decisions_of` reports six
+    // ruled decisions for a file the planner never touched — found by pointing this at a real run
+    // and reading what landed. Counting decisions cannot tell a brief from its own stationery.
+    //
+    // So the test is for the stationery. These strings exist only in `template()`; a brief that
+    // still carries one is a brief nobody wrote, and it must not reach the morning list looking
+    // like work.
+    let body_now = std::fs::read_to_string(dir.join("brief.md")).unwrap_or_default();
+    const SCAFFOLD: &[&str] = &["<the question>", "BINDING. ONE paragraph", "BINDING. Exact paths"];
+    if let Some(marker) = SCAFFOLD.iter().find(|m| body_now.contains(**m)) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(std::io::Error::other(format!(
+            "planner left the scaffold unfilled (still contains {marker:?}) — an empty brief in the queue is worse than none"
+        )));
+    }
+    if decisions_of(&dir).is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(std::io::Error::other("planner left no ruled decisions — a brief with no forks is a wish"));
+    }
+    if b.verify.is_empty() {
+        // Not fatal — `unverifiable` is a first-class outcome and some work genuinely has no
+        // machine oracle. But it decides the pile, so it is recorded rather than shrugged at.
+        let _ = std::fs::write(dir.join("no-oracle"), "");
+    }
+    // The deterministic second reader, and the plan-time estimate. Both written beside the brief
+    // so the morning list is a directory read rather than a recomputation.
+    let _ = review(&dir);
+    let body = std::fs::read_to_string(dir.join("brief.md")).unwrap_or_default();
+    let t = triage(&b, &body);
+    let _ = std::fs::write(
+        dir.join("triage.md"),
+        format!(
+            "---\nautonomy: {}\ncited: \"{}\"\n---\n# Triage\n\n{}\n\n\
+             An estimate from what the brief SAYS it will touch, made before anything was built. \
+             The diff decides at landing time and may only be more cautious than this.\n",
+            t.autonomy.label(), obs.cite.replace('"', "'"), t.why
+        ),
+    );
+    Ok(id)
 }
 
 /// The command that starts a pane as a planner.
