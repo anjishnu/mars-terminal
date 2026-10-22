@@ -13,8 +13,10 @@ use crate::worklog::now_secs;
 
 /// One host you've connected to — the home machine's view of the fleet.
 /// `session` / `last_status` are refreshed by the broker's status push (every
-/// brokered agent call self-reports host + session); `cwd` is recorded by
-/// `mars ssh`.
+/// brokered agent call self-reports host + session). `cwd` is **unpopulated**:
+/// every call site passes `None`, so nothing records a remote's working
+/// directory and `mars ls` shows `—` in its `DIR` column for a host. The field
+/// is kept for the day `mars ssh` learns to report one.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct FleetEntry {
     pub host: String,
