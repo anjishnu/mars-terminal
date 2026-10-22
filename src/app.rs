@@ -190,6 +190,8 @@ pub struct RoverSummary {
     pub text: String,
     pub tail_hash: u64,
     pub provider: String,
+    /// Triage couldn't settle this tail, so a model look is worth paying for.
+    pub ambiguous: bool,
 }
 
 /// Stable hash of a string — the incremental key for the Rover map/reduce (only
@@ -579,7 +581,7 @@ pub struct App {
     pub rover_summaries: HashMap<TermId, RoverSummary>,
     /// The (TermId, tail_hash) currently out to the model, so the landing result
     /// is stored against the tail it was actually computed from.
-    rover_map_inflight: Option<(TermId, u64)>,
+    pub(crate) rover_map_inflight: Option<(TermId, u64)>,
     /// What each board pane is actually RUNNING (`claude`, `cargo`, …), sampled.
     ///
     /// Mars has always been able to answer this — `Terminal::foreground_command()` asks the PTY's
@@ -6550,7 +6552,7 @@ impl App {
                             hash_str(&self.terminal_tail(term_id, self.tuning.agent_scrollback_context))
                         }
                     };
-                    self.rover_summaries.insert(term_id, RoverSummary { text, tail_hash: hash, provider });
+                    self.rover_summaries.insert(term_id, RoverSummary { text, tail_hash: hash, provider, ambiguous: false });
                     self.rover_map_failed.remove(&term_id); // recovered — clear the back-off
                     self.needs_redraw = true;
                 }
@@ -7438,6 +7440,7 @@ impl App {
                 text: tri.text,
                 tail_hash: hash,
                 provider: "tier-0".into(),
+                ambiguous: tri.ambiguous,
             });
         }
         // Everything below spends tokens, so it answers to ATTENTION rather than readership: an
@@ -7460,8 +7463,10 @@ impl App {
             let stale = self
                 .rover_summaries
                 .get(&id)
-                .map(|s| s.provider == "tier-0")
+                .map(|s| s.provider == "tier-0" && s.ambiguous)
                 .unwrap_or(false);
+            // A tail triage already settled (blocked on a prompt, visibly progressing, a clean
+            // exit) is answered; a model rewording it was most of this host's traffic.
             if !stale {
                 continue;
             }
@@ -7668,6 +7673,37 @@ impl App {
         String::new()
     }
 
+    /// A name read off what the panes already are, so naming needs no model: a Claude Code
+    /// conversation's own title (tabs only — a session outlives any one conversation), else the
+    /// folder a terminal started in, else an open file's name. `None` when none says anything.
+    fn derived_name(&self, panes: &[PaneId], titles: bool) -> Option<String> {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        panes
+            .iter()
+            .find_map(|pid| match &self.panes.get(pid)?.content {
+                PaneContent::Terminal(t) => {
+                    let term = self.terms.get(t)?;
+                    let cwd = term.spawn_cwd.as_ref().filter(|c| Some(*c) != home.as_ref());
+                    let title = titles
+                        .then(|| term.foreground_pid())
+                        .flatten()
+                        .and_then(|p| {
+                            let dir = term.spawn_cwd.as_ref().map(|c| c.display().to_string());
+                            crate::session::claude_session_of_pub(p, &dir.unwrap_or_default())
+                        })
+                        .and_then(|c| crate::conv::transcript_for(&c))
+                        .map(|p| crate::timeline::title_of(&p))
+                        .filter(|t| !t.is_empty());
+                    title.or_else(|| Some(cwd?.file_name()?.to_string_lossy().into_owned()))
+                }
+                PaneContent::Editor(b) => {
+                    Some(self.buffers.get(b)?.path.as_ref()?.file_stem()?.to_string_lossy().into_owned())
+                }
+            })
+            .map(|n| agent::kebab(&n))
+            .filter(|n| !n.is_empty())
+    }
+
     /// One-shot AI naming of a still-numeric session (numbered → AI → explicit).
     fn maybe_auto_name_session(&mut self) {
         if self.tuning.auto_name_secs == 0 || !self.session_name_attempt.ready(self.frame_tick) {
@@ -7685,6 +7721,14 @@ impl App {
         // Give it a little longer than tab-naming so there's real activity.
         let ticks = (self.tuning.auto_name_secs * 2 * 1000 / self.tuning.poll_interval_ms.max(1)).max(1);
         if self.frame_tick % ticks != 0 || self.bg_busy {
+            return;
+        }
+        let all: Vec<PaneId> = self.tabs.iter().flat_map(|t| t.layout.pane_ids()).collect();
+        if let Some(name) = self.derived_name(&all, false) {
+            self.session_name_attempt.succeeded();
+            if crate::session::validate_session_name(&name).is_ok() {
+                self.session_name_suggestion = Some(name);
+            }
             return;
         }
         let cfg = agent::AgentConfig::from_env();
@@ -7729,6 +7773,14 @@ impl App {
             }
         });
         if !has_content {
+            return;
+        }
+        let mut panes = self.tab().layout.pane_ids();
+        let focused = self.focused_pane_id();
+        panes.sort_by_key(|p| *p != focused);
+        if let Some(name) = self.derived_name(&panes, true) {
+            self.auto_name_attempts.entry(tab_id).or_default().succeeded();
+            self.tab_name_suggestion.insert(tab_id, name);
             return;
         }
         let cfg = agent::AgentConfig::from_env();

@@ -2328,6 +2328,10 @@ fn scaffold_docs(repo: &Path) -> Result<()> {
     seed(&repo.join("docs/tools.md"), include_str!("manager_docs/tools.md"))?;
     seed(&repo.join("policy.md"), include_str!("manager_docs/policy.md"))?;
     seed(
+        &repo.join(".claude/skills/manage-task-to-completion/SKILL.md"),
+        include_str!("manager_docs/skills/manage-task-to-completion/SKILL.md"),
+    )?;
+    seed(
         &repo.join("memory/beliefs.md"),
         "# Beliefs\n\nRead this first. Revised, never appended. Under 200 lines.\n\n\
          ## Where things are\n\n\

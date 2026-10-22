@@ -131,7 +131,7 @@ pub fn provenance(cfg: &AgentConfig) -> String {
 }
 
 /// Kebab-case, ≤16 chars, alnum+dash — shared by tab/session auto-naming.
-fn kebab(text: &str) -> String {
+pub(crate) fn kebab(text: &str) -> String {
     let s: String = text
         .trim()
         .to_lowercase()
@@ -298,7 +298,7 @@ fn provider_chain() -> Vec<Provider> {
         (k, tag, url.to_string(), model.to_string())
     };
     if let Ok(k) = env_var("LLM_KEY") {
-        chain.push(p(k, "custom", "https://api.groq.com/openai/v1", "llama-3.1-8b-instant"));
+        chain.push(p(k, "custom", "https://api.groq.com/openai/v1", "openai/gpt-oss-20b"));
     }
     // Enterprise gateways win over consumer keys — a box deliberately configured
     // for Bedrock/Azure means to use it. Bearer/api-key auth only (no SigV4).
@@ -345,7 +345,7 @@ fn provider_chain() -> Vec<Provider> {
         // Llama-3.3-70B-versatile: a live, non-reasoning default on Groq's fast
         // free tier. (This is the fallback for any task the ring doesn't map — so
         // it must be a currently-served model; Groq retires open models often.)
-        chain.push(p(k, "groq", "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"));
+        chain.push(p(k, "groq", "https://api.groq.com/openai/v1", "openai/gpt-oss-120b"));
     }
     if let Ok(k) = std::env::var("GEMINI_API_KEY").or_else(|_| std::env::var("GOOGLE_API_KEY")) {
         // Flash-Lite: cheapest + highest free-tier limits. (Pinned dated
@@ -434,7 +434,7 @@ impl AgentConfig {
                 String::new(),
                 "none",
                 "https://api.groq.com/openai/v1".to_string(),
-                "llama-3.1-8b-instant".to_string(),
+                "openai/gpt-oss-20b".to_string(),
             ));
 
         // Explicit URL/model overrides apply to any provider.
@@ -460,7 +460,7 @@ impl AgentConfig {
             crate::integration::Path::Groq => AgentConfig {
                 url: "https://api.groq.com/openai/v1".to_string(),
                 key: crate::integration::groq_key().unwrap_or_default(),
-                model: env_var("LLM_MODEL").unwrap_or_else(|_| "llama-3.3-70b-versatile".to_string()),
+                model: env_var("LLM_MODEL").unwrap_or_else(|_| "openai/gpt-oss-120b".to_string()),
                 provider: "groq",
                 max_tokens: 512,
                 temperature: 0.3,
