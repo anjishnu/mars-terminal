@@ -4387,7 +4387,7 @@ fn claude_can_run() -> Check {
     // `auth status` answers "is this machine signed in" without spending a model turn; the
     // manager's own first turn is what proves the plan has usage left.
     let out = std::process::Command::new("env")
-        .args(["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "claude", "auth", "status", "--json"])
+        .args(["-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN", "claude", "auth", "status"])
         .output();
     let signed_in = |o: &std::process::Output| {
         serde_json::from_slice::<serde_json::Value>(&o.stdout)
