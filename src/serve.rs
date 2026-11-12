@@ -264,7 +264,7 @@ pub fn build_pair_link_all(session: &str, reach: Reach<'_>, all: bool) -> Result
     let (page, endpoint) = match reach {
         Reach::Tunnel { base, route } => (
             format!("https://mars-terminal.lovable.app/{route}"),
-            format!("{}/ws", base.replacen("https://", "wss://", 1)),
+            ws_endpoint(base),
         ),
         Reach::Lan { ip } => {
             let port = default_port();
@@ -929,7 +929,7 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
         keep_attached(api, port, session.clone(), base.clone());
     }
     let app_url = pair_link(&session, &base, "rover")?;
-    let endpoint = format!("{}/ws", base.replacen("https://", "wss://", 1));
+    let endpoint = ws_endpoint(&base);
 
     // Prove the path before showing a QR. A QR that cannot work is worse than an error: it moves
     // the failure onto a device with no diagnostics.
@@ -938,7 +938,9 @@ pub fn serve_main(session_arg: Option<String>) -> Result<()> {
     // the earliest possible moment, tests the tunnel at exactly the instant it is least likely to
     // answer.
     let https = endpoint.replacen("wss://", "https://", 1);
-    let mut checked = verify_public(&https);
+    // A direct bridge has no tunnel to probe: its address was handed to it by whoever runs the
+    // machine, and from inside the machine that address is often not reachable at all.
+    let mut checked = if direct_base().is_some() { Vec::new() } else { verify_public(&https) };
     for attempt in 1..=4 {
         if !checked.iter().any(|c| c.failed()) {
             break;
@@ -1933,7 +1935,38 @@ pub fn reset_main(session_arg: Option<String>) -> Result<()> {
 /// If a domain is pinned (`--domain`, or `MARS_NGROK_DOMAIN`), we pin the tunnel to it with
 /// `--url`, so the public URL — and therefore the paired phone's stored endpoint and the QR — stay
 /// identical across every restart.
+/// Set to the base URL this bridge is already reachable at — `https://box-8787.example.dev`, or
+/// `http://127.0.0.1:8787` on the machine itself. With it set Mars starts NO tunnel.
+///
+/// A hosted machine is given a public address by its provider, so a tunnel there is a second
+/// route to a door that is already open, plus an account nobody should have to create. The
+/// pairing token is unchanged: the address was never the lock.
+pub const DIRECT_ENV: &str = "MARS_BRIDGE_BASE";
+
+pub fn direct_base() -> Option<String> {
+    let b = std::env::var(DIRECT_ENV).ok()?;
+    let b = b.trim().trim_end_matches('/');
+    (b.starts_with("https://") || b.starts_with("http://")).then(|| b.to_string())
+}
+
+/// The WebSocket address for a base URL, keeping its security: `https` → `wss`, `http` → `ws`.
+pub fn ws_endpoint(base: &str) -> String {
+    let b = base.trim_end_matches('/');
+    let b = if let Some(rest) = b.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = b.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        b.to_string()
+    };
+    format!("{b}/ws")
+}
+
 fn start_tunnel(local_port: u16) -> Result<(Option<std::process::Child>, String, Option<String>)> {
+    if let Some(base) = direct_base() {
+        crate::session::debug_log(&format!("[rover] direct bridge at {base} — no tunnel"));
+        return Ok((None, base, None));
+    }
     // ADOPT before spawning. A bridge that died (or exec-replaced itself) can leave its ngrok
     // child running with the tunnel intact — in which case a fresh spawn collides with it, which
     // serially killed every bridge restart one night. If a live agent already fronts a tunnel TO

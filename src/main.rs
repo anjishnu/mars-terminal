@@ -10695,6 +10695,21 @@ fi
         println!("[selfcheck] rover: an unwatched board is enriched free, never paid ... PASS");
     }
 
+    #[cfg(feature = "web")]
+    {
+        // A hosted machine is handed a public address by its provider. The bridge must keep
+        // that address's security when it turns it into a socket address, and must refuse
+        // anything that is not a web address at all.
+        assert_eq!(serve::ws_endpoint("https://box-8787.example.dev/"), "wss://box-8787.example.dev/ws");
+        assert_eq!(serve::ws_endpoint("http://127.0.0.1:8791"), "ws://127.0.0.1:8791/ws");
+        std::env::set_var(serve::DIRECT_ENV, "ftp://nope");
+        assert!(serve::direct_base().is_none(), "a base that is not http(s) was accepted");
+        std::env::set_var(serve::DIRECT_ENV, " https://box.example.dev/ ");
+        assert_eq!(serve::direct_base().as_deref(), Some("https://box.example.dev"));
+        std::env::remove_var(serve::DIRECT_ENV);
+        println!("[selfcheck] rover: a direct bridge keeps its address's security and starts no tunnel ... PASS");
+    }
+
     let _ = std::fs::remove_file(&worklog_default);
     std::env::remove_var("MARS_WORKLOG");
 
