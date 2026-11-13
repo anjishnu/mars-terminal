@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.7.5
+
+A machine that already has a public address can serve Rover with no tunnel, and a session that
+is stopped without warning comes back with the workspaces it had.
+
+### Added
+
+- **`MARS_BRIDGE_BASE` serves the Rover bridge with no tunnel.** A hosted machine is given a
+  public address by its provider, so starting ngrok there added a second route and an account
+  nobody should need. Set it to that address (`https://…`, or `http://127.0.0.1:8787` on the
+  machine itself) and `mars pair` binds its port and starts no tunnel. The pairing token is
+  unchanged. Pairing links now keep the address's own security: `https` gives `wss`, `http`
+  gives `ws`.
+
+### Fixed
+
+- **A workspace opened just before a hard stop did not come back.** The backup of a session's
+  workspaces was written once a minute, so a session removed without warning (a hosted machine
+  put to sleep, a laptop losing power) lost anything opened since the last write. Opening,
+  closing and naming a workspace now write it at once.
+
+## 0.7.4
 
 `mars pair` next to a service that already runs ngrok. 0.7.3 stopped the
 bridge adopting that service's tunnel, but the bridge then always started an
