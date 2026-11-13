@@ -2101,6 +2101,15 @@ fn seed(path: &Path, body: &str) -> Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d)?;
     }
+    // A superseded doc may be locked read-only (`lock_orders`): Mars upgrading its own orders is
+    // not the agent rewriting them, so the lock is lifted for the write and restored at the next turn.
+    #[cfg(unix)]
+    if let Ok(m) = std::fs::metadata(path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = m.permissions();
+        perms.set_mode(perms.mode() | 0o200);
+        let _ = std::fs::set_permissions(path, perms);
+    }
     std::fs::write(path, body)?;
     Ok(())
 }
@@ -3152,6 +3161,8 @@ pub fn run_once(ts: u64, force: bool) -> Result<String> {
              note will repeat; to silence it:  echo {h} >> ~/.mars/manager.approved"
         );
     }
+    // The same lock the scheduled turn takes: `run.sh`'s deny list is Claude Code's, this is not.
+    lock_orders(&repo);
     println!("running batch {name} …");
     let started = std::time::Instant::now();
     let out = std::process::Command::new("sh")
@@ -3220,6 +3231,31 @@ pub fn write_captain_note(session: &str, title: &str, body: &str) -> anyhow::Res
 /// `policy.md` is deliberately absent: it grants autonomy and is the human's to edit, so drift
 /// there is expected and gating on it would nag forever. It is protected the other way — the
 /// runner denies the agent the tool to write it.
+/// THE ORDERS ARE READ-ONLY BEFORE EVERY TURN, whichever agent takes it.
+///
+/// `run.sh` forbids the agent from editing its own instructions, but only `mars manager run` goes
+/// through `run.sh`: the turn the daemon types every twenty minutes did not, so on the turn that
+/// actually runs, nothing stopped the manager rewriting the orders it would read next time. A
+/// deny list is also a Claude Code feature; pi and most other agents have none. Taking away the
+/// write permission works for all of them, because their file tools write as the user and do not
+/// change permissions. A person can still edit the files: their editor will ask, or `chmod u+w`.
+pub fn lock_orders(repo: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for rel in GUARDED_DOCS.iter().map(|(r, _)| *r).chain(["run.sh"]) {
+            let p = repo.join(rel);
+            if let Ok(m) = std::fs::metadata(&p) {
+                let mut perms = m.permissions();
+                perms.set_mode(perms.mode() & !0o222);
+                let _ = std::fs::set_permissions(&p, perms);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = repo;
+}
+
 pub const GUARDED_DOCS: &[(&str, &str)] = &[
     ("AGENTS.md", include_str!("manager_docs/AGENTS.md")),
     ("prompt.md", include_str!("manager_docs/prompt.md")),
@@ -4469,4 +4505,42 @@ pub fn goals_json() -> serde_json::Value {
 
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn orders_are_read_only_before_a_turn_and_mars_can_still_upgrade_them() {
+        let repo = std::env::temp_dir().join(format!("mars-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        for (rel, body) in GUARDED_DOCS {
+            std::fs::write(repo.join(rel), body).unwrap();
+        }
+        std::fs::write(repo.join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(repo.join("notes.md"), "the agent's own\n").unwrap();
+
+        lock_orders(&repo);
+        let writable = |rel: &str| std::fs::metadata(repo.join(rel)).unwrap().permissions().mode() & 0o222 != 0;
+        for (rel, _) in GUARDED_DOCS {
+            assert!(!writable(rel), "{rel} is still writable");
+            assert!(std::fs::write(repo.join(rel), "rewritten").is_err(), "{rel} could be rewritten");
+        }
+        assert!(!writable("run.sh"));
+        // Only the orders: the agent's own files stay its to write.
+        assert!(writable("notes.md"));
+
+        // Mars upgrading a superseded doc is not the agent rewriting it.
+        let (rel, _) = GUARDED_DOCS[0];
+        let target = repo.join(rel);
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&target, perms).unwrap();
+        seed(&target, "<!-- mars-doc-version: 999999 -->\nnew orders").unwrap();
+        assert!(std::fs::read_to_string(&target).unwrap().contains("new orders"));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 }
