@@ -1453,6 +1453,8 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
     // listening: the whole point of an ambient layer is that the cards already exist when
     // somebody finally looks.
     let mut last_manager: Option<std::time::Instant> = None;
+    // What the last written backup looked like, so a change can be seen the moment it happens.
+    let mut last_shape_sig: Vec<(crate::tab::TabId, String)> = Vec::new();
     // Per-pane read cursor into the terminal's line log, so each snapshot carries what is NEW.
     // In memory deliberately: a daemon restart just means the first snapshot has a tail and no
     // delta, which is the honest answer — we genuinely did not watch that stretch.
@@ -1930,6 +1932,28 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
+        // WRITE THE BACKUP THE MOMENT THE SHAPE CHANGES, not only on the tick.
+        //
+        // The tick is a minute apart, and a session can be removed with no warning at all — a
+        // hosted machine put to sleep, a laptop losing power. A workspace opened ten seconds
+        // before that was simply not in the manifest, so it did not come back. Opening, closing
+        // and naming a workspace are rare, so writing on each one costs nothing; the tick still
+        // runs and keeps the slower-moving facts (is an agent running, which conversation) fresh.
+        let shape_sig: Vec<(crate::tab::TabId, String)> =
+            app.tabs.iter().filter(|t| !t.hidden).map(|t| (t.id, t.name.clone())).collect();
+        if shape_sig != last_shape_sig {
+            last_shape_sig = shape_sig;
+            let shape = restore_shape(&app);
+            let agents_now = shape.iter().filter(|p| p.agent).count();
+            // The same hold the tick honours: while a restore is still bringing agents back, the
+            // manifest being restored FROM must not be replaced by a picture of the attempt.
+            if !restore_hold(&mut app.restore_promise, agents_now, crate::worklog::now_secs()) {
+                if let Some(n) = app.session_name.as_deref() {
+                    write_restore(n, &shape);
+                }
+            }
+        }
+
         // Refresh ~/.mars/manager. Deliberately fed from `mobile_board_json()` — the exact
         // bytes the phone sees — so the manager can never describe a world Rover does not
         // show. Failures are ignored: a full disk must not take the session down.
@@ -2015,33 +2039,7 @@ pub fn server_main(name: &str, file: Option<String>) -> Result<()> {
                 // The session's shape, refreshed on the same tick as the snapshot. A reboot reads
                 // this to come back as itself; writing it here rather than on shutdown means a
                 // daemon that is killed outright still leaves one behind.
-                let shape: Vec<RestoredPane> = app
-                    .tabs
-                    .iter()
-                    .filter(|t| !t.hidden)
-                    .filter_map(|t| {
-                        let pid = t.focused_pane;
-                        let crate::pane::PaneContent::Terminal(tid) =
-                            app.panes.get(&pid)?.content else { return None };
-                        let term = app.terms.get(&tid)?;
-                        let cwd = term.spawn_cwd.as_ref()?.display().to_string();
-                        // Was a coding agent running here? Ask the process table for the pane's
-                        // foreground command — `last_command` only knows what MARS typed, so a
-                        // `claude` the engineer started by hand is invisible to it.
-                        let agent = term.foreground_command().as_deref() == Some("claude");
-                        // The conversation id, while the process is still alive to be asked. After
-                        // the reboot there is nothing left to ask.
-                        let chat = agent
-                            .then(|| term.foreground_pid().and_then(|p| claude_session_of(p, &cwd)))
-                            .flatten();
-                        // Only a name a PERSON set. `settle()` marks a tab as manually named —
-                        // the same flag that stops auto-naming from overwriting it here — so the
-                        // two agree about what "named" means instead of guessing from the string.
-                        let named = app.tab_manually_named(t.id);
-                        let name = named.then(|| t.name.clone()).filter(|n| !n.is_empty());
-                        Some(RestoredPane { wid: term.wid.clone(), cwd, agent, chat, name })
-                    })
-                    .collect();
+                let shape = restore_shape(&app);
                 let agents_now = shape.iter().filter(|p| p.agent).count();
                 if !restore_hold(&mut app.restore_promise, agents_now, now) {
                     if let Some(n) = app.session_name.as_deref() {
@@ -2946,6 +2944,41 @@ fn claude_session_of(pid: i32, cwd: &str) -> Option<String> {
     }
     let id = find(&roster, &want)?;
     conversation_belongs(&id, None, cwd).then_some(id)
+}
+
+/// The session's shape right now: one entry per visible terminal workspace, in tab order.
+///
+/// One function because there are two moments it is wanted — the manager's tick, and the
+/// instant the shape changes — and two copies of "what counts as a workspace worth restoring"
+/// would drift apart the first time one of them learned something new.
+fn restore_shape(app: &App) -> Vec<RestoredPane> {
+    app
+        .tabs
+        .iter()
+        .filter(|t| !t.hidden)
+        .filter_map(|t| {
+            let pid = t.focused_pane;
+            let crate::pane::PaneContent::Terminal(tid) =
+                app.panes.get(&pid)?.content else { return None };
+            let term = app.terms.get(&tid)?;
+            let cwd = term.spawn_cwd.as_ref()?.display().to_string();
+            // Was a coding agent running here? Ask the process table for the pane's
+            // foreground command — `last_command` only knows what MARS typed, so a
+            // `claude` the engineer started by hand is invisible to it.
+            let agent = term.foreground_command().as_deref() == Some("claude");
+            // The conversation id, while the process is still alive to be asked. After
+            // the reboot there is nothing left to ask.
+            let chat = agent
+                .then(|| term.foreground_pid().and_then(|p| claude_session_of(p, &cwd)))
+                .flatten();
+            // Only a name a PERSON set. `settle()` marks a tab as manually named —
+            // the same flag that stops auto-naming from overwriting it here — so the
+            // two agree about what "named" means instead of guessing from the string.
+            let named = app.tab_manually_named(t.id);
+            let name = named.then(|| t.name.clone()).filter(|n| !n.is_empty());
+            Some(RestoredPane { wid: term.wid.clone(), cwd, agent, chat, name })
+        })
+        .collect()
 }
 
 /// Whether the restore manifest is still read-only: a reboot promised `want` agent panes and
