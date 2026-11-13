@@ -3367,16 +3367,10 @@ pub struct Notification {
 }
 
 /// The commands that mean a person is the bottleneck. A shell sitting at a prompt is idle; an
-/// agent sitting at a prompt is waiting for you, and only the second is worth a buzz.
-const INTERACTIVE_AGENTS: [&str; 5] = ["claude", "codex", "aider", "cursor-agent", "gemini"];
-
+/// agent sitting at a prompt is waiting for you, and only the second is worth a buzz. Which names
+/// are agents is `agents.rs`'s table, so a new agent is added in one place.
 fn is_agent(cmd: Option<&str>) -> bool {
-    cmd.map(|c| {
-        let base = c.rsplit('/').next().unwrap_or(c);
-        let word = base.split_whitespace().next().unwrap_or(base);
-        INTERACTIVE_AGENTS.contains(&word)
-    })
-    .unwrap_or(false)
+    cmd.map(crate::agents::is_agent_name).unwrap_or(false)
 }
 
 /// Have we already spent the interrupts this hour, or this day, allows?

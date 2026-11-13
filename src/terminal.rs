@@ -199,6 +199,14 @@ pub fn new_wid(cwd: Option<&std::path::Path>) -> String {
     )
 }
 
+/// A program's report of its own state; see `osc133.rs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramStatus {
+    pub state: String,
+    pub kind: Option<String>,
+    pub at: Instant,
+}
+
 pub struct Term {
     /// This workspace's DURABLE identity: `<unix-secs>-<directory>`, minted once when the shell is
     /// spawned and carried across a reboot in `restore.json`.
@@ -244,6 +252,9 @@ pub struct Term {
     /// loop to drain and forward as `{t:"output"}` deltas. Off (and free) otherwise.
     raw_tap: Arc<Mutex<Vec<u8>>>,
     raw_tap_on: Arc<AtomicBool>,
+    /// The last state a program in this pane reported for itself (OSC 7501), with when. `None`
+    /// until one does: most programs never will, and their panes are judged as before.
+    program_status: Arc<Mutex<Option<ProgramStatus>>>,
     /// A rolling window of raw PTY bytes, appended ALWAYS. vt100's scrollback cannot be the
     /// source of history for the phone: reflowing the pane to the phone's grid resizes the
     /// parser, which discards its scrollback — so watching destroyed the very history we were
@@ -298,6 +309,10 @@ pub fn spawn(
     if let Some(id) = session_instance_id {
         cmd.env("MARS_SESSION_ID", id);
     }
+    // Ask agents that can report their state (OSC 7501) to do so without first asking whether
+    // the terminal understands: Mars does, and this way nothing has to be written back into the
+    // pane to say so. pi reads this; programs that do not know it ignore it.
+    cmd.env("PI_PROGRAM_STATUS", "1");
     let mut child = pair.slave.spawn_command(cmd)?;
     let shell_pid = child.process_id();
     // Drop our slave copy; child-process exit is tracked separately because
@@ -322,6 +337,8 @@ pub fn spawn(
     let reader_raw_tap_on = raw_tap_on.clone();
     let reader_raw_history = raw_history.clone();
     let reader_line_log = line_log.clone();
+    let program_status = Arc::new(Mutex::new(None::<ProgramStatus>));
+    let reader_status = program_status.clone();
     let output_tx = tx.clone();
     // Captured for the OSC-133 ledger: exact command records are keyed by session
     // (skipped in standalone mode, which has no session log). The surface label is
@@ -359,17 +376,25 @@ pub fn spawn(
                             tap.extend_from_slice(&buf[..n]);
                         }
                     }
-                    if let Some(sess) = &ledger_session {
-                        for ev in osc.feed(&buf[..n]) {
-                            match ev {
-                                crate::osc133::CmdEvent::Start => cmd_started = Some(Instant::now()),
-                                crate::osc133::CmdEvent::End { command, cwd, exit } => {
-                                    let dur = cmd_started.take().map(|t| t.elapsed().as_secs());
+                    // Scanned always: status reports matter in standalone mode too. The ledger
+                    // records still need a session, as before.
+                    for ev in osc.feed(&buf[..n]) {
+                        match ev {
+                            crate::osc133::CmdEvent::Start => cmd_started = Some(Instant::now()),
+                            crate::osc133::CmdEvent::End { command, cwd, exit } => {
+                                let dur = cmd_started.take().map(|t| t.elapsed().as_secs());
+                                if let Some(sess) = &ledger_session {
                                     if let Some(entry) = crate::osc133::to_ledger_entry(
                                         sess, &ledger_surface, command, cwd, exit, dur,
                                     ) {
                                         crate::worklog::record(&entry);
                                     }
+                                }
+                            }
+                            crate::osc133::CmdEvent::Status { state, kind } => {
+                                if let Ok(mut s) = reader_status.lock() {
+                                    *s = (state != "clear")
+                                        .then(|| ProgramStatus { state, kind, at: Instant::now() });
                                 }
                             }
                         }
@@ -452,6 +477,7 @@ pub fn spawn(
         raw_tap_on,
         raw_history,
         line_log,
+        program_status,
     })
 }
 
@@ -589,6 +615,11 @@ impl Term {
     /// Kept because a pid is a JOIN KEY, not just a number: Claude Code records each live session
     /// at `~/.claude/sessions/<pid>.json`, so this is what turns "a coding agent is running here"
     /// into "and here is exactly which conversation it is".
+    /// What the program in this pane last said about itself, if it ever has. See `ProgramStatus`.
+    pub fn program_status(&self) -> Option<ProgramStatus> {
+        self.program_status.lock().ok()?.clone()
+    }
+
     pub fn foreground_pid(&self) -> Option<i32> {
         #[cfg(unix)]
         {
@@ -618,7 +649,24 @@ impl Term {
                 .args(["-o", "comm=", "-p", &leader.to_string()])
                 .output()
                 .ok()?;
-            Some(Self::command_name(&String::from_utf8_lossy(&out.stdout))).filter(|s| !s.is_empty())
+            let comm = Self::command_name(&String::from_utf8_lossy(&out.stdout));
+            if comm.is_empty() {
+                return None;
+            }
+            // An agent run by an interpreter shows as the interpreter: pi is `node`. Its arguments
+            // say which agent it is, and the agent's name is the honest answer to "what is this
+            // pane running". Read only for interpreters, so a native binary costs nothing extra.
+            if crate::agents::is_runtime(&comm) {
+                let args = std::process::Command::new("ps")
+                    .args(["-o", "args=", "-p", &leader.to_string()])
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+                if let Some(p) = crate::agents::by_process(&comm, args.as_deref()) {
+                    return Some(p.name.to_string());
+                }
+            }
+            Some(comm)
         }
         #[cfg(not(unix))]
         {
@@ -860,5 +908,51 @@ impl Term {
 
     pub fn view_offset(&self) -> usize {
         self.view_offset
+    }
+}
+
+/// pi, really running in a Mars pane: does Mars see it as `pi` (it runs as `node`), and do its
+/// status reports arrive? Needs pi installed and a model it can reach, so it runs only when asked:
+///
+///   MARS_PI_LIVE_CMD='env PI_CODING_AGENT_DIR=… pi --no-session "say hi"' \
+///     cargo test -- --ignored pi_in_a_pane
+#[cfg(all(test, unix))]
+mod pi_live {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn pi_in_a_pane() {
+        let Ok(cmd) = std::env::var("MARS_PI_LIVE_CMD") else { return };
+        let (tx, _rx) = mpsc::channel();
+        let mut term = spawn(1, 30, 100, 1000, 1 << 20, None, None, None, Duration::from_millis(50), tx)
+            .expect("spawn a pane");
+        std::thread::sleep(Duration::from_secs(2)); // the shell's own startup
+        term.send_bytes(cmd.as_bytes());
+        term.send_bytes(b"\r");
+        let mut names = Vec::new();
+        let mut states = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(20) {
+            if let Some(n) = term.foreground_command() {
+                if names.last() != Some(&n) {
+                    names.push(n);
+                }
+            }
+            if let Some(s) = term.program_status() {
+                if states.last() != Some(&s.state) {
+                    states.push(s.state);
+                }
+            }
+            if states.iter().any(|s| s == "done") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        eprintln!("foreground commands seen: {names:?}");
+        eprintln!("states reported: {states:?}");
+        assert!(names.iter().any(|n| n == "pi"), "Mars never saw pi by name: {names:?}");
+        assert!(states.iter().any(|s| s == "working"), "no working report: {states:?}");
+        assert!(states.iter().any(|s| s == "done"), "no done report: {states:?}");
     }
 }

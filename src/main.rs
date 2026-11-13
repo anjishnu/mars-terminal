@@ -25,6 +25,7 @@ mod layout;
 mod llm_log;
 mod manager;
 mod mode;
+mod agents;
 mod osc133;
 mod palette;
 mod pane;
@@ -391,7 +392,24 @@ fn main() -> Result<()> {
                 // that explains why the agent is or is not running — this answers the next
                 // question, which is whether what it produces is worth anything.
                 "health" => print!("{}", manager::health_report(ts)?),
-                other => anyhow::bail!("unknown: mars manager {other} (status | run [--force] | snapshot)"),
+                // Which coding agent takes the manager's turns. Writes the one knob, so the change
+                // is visible and reversible in tuning.json like any other.
+                "agent" => {
+                    let which = flags.get(1).map(String::as_str).unwrap_or("");
+                    let able: Vec<&str> = agents::AGENTS
+                        .iter()
+                        .filter(|a| a.manager_turn.is_some())
+                        .map(|a| a.name)
+                        .collect();
+                    let Some(command) = agents::by_name(which).and_then(|a| a.manager_turn) else {
+                        anyhow::bail!("usage: mars manager agent <{}>", able.join("|"));
+                    };
+                    let path = tuning::set_value("manager_agent_command", serde_json::json!(command))?;
+                    println!("manager turns now run on {which} ({}): {command}", path.display());
+                    // Tuning is read when a session starts, so say so rather than imply it is live.
+                    println!("takes effect when a Mars session next starts (`mars reboot` restarts this one)");
+                }
+                other => anyhow::bail!("unknown: mars manager {other} (status | run [--force] | snapshot | health | agent <name>)"),
             }
             return Ok(());
         }
