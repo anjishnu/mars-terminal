@@ -5928,6 +5928,9 @@ impl App {
             "{} -p \"$(cat {} 2>/dev/null || echo 'Warm-up run — process the open batch in inbox/ per AGENTS.md')\"",
             self.tuning.manager_agent_command, prompt_file,
         );
+        if let Some(repo) = crate::manager::repo_dir() {
+            crate::manager::lock_orders(&repo);
+        }
         self.status_msg = Some(format!("Manager: turn delivered ({line})"));
         if let Some(t) = self.terms.get_mut(&tid) {
             t.send_bytes(cmd.as_bytes());
