@@ -302,11 +302,7 @@ impl Default for Tuning {
             manager_snapshot_keep: 20,
             manager_detail_min_secs: 300,
             manager_agent_secs: 1200,
-            manager_agent_command:
-                "env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN claude \
-                  --model claude-sonnet-5 --effort medium \
-                  --add-dir ~/.mars/sessions --permission-mode acceptEdits"
-                    .into(),
+            manager_agent_command: crate::agents::CLAUDE_TURN.into(),
             manager_agent_stale_secs: 2700,
             restore_hold_secs: 300,
             rover_map_min_secs: 1,
@@ -616,8 +612,10 @@ fn default_knobs() -> Vec<(&'static str, Knob)> {
              workspace wakes the agent immediately regardless. Delete \
              ~/.mars/manager/memory/last_run to force a run on the next tick. 0 = agent off.")),
         ("manager_agent_command", knob(json!(d.manager_agent_command),
-            "The command run in the manager's hidden pane for each turn; the prompt is appended \
-             as `-p '<line>'`. ANTHROPIC_API_KEY is scrubbed deliberately — when it is set it \
+            "The command run in the manager's hidden pane for each turn. Where the command holds \
+             `{prompt}`, the turn's prompt goes there; otherwise it is appended as `-p '<line>'`, \
+             which is Claude Code's form. `mars manager agent <name>` sets it from the agents \
+             Mars knows (claude, pi). ANTHROPIC_API_KEY is scrubbed deliberately — when it is set it \
              takes precedence over the claude.ai login, so the agent would bill credits instead \
              of using the subscription (and fail outright when that key is empty). \
              --add-dir is required, not optional: session artifacts live in ~/.mars/sessions \
@@ -681,6 +679,28 @@ fn write_default_knobs(path: &std::path::Path) {
     if let Ok(json) = serde_json::to_string_pretty(&map) {
         let _ = std::fs::write(path, json);
     }
+}
+
+/// Set one knob's value in tuning.json, keeping every other knob as the person left it.
+/// A knob missing from the file is added with its built-in description, so the file stays
+/// self-explaining.
+pub fn set_value(name: &str, value: serde_json::Value) -> anyhow::Result<std::path::PathBuf> {
+    let path = tuning_path().ok_or_else(|| anyhow::anyhow!("no config directory"))?;
+    if !path.exists() {
+        write_default_knobs(&path);
+    }
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let entry = map.entry(name.to_string()).or_insert_with(|| {
+        default_knobs()
+            .into_iter()
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| serde_json::to_value(v).ok())
+            .unwrap_or_else(|| serde_json::json!({ "description": "" }))
+    });
+    entry["value"] = value;
+    std::fs::write(&path, serde_json::to_string_pretty(&map)?)?;
+    Ok(path)
 }
 
 /// Restore tuning.json to defaults, backing up the current file.

@@ -47,18 +47,22 @@ pub struct Conv {
 /// Returns the id AND when it was last written — because a row that says "live" about a session
 /// that last ran hours ago is a lie of exactly the kind this surface exists to stop telling.
 pub fn newest_for_dir(dir: &Path) -> Option<(String, u64)> {
-    let root = projects_root()?;
-    let encoded = project_slug(&dir.display().to_string());
+    let path = dir.display().to_string();
+    // Each agent's folder for this directory. Whichever agent last worked here wins.
     let mut best: Option<(std::time::SystemTime, String)> = None;
-    for e in std::fs::read_dir(root.join(encoded)).ok()?.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(stem) = p.file_stem().and_then(|x| x.to_str()) else { continue };
-        let Ok(m) = e.metadata().and_then(|m| m.modified()) else { continue };
-        if best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
-            best = Some((m, stem.to_string()));
+    for store in crate::agents::transcript_stores() {
+        let Some(root) = (store.root)() else { continue };
+        let Ok(entries) = std::fs::read_dir(root.join((store.folder)(&path))) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = p.file_stem().and_then(|x| x.to_str()).map(store.id_of) else { continue };
+            let Ok(m) = e.metadata().and_then(|m| m.modified()) else { continue };
+            if best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+                best = Some((m, stem.to_string()));
+            }
         }
     }
     best.map(|(t, id)| {
@@ -92,21 +96,29 @@ pub fn transcript_dir(chat: &str) -> Option<String> {
     Some(transcript_for(chat)?.parent()?.file_name()?.to_string_lossy().to_string())
 }
 
-fn projects_root() -> Option<PathBuf> {
-    crate::sys::paths::home_dir().map(|h| h.join(".claude").join("projects"))
-}
-
 /// Locate a transcript by conversation id.
 pub fn transcript_for(chat: &str) -> Option<PathBuf> {
     if chat.is_empty() {
         return None;
     }
-    let root = projects_root()?;
-    let want = format!("{chat}.jsonl");
-    std::fs::read_dir(root).ok()?.flatten().find_map(|e| {
-        let p = e.path().join(&want);
-        p.is_file().then_some(p)
-    })
+    // Each agent that Mars can read, in the table's order: the exact file where its names say
+    // it is, otherwise its folders are listed for a file carrying the id.
+    for store in crate::agents::transcript_stores() {
+        let Some(root) = (store.root)() else { continue };
+        let Ok(folders) = std::fs::read_dir(&root) else { continue };
+        let folders: Vec<_> = folders.flatten().map(|f| f.path()).collect();
+        let found = match (store.file_for)(chat) {
+            Some(name) => folders.iter().map(|f| f.join(&name)).find(|p| p.is_file()),
+            None => folders.iter().filter_map(|f| std::fs::read_dir(f).ok()).flatten().flatten().map(|e| e.path()).find(|p| {
+                p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                    && p.file_stem().and_then(|x| x.to_str()).map(store.id_of) == Some(chat)
+            }),
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
 /// How many bytes this conversation's transcript holds. `0` when there is no transcript.
@@ -263,4 +275,22 @@ pub fn gist_and_delta(
     // Strip frontmatter from the agent's markdown — the reader wants the prose.
     let gist = crate::manager::split_front(&gist).map(|(_, b)| b.to_string()).unwrap_or(gist);
     Some((gist.trim().to_string(), lines.join("\n\n")))
+}
+
+/// The manager's own conversation under pi, found the way the phone finds it: newest for the
+/// manager's folder, then by id, then read as rows. Needs a real pi session, so on request only:
+///
+///   PI_CODING_AGENT_DIR=… MARS_PI_LIVE_DIR=<folder pi ran in> cargo test -- --ignored pi_transcript
+#[cfg(test)]
+mod pi_live {
+    #[test]
+    #[ignore]
+    fn pi_transcript_is_found_and_read() {
+        let Ok(dir) = std::env::var("MARS_PI_LIVE_DIR") else { return };
+        let (id, _) = super::newest_for_dir(std::path::Path::new(&dir)).expect("newest session");
+        let path = super::transcript_for(&id).expect("found by id");
+        let w = crate::timeline::rows_for(&id, 0, crate::timeline::TAIL_BYTES).expect("rows");
+        eprintln!("id {id}\nfile {}\nrows {}", path.display(), w.rows.len());
+        assert!(w.rows.len() >= 4, "{:?}", w.rows);
+    }
 }

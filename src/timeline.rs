@@ -162,6 +162,10 @@ fn tool_summary(name: &str, input: &Value) -> String {
         "WebSearch" => pick("query"),
         "Task" | "Agent" => pick("description"),
         "TodoWrite" => None,
+        // pi's built-in tools, which name their arguments differently.
+        "read" | "write" | "edit" | "ls" => pick("path"),
+        "bash" => pick("command"),
+        "grep" | "find" => pick("pattern"),
         _ => None,
     };
     match salient {
@@ -242,7 +246,15 @@ fn change_of(name: &str, input: &Value) -> Option<Change> {
             before: get("old_string").map(|s| clean(s, CHANGE_CHARS)),
             after: clean(get("new_string")?, CHANGE_CHARS),
         }),
-        "Write" => Some(Change { before: None, after: clean(get("content")?, CHANGE_CHARS) }),
+        "Write" | "write" => Some(Change { before: None, after: clean(get("content")?, CHANGE_CHARS) }),
+        // pi's edit takes a list of replacements; shown as one change, joined in order.
+        "edit" => {
+            let edits = input.get("edits").and_then(|e| e.as_array())?;
+            let side = |k: &str| {
+                edits.iter().filter_map(|e| e.get(k).and_then(|v| v.as_str())).collect::<Vec<_>>().join("\n…\n")
+            };
+            Some(Change { before: Some(clean(&side("oldText"), CHANGE_CHARS)), after: clean(&side("newText"), CHANGE_CHARS) })
+        }
         _ => None,
     }
 }
@@ -337,22 +349,14 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                 }
                 for block in content.as_array().into_iter().flatten() {
                     match block["type"].as_str().unwrap_or("") {
-                        "tool_result" => {
-                            let id = block["tool_use_id"].as_str().unwrap_or_default();
-                            let failed = block["is_error"].as_bool().unwrap_or(false);
-                            let text = result_text(&block["content"]);
-                            if let Some((_, idx, started)) = pending.iter().find(|(pid, _, _)| pid == id) {
-                                let took = started.zip(at).map(|(a, b)| b.saturating_sub(a));
-                                if let Some(Row::Tool { status, detail, secs, .. }) = rows.get_mut(*idx) {
-                                    *status = if failed { ToolStatus::Failed } else { ToolStatus::Ok };
-                                    *secs = took;
-                                    let d = clean(&text, DETAIL_CHARS);
-                                    if !d.is_empty() {
-                                        *detail = Some(d);
-                                    }
-                                }
-                            }
-                        }
+                        "tool_result" => settle(
+                            &mut rows,
+                            &pending,
+                            block["tool_use_id"].as_str().unwrap_or_default(),
+                            block["is_error"].as_bool().unwrap_or(false),
+                            &result_text(&block["content"]),
+                            at,
+                        ),
                         "text" => {
                             let t = clean(block["text"].as_str().unwrap_or(""), PROSE_CHARS);
                             if !t.is_empty() && !is_machinery(&t) {
@@ -406,6 +410,8 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
                     }
                 }
             }
+            // pi: every conversation line is `message`, and the role says whose it is.
+            "message" => pi_message(&v["message"], at, &mut rows, &mut pending),
             // A record with no `message` is bookkeeping, not conversation — measured on a live
             // transcript: `relocated`, `agent-name`, `mode`, `permission-mode`, `last-prompt`,
             // `custom-title`, `ai-title`, `file-history-delta`, `attachment`. Showing those as
@@ -434,6 +440,103 @@ pub fn rows_from_str(body: &str, limit: usize) -> Vec<Row> {
         }
     }
     rows
+}
+
+/// A tool call's result arriving: the call's row, found where it was put, says how it ended.
+/// A result whose call is above the window is ignored rather than invented.
+fn settle(
+    rows: &mut [Row],
+    pending: &[(String, usize, Option<u64>)],
+    id: &str,
+    failed: bool,
+    text: &str,
+    at: Option<u64>,
+) {
+    let Some((_, idx, started)) = pending.iter().find(|(pid, _, _)| pid == id) else { return };
+    let took = started.zip(at).map(|(a, b)| b.saturating_sub(a));
+    if let Some(Row::Tool { status, detail, secs, .. }) = rows.get_mut(*idx) {
+        *status = if failed { ToolStatus::Failed } else { ToolStatus::Ok };
+        *secs = took;
+        let d = clean(text, DETAIL_CHARS);
+        if !d.is_empty() {
+            *detail = Some(d);
+        }
+    }
+}
+
+/// One line of a pi transcript, as the same rows a Claude Code one produces.
+///
+/// pi writes `{"type":"message","message":{"role":…}}`: `user` with a string or text blocks,
+/// `assistant` with `text`, `thinking` and `toolCall` blocks, and each tool's result as its own
+/// `toolResult` message. `system` lines carry the prompt and tool list, which are machinery.
+/// Sessions are trees (`parentId`); lines are read in the order written, which is the
+/// conversation as it happened, branches included.
+fn pi_message(
+    m: &Value,
+    at: Option<u64>,
+    rows: &mut Vec<Row>,
+    pending: &mut Vec<(String, usize, Option<u64>)>,
+) {
+    let content = &m["content"];
+    match m["role"].as_str().unwrap_or("") {
+        "user" => {
+            let text = content.as_str().map(str::to_string).unwrap_or_else(|| result_text(content));
+            let t = clean(&text, PROSE_CHARS);
+            if !t.is_empty() {
+                rows.push(Row::User { text: t });
+            }
+        }
+        "assistant" => {
+            for block in content.as_array().into_iter().flatten() {
+                match block["type"].as_str().unwrap_or("") {
+                    "text" => {
+                        let t = clean(block["text"].as_str().unwrap_or(""), PROSE_CHARS);
+                        if !t.is_empty() {
+                            rows.push(Row::Assistant { text: t });
+                        }
+                    }
+                    "thinking" => {
+                        let t = clean(block["thinking"].as_str().unwrap_or(""), DETAIL_CHARS);
+                        if !t.is_empty() {
+                            rows.push(Row::Reasoning { text: t });
+                        }
+                    }
+                    "toolCall" => {
+                        let id = block["id"].as_str().unwrap_or_default().to_string();
+                        let name = clean(block["name"].as_str().unwrap_or("tool"), 60);
+                        let input = &block["arguments"];
+                        pending.push((id.clone(), rows.len(), at));
+                        rows.push(Row::Tool {
+                            id,
+                            summary: tool_summary(&name, input),
+                            change: change_of(&name, input),
+                            name,
+                            status: ToolStatus::Running,
+                            detail: None,
+                            secs: None,
+                        });
+                    }
+                    other if !other.is_empty() => rows.push(Row::Unknown { label: other.to_string() }),
+                    _ => {}
+                }
+            }
+            // A turn that failed says so in the message rather than in a block.
+            if m["stopReason"].as_str() == Some("error") {
+                let why = m["errorMessage"].as_str().unwrap_or("the model call failed");
+                rows.push(Row::Error { message: clean(why, DETAIL_CHARS) });
+            }
+        }
+        "toolResult" => settle(
+            rows,
+            pending,
+            m["toolCallId"].as_str().unwrap_or_default(),
+            m["isError"].as_bool().unwrap_or(false),
+            &result_text(content),
+            at,
+        ),
+        "system" | "" => {}
+        other => rows.push(Row::Unknown { label: clean(other, 40) }),
+    }
 }
 
 /// The last `limit` rows of a conversation, by id.
@@ -665,3 +768,45 @@ pub(crate) fn title_of(path: &std::path::Path) -> String {
     title
 }
 
+
+#[cfg(test)]
+mod pi_tests {
+    use super::*;
+
+    /// A real pi manager turn, recorded against a scripted model: it read its orders, tried to
+    /// rewrite them (refused: they are read-only), and wrote a briefing.
+    const TURN: &str = include_str!("testdata/pi_manager_turn.jsonl");
+
+    #[test]
+    fn a_pi_turn_reads_as_the_same_rows_as_a_claude_one() {
+        let rows = rows_from_str(TURN, 0);
+        let tools: Vec<_> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Tool { name, summary, status, .. } => Some((name.as_str(), summary.as_str(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools,
+            vec![
+                ("read", "AGENTS.md", ToolStatus::Ok),
+                ("edit", "AGENTS.md", ToolStatus::Failed),
+                ("write", "out/mission_briefing.md", ToolStatus::Ok),
+            ]
+        );
+        // The prompt is the person's line; the system prompt is machinery and does not appear.
+        assert!(matches!(rows.first(), Some(Row::User { text }) if text.contains("mars-doc-version")));
+        assert!(!rows.iter().any(|r| matches!(r, Row::Unknown { .. })), "{rows:?}");
+        assert!(matches!(rows.last(), Some(Row::Assistant { text }) if text.starts_with("Briefing written")));
+    }
+
+    #[test]
+    fn a_refused_edit_says_why_and_a_write_shows_what_it_wrote() {
+        let rows = rows_from_str(TURN, 0);
+        let edit = rows.iter().find(|r| matches!(r, Row::Tool { name, .. } if name == "edit")).unwrap();
+        assert!(matches!(edit, Row::Tool { detail: Some(d), change: Some(_), .. } if d.contains("EACCES")));
+        let write = rows.iter().find(|r| matches!(r, Row::Tool { name, .. } if name == "write")).unwrap();
+        assert!(matches!(write, Row::Tool { change: Some(Change { before: None, after }), .. } if after.contains("All quiet")));
+    }
+}

@@ -1013,6 +1013,9 @@ impl App {
             PaneContent::Terminal(tid) => tid,
             PaneContent::Editor(_) => return Verdict::Context,
         };
+        if let Some(v) = self.reported_verdict(tid) {
+            return v;
+        }
         if let Some(w) = self.watches.get(&tid) {
             let judged = w
                 .verdict
@@ -1069,6 +1072,30 @@ impl App {
     /// A pane whose PTY cannot report a foreground group answers `None` there, and this
     /// returns false — no claim rather than a guess. Windows therefore never stalls, and
     /// the board reads exactly as it did before.
+    /// An agent's own report of its state, when the agent in this pane gives one (OSC 7501).
+    ///
+    /// Trusted only while the pane is still running an agent: a report outlives the program that
+    /// sent it, and a shell back at its prompt is not "working". Mapped conservatively:
+    /// - `working` is Running, so a long tool call with nothing on screen is not taken for stalled;
+    /// - `error` is Failed;
+    /// - `blocked` is Stalled, which reads as "waiting on you", NOT Blocked: a Blocked pane gets
+    ///   "Answer y / Answer n" buttons, and pi blocks on things like signing in, where `y` is wrong;
+    /// - `done` and `idle` are left to the usual judgement of silence and the screen.
+    fn reported_verdict(&self, tid: crate::terminal::TermId) -> Option<crate::briefing::Verdict> {
+        use crate::briefing::Verdict;
+        let cmd = self.fg_commands.get(&tid)?;
+        if !crate::agents::is_agent_name(cmd) {
+            return None;
+        }
+        let status = self.terms.get(&tid)?.program_status()?;
+        match status.state.as_str() {
+            "working" => Some(Verdict::Running),
+            "error" => Some(Verdict::Failed),
+            "blocked" => Some(Verdict::Stalled),
+            _ => None,
+        }
+    }
+
     pub fn pane_stalled(&self, tid: crate::terminal::TermId) -> bool {
         if self.tuning.stall_secs == 0 {
             return false;
@@ -5924,10 +5951,11 @@ impl App {
         let prompt_file = crate::manager::repo_dir()
             .map(|r| r.join("prompt.md").to_string_lossy().to_string())
             .unwrap_or_default();
-        let cmd = format!(
-            "{} -p \"$(cat {} 2>/dev/null || echo 'Warm-up run — process the open batch in inbox/ per AGENTS.md')\"",
-            self.tuning.manager_agent_command, prompt_file,
+        let prompt = format!(
+            "\"$(cat {} 2>/dev/null || echo 'Warm-up run — process the open batch in inbox/ per AGENTS.md')\"",
+            prompt_file,
         );
+        let cmd = manager_turn(&self.tuning.manager_agent_command, &prompt);
         if let Some(repo) = crate::manager::repo_dir() {
             crate::manager::lock_orders(&repo);
         }
@@ -8498,4 +8526,33 @@ fn terminal_screen_to_ansi(screen: &vt100::Screen) -> String {
         }
     }
     text
+}
+
+/// The command typed for one manager turn. A command holding `{prompt}` names where the prompt
+/// goes, which is how agents other than Claude Code take theirs; one without it gets Claude Code's
+/// `-p <prompt>` appended, so every existing configuration means what it meant.
+pub(crate) fn manager_turn(command: &str, prompt: &str) -> String {
+    if command.contains("{prompt}") {
+        command.replace("{prompt}", prompt)
+    } else {
+        format!("{command} -p {prompt}")
+    }
+}
+
+#[cfg(test)]
+mod manager_turn_tests {
+    use super::manager_turn;
+
+    #[test]
+    fn a_template_says_where_the_prompt_goes() {
+        assert_eq!(
+            manager_turn(crate::agents::PI_TURN, "\"$(cat prompt.md)\""),
+            "pi --print --no-approve --tools read,grep,find,ls,write,edit \"$(cat prompt.md)\""
+        );
+    }
+
+    #[test]
+    fn a_command_without_one_means_what_it_always_meant() {
+        assert_eq!(manager_turn("claude --model x", "\"p\""), "claude --model x -p \"p\"");
+    }
 }

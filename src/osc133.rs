@@ -19,6 +19,9 @@
 //!   - `133 ; D [; <exit>]` command finished, with exit code
 //!   - `633 ; E ; <cmd>`    the command line (VS Code extension)
 //!   - `7 ; file://host/path`  the cwd
+//!   - `7501 ; state=… : kind=…` a program's own report of its state (the Program Status
+//!     Protocol). pi sends these: `working`, `blocked`, `done`, `error`, `idle`. Unlike every
+//!     other signal a terminal has about an agent, it is the agent saying so, not Mars guessing.
 
 const MAX_OSC: usize = 8192;
 
@@ -41,6 +44,9 @@ pub enum CmdEvent {
         cwd: Option<String>,
         exit: Option<i32>,
     },
+    /// A program reported its own state (OSC 7501). `kind` qualifies `blocked`: `permission`,
+    /// `question` or `auth`. Reports carry no prompt or output text, only these words.
+    Status { state: String, kind: Option<String> },
 }
 
 /// Incremental OSC scanner. One per terminal, fed the raw PTY bytes; state (a
@@ -148,6 +154,25 @@ impl Scanner {
                     }
                 }
             }
+            // `7501 ; key=value : key=value`. A program's support query (`7501 ; ?`) is not a
+            // report and is ignored: Mars asks agents to report unconditionally instead
+            // (`PI_PROGRAM_STATUS=1`), which needs no reply written back into the pane.
+            "7501" => {
+                let mut state = None;
+                let mut kind = None;
+                for pair in rest.split(':') {
+                    let Some((k, v)) = pair.split_once('=') else { continue };
+                    match k.trim() {
+                        "state" => state = Some(v.trim().to_string()),
+                        "kind" => kind = Some(v.trim().to_string()),
+                        _ => {}
+                    }
+                }
+                let known = ["idle", "working", "done", "blocked", "error", "clear"];
+                if let Some(state) = state.filter(|s| known.contains(&s.as_str())) {
+                    out.push(CmdEvent::Status { state, kind });
+                }
+            }
             _ => {}
         }
     }
@@ -186,4 +211,36 @@ pub fn to_ledger_entry(
         exit,
         error_excerpt: None,
     })
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn a_program_status_report_is_read_with_either_terminator() {
+        let evs = Scanner::new().feed(
+            b"text\x1b]7501;state=working:app=pi:msg=c2Vzc2lvbg==\x1b\\more\x1b]7501;state=blocked:kind=auth\x07",
+        );
+        assert_eq!(
+            evs,
+            vec![
+                CmdEvent::Status { state: "working".into(), kind: None },
+                CmdEvent::Status { state: "blocked".into(), kind: Some("auth".into()) },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_query_or_an_unknown_state_is_not_a_report() {
+        assert!(Scanner::new().feed(b"\x1b]7501;?\x1b\\").is_empty());
+        assert!(Scanner::new().feed(b"\x1b]7501;state=dancing\x07").is_empty());
+    }
+
+    #[test]
+    fn a_report_split_across_reads_still_arrives() {
+        let mut s = Scanner::new();
+        assert!(s.feed(b"\x1b]7501;sta").is_empty());
+        assert_eq!(s.feed(b"te=done\x07"), vec![CmdEvent::Status { state: "done".into(), kind: None }]);
+    }
 }
