@@ -3911,6 +3911,10 @@ pub fn resolve_path_for_test(raw: &str) -> std::io::Result<PathBuf> {
 pub fn resolve_path_in_for_test(base: Option<&std::path::Path>, raw: &str) -> std::io::Result<PathBuf> {
     resolve_path_in(base, raw)
 }
+/// The manager's reply to `want`, for the selfcheck: every reply must carry the type it answers.
+pub fn manager_view_for_test(want: &str, session: &str) -> String {
+    manager_view_json(want, session)
+}
 pub fn fs_home_for_test() -> PathBuf {
     fs_home()
 }
@@ -4047,12 +4051,16 @@ fn manager_view_json(want: &str, session: &str) -> String {
     // FAIL CLOSED. This skipped filtering entirely when the directory could not be resolved, so
     // the one case where isolation is uncertain was the case that showed everything. A session
     // whose dir is missing is exactly when you know least about what belongs to it.
-    let want = dir_id.as_deref().unwrap_or("\u{0}never-matches");
+    //
+    // `dir`, not `want`: this once shadowed the requested type, so every reply went out as the
+    // board and labelled with the directory, and the phone — which reads replies by their type —
+    // dropped all three. The selfcheck now asks for each and checks what comes back.
+    let dir = dir_id.as_deref().unwrap_or("\u{0}never-matches");
     if let Some(memos) = v["memos"].as_array_mut() {
-        memos.retain(|c| c["dir"].as_str() == Some(want));
+        memos.retain(|c| c["dir"].as_str() == Some(dir));
     }
     if let Some(sessions) = v["sessions"].as_array_mut() {
-        sessions.retain(|e| e["dir"].as_str() == Some(want));
+        sessions.retain(|e| e["dir"].as_str() == Some(dir));
     }
     let body = match want {
         "manager.memos" => serde_json::json!({ "memos": v["memos"] }),

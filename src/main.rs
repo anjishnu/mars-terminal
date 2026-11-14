@@ -8994,6 +8994,26 @@ fi
     }
     println!("[selfcheck] pair: --help prints usage and no token; unknown flags exit 2 ... PASS");
 
+    // ── The manager's replies carry the type they answer ────────────────────────────────
+    // The phone files a reply by its `t`. A variable that shadowed the requested type sent all
+    // three out as the board, labelled with the session's directory, so the phone dropped every
+    // one: no memos, no manager health, no Rover readiness — for months, silently.
+    #[cfg(feature = "web")]
+    {
+        for want in ["manager.board", "manager.memos", "manager.health"] {
+            let v: serde_json::Value =
+                serde_json::from_str(&serve::manager_view_for_test(want, "selfcheck-replies"))?;
+            assert_eq!(v["t"].as_str(), Some(want), "a {want} request was answered as {}", v["t"]);
+        }
+        let h: serde_json::Value =
+            serde_json::from_str(&serve::manager_view_for_test("manager.health", "selfcheck-replies"))?;
+        assert!(h.get("agentEnabled").is_some() && h.get("rover").is_some(), "health lost its fields: {h}");
+        let m: serde_json::Value =
+            serde_json::from_str(&serve::manager_view_for_test("manager.memos", "selfcheck-replies"))?;
+        assert!(m.get("memos").is_some(), "memos lost their list: {m}");
+        println!("[selfcheck] manager replies carry the type they answer ... PASS");
+    }
+
     // ── The bridge's filesystem seam ────────────────────────────────────────────────────
     // The phone reaches this over a PUBLIC tunnel, so `fs.read`/`fs.write` with an unbounded
     // path was arbitrary file access as the user: `~/.ssh/id_rsa` out, `~/.zshrc` in, which is
