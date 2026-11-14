@@ -573,15 +573,18 @@ impl Term {
     ///
     /// The bare command name out of whatever `ps` reported.
     ///
-    /// Two surprises, each of which silently defeats an exact match. macOS `ps -o comm=` includes
-    /// ARGUMENTS, so Claude Code's helpers report as `claude bg-pty-host`; and anything off the
-    /// default PATH reports a full path. Take the first token, then its basename.
+    /// Three surprises, each of which silently defeats an exact match. macOS `ps -o comm=` includes
+    /// ARGUMENTS, so Claude Code's helpers report as `claude bg-pty-host`; anything off the default
+    /// PATH reports a full path; and Claude Code's npm package ships its native binary as
+    /// `claude.exe` on every platform, Linux included. Take the first token, its basename, and the
+    /// name without `.exe`.
     ///
     /// Getting this wrong is invisible rather than loud: the agent flag simply never gets set, and
     /// a reboot quietly comes back without resuming the conversation it was supposed to restore.
     pub fn command_name(ps_output: &str) -> String {
         let first = ps_output.trim().split_whitespace().next().unwrap_or_default();
-        first.rsplit('/').next().unwrap_or(first).to_string()
+        let base = first.rsplit('/').next().unwrap_or(first);
+        base.strip_suffix(".exe").unwrap_or(base).to_string()
     }
 
     /// The pid of the foreground process group, when a command is running.

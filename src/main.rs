@@ -2129,6 +2129,13 @@ fi
             assert_eq!(cn("/Users/me/.local/bin/claude"), "claude",
                 "a full path defeated the command name");
             assert_eq!(cn("  /bin/zsh  \n"), "zsh", "whitespace was not trimmed");
+            // Claude Code from npm runs as `claude.exe`, on Linux too — what a hosted machine
+            // reported, which left its agent pane unrecognised and its conversation unfound.
+            assert_eq!(cn("claude.exe"), "claude", "`.exe` defeated the command name");
+            assert_eq!(
+                cn("/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+                "claude"
+            );
             // …and it must not turn an unrelated command into a match.
             assert_eq!(cn("cargo build --release"), "cargo");
             assert_eq!(cn(""), "");
