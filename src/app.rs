@@ -1294,7 +1294,33 @@ impl App {
                         }
                     }
                 }
-                if blocked {
+                // A MENU ON SCREEN IS A QUESTION, whatever the verdict says. Claude Code asks for
+                // permission with a numbered menu, and "Do you want to make this edit to x?" trips
+                // none of triage's marks — so the pane read as quiet while it waited on a person. It
+                // is read live off the screen on every board, and carries each option with the keys
+                // that choose it, so the phone can offer the real answers rather than a guessed y/n.
+                let menu = match self.panes.get(&s.pane_id).map(|p| &p.content) {
+                    Some(PaneContent::Terminal(t)) => crate::briefing::menu_of(&self.terminal_tail(*t, 24)),
+                    _ => None,
+                };
+                if let Some(m) = menu {
+                    let options: Vec<serde_json::Value> = m
+                        .options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, label)| {
+                            serde_json::json!({ "label": label, "keys": crate::briefing::menu_keys(m.cursor, i) })
+                        })
+                        .collect();
+                    row["verdict"] = serde_json::json!("blocked");
+                    row["why"] = serde_json::json!(m.question);
+                    row["blocked"] = serde_json::json!({
+                        "prompt": m.question,
+                        "detail": m.detail.join("\n"),
+                        "paneId": s.pane_id.to_string(),
+                        "options": options,
+                    });
+                } else if blocked {
                     row["blocked"] = serde_json::json!({
                         "prompt": prompt,
                         "paneId": s.pane_id.to_string(),
