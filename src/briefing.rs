@@ -229,6 +229,141 @@ pub fn triage(tail: &str, exit: Option<i32>, running: bool) -> Triage {
 
 /// Class of a verdict STRING (model- or tier-0-authored): the `blocked:` /
 /// `failed:` / `done:` prefixes the prompts mandate, with keyword fallbacks.
+/// A choice the screen is waiting on: a numbered menu with a cursor on one option, the way Claude
+/// Code (and any Ink `Select`) draws its permission, edit, plan and trust prompts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Menu {
+    /// The line that asks, e.g. "Do you want to make this edit to serve.rs?".
+    pub question: String,
+    /// Each option's words, without its number. Wrapped options are joined back into one line.
+    pub options: Vec<String>,
+    /// Which option the cursor is on, 0-based.
+    pub cursor: usize,
+}
+
+/// A frame character a dialog may draw down its sides.
+fn is_frame(c: char) -> bool {
+    matches!(c, '│' | '┃' | '║' | '|' | '╭' | '╮' | '╰' | '╯' | '─' | '━')
+}
+
+/// A screen row with a dialog's side frame removed, keeping its indentation.
+fn unframe(line: &str) -> String {
+    line.trim_start_matches(is_frame)
+        .trim_end_matches(|c: char| c.is_whitespace() || is_frame(c))
+        .to_string()
+}
+
+/// `(cursor?, number, words)` for a line like "❯ 2. Yes, and don't ask again".
+fn menu_option(line: &str) -> Option<(bool, u32, String)> {
+    let s = line.trim();
+    let (cursor, rest) = match s.strip_prefix(['❯', '›', '▶']) {
+        Some(after) => (true, after.trim_start()),
+        None => (false, s),
+    };
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 2 {
+        return None;
+    }
+    let words = rest[digits.len()..].strip_prefix(". ")?;
+    Some((cursor, digits.parse().ok()?, words.trim().to_string()))
+}
+
+/// Read a numbered menu off the bottom of a screen.
+///
+/// THE CURSOR IS THE PROOF. Claude's own prose is full of numbered lists, and reading one of those
+/// as a menu would put answer buttons on a paragraph. A list only counts when exactly one of its
+/// options carries the selection cursor (`❯`), numbered from 1 in order, and it sits at the bottom
+/// of the screen with at most three lines (hints like "Esc to cancel") below it.
+///
+/// A phone's 39 columns wrap long options onto the next line, and the wrapped part is joined back:
+/// between two options every line belongs to the one above, and below the last option a line counts
+/// only if it is indented at least as far as that option's number. The labels are for reading; the
+/// keys choose by position, so a label cut short still answers correctly.
+pub fn menu_of(tail: &str) -> Option<Menu> {
+    let rows: Vec<String> = tail.lines().map(unframe).collect();
+    let indent = |l: &str| l.chars().take_while(|c| c.is_whitespace()).count();
+    // The bottom-most option, then up through the run: options and the lines wrapped from them.
+    let last = rows.iter().rposition(|l| menu_option(l).is_some())?;
+    let mut first = last;
+    let mut i = last;
+    while i > 0 {
+        i -= 1;
+        if menu_option(&rows[i]).is_some() {
+            first = i;
+            continue;
+        }
+        // A wrapped line belongs to an option further up; keep going only if one is there.
+        let above = rows[..i].iter().rposition(|l| menu_option(l).is_some() || l.trim().is_empty());
+        match above {
+            Some(j) if menu_option(&rows[j]).is_some() && i - j <= 3 => {}
+            _ => break,
+        }
+    }
+    let mut options: Vec<String> = Vec::new();
+    let mut cursor = None;
+    let mut lead = 0;
+    let mut end = last;
+    for (k, line) in rows.iter().enumerate().skip(first) {
+        match menu_option(line) {
+            Some((cur, n, words)) if k <= last => {
+                if n as usize != options.len() + 1 {
+                    return None;
+                }
+                if cur {
+                    if cursor.is_some() {
+                        return None;
+                    }
+                    cursor = Some(options.len());
+                }
+                options.push(words);
+                lead = indent(line);
+                end = k;
+            }
+            _ if k < last && !line.trim().is_empty() => {
+                if let Some(o) = options.last_mut() {
+                    o.push(' ');
+                    o.push_str(line.trim());
+                }
+            }
+            _ if k > last && k <= last + 3 && k == end + 1 && !line.trim().is_empty() && indent(line) >= lead => {
+                if let Some(o) = options.last_mut() {
+                    o.push(' ');
+                    o.push_str(line.trim());
+                }
+                end = k;
+            }
+            _ if k > last => break,
+            _ => {}
+        }
+    }
+    if rows[end + 1..].iter().filter(|l| !l.trim().is_empty()).count() > 3 {
+        return None;
+    }
+    let cursor = cursor?;
+    if options.len() < 2 {
+        return None;
+    }
+    // The question: the nearest line above that asks one, else the nearest line with words.
+    let above: Vec<&str> =
+        rows[..first].iter().rev().map(|l| l.trim()).filter(|l| !l.is_empty()).take(8).collect();
+    let question = above
+        .iter()
+        .find(|l| l.ends_with('?'))
+        .or_else(|| above.first())
+        .map(|l| l.to_string())
+        .unwrap_or_default();
+    Some(Menu { question, options, cursor })
+}
+
+/// The keys that choose option `to` from the cursor at `from`: arrows, then Enter. Arrows rather
+/// than the option's number, because every `Select` moves on arrows and not every one reads digits.
+pub fn menu_keys(from: usize, to: usize) -> String {
+    let step = if to > from { "\x1b[B" } else { "\x1b[A" };
+    let mut keys = step.repeat(to.abs_diff(from));
+    keys.push('\r');
+    keys
+}
+
 pub fn classify(text: &str, default: Verdict) -> Verdict {
     let low = text.trim().to_lowercase();
     if low.starts_with("blocked") || low.contains("waiting on your input") {

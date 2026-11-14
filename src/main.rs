@@ -6970,6 +6970,34 @@ fi
         assert!(t.text.contains("137") && t.ambiguous, "nonzero exit wants a modeled cause: {}", t.text);
         assert_eq!(triage("Continue? [y/N]", None, true).verdict, Verdict::Blocked);
         assert!(!triage("Continue? [y/N]", None, true).ambiguous);
+        // Menus read off the screen: Claude Code's permission prompt, as a 39-column phone wraps it.
+        {
+            use briefing::{menu_keys, menu_of};
+            let claude = "⏺ Bash(rm -rf target/debug/build)\n\n Bash command\n\n   rm -rf target/debug/build\n   Remove the build directory\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for rm commands in\n   /home/user/project\n   3. No, and tell Claude what to do differently\n   (esc)\n";
+            let m = menu_of(claude).expect("Claude's permission menu was not read");
+            assert_eq!(m.question, "Do you want to proceed?");
+            assert_eq!(m.cursor, 0);
+            assert_eq!(m.options, vec![
+                "Yes".to_string(),
+                "Yes, and don't ask again for rm commands in /home/user/project".to_string(),
+                "No, and tell Claude what to do differently (esc)".to_string(),
+            ], "wrapped options were not joined");
+            // Inside a drawn box, with the cursor further down.
+            let boxed = "╭────────────────────────────────╮\n│ Do you want to make this edit to serve.rs? │\n│   1. Yes                        │\n│ ❯ 2. No                         │\n╰────────────────────────────────╯";
+            let b = menu_of(boxed).expect("a boxed menu was not read");
+            assert_eq!((b.question.as_str(), b.options.len(), b.cursor), ("Do you want to make this edit to serve.rs?", 2, 1));
+            // The keys: arrows from the cursor, then Enter.
+            assert_eq!(menu_keys(1, 0), "\x1b[A\r");
+            assert_eq!(menu_keys(0, 2), "\x1b[B\x1b[B\r");
+            assert_eq!(menu_keys(1, 1), "\r");
+            // Not menus: Claude's own numbered prose has no cursor, and a list scrolled up out of
+            // the way is not what the screen is waiting on.
+            assert!(menu_of("I'll do three things:\n1. Fix the reader\n2. Add a test\n3. Ship it").is_none(),
+                "a numbered paragraph was read as a menu");
+            assert!(menu_of("Pick one\n❯ 1. A\n  2. B\nline\nline\nline\nline").is_none(),
+                "a menu with output below it was read as waiting");
+            assert!(menu_of("Pick one\n❯ 1. A\n  3. B").is_none(), "out-of-order numbers were accepted");
+        }
         assert_eq!(triage("CUDA out of memory. Tried to allocate", None, true).verdict, Verdict::Failed);
         assert_eq!(triage("epoch 3/10  loss 0.42  1.2 it/s", None, true).verdict, Verdict::Running);
         assert!(!triage("epoch 3/10  loss 0.42  1.2 it/s", None, true).ambiguous);
