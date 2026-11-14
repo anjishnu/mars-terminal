@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.6
+
+The manager's replies reach Rover again.
+
+### Fixed
+
+- **Rover dropped every manager reply.** Since 0.7.1 the bridge answered `manager.board`,
+  `manager.memos` and `manager.health` labelled with the session's directory instead of the type
+  that was asked for, because a local variable shadowed it. Rover files replies by type, so it
+  never saw the manager's memos, whether the manager was on, or whether Rover's own agent was
+  ready. Each reply now carries the type it answers, and the selfcheck asks for all three.
+
 ## 0.7.5
 
 A machine that already has a public address can serve Rover with no tunnel, and a session that
