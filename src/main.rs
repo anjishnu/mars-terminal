@@ -6976,6 +6976,8 @@ fi
             let claude = "⏺ Bash(rm -rf target/debug/build)\n\n Bash command\n\n   rm -rf target/debug/build\n   Remove the build directory\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for rm commands in\n   /home/user/project\n   3. No, and tell Claude what to do differently\n   (esc)\n";
             let m = menu_of(claude).expect("Claude's permission menu was not read");
             assert_eq!(m.question, "Do you want to proceed?");
+            assert_eq!(m.detail, vec!["Bash command", "rm -rf target/debug/build", "Remove the build directory"],
+                "the lines saying what is being asked about were not read");
             assert_eq!(m.cursor, 0);
             assert_eq!(m.options, vec![
                 "Yes".to_string(),

@@ -1316,6 +1316,7 @@ impl App {
                     row["why"] = serde_json::json!(m.question);
                     row["blocked"] = serde_json::json!({
                         "prompt": m.question,
+                        "detail": m.detail.join("\n"),
                         "paneId": s.pane_id.to_string(),
                         "options": options,
                     });

@@ -235,6 +235,9 @@ pub fn triage(tail: &str, exit: Option<i32>, running: bool) -> Triage {
 pub struct Menu {
     /// The line that asks, e.g. "Do you want to make this edit to serve.rs?".
     pub question: String,
+    /// Up to three lines above the question, top first: what is being asked about ("Bash command",
+    /// the command, its description). "Do you want to proceed?" alone says nothing.
+    pub detail: Vec<String>,
     /// Each option's words, without its number. Wrapped options are joined back into one line.
     pub options: Vec<String>,
     /// Which option the cursor is on, 0-based.
@@ -346,13 +349,11 @@ pub fn menu_of(tail: &str) -> Option<Menu> {
     // The question: the nearest line above that asks one, else the nearest line with words.
     let above: Vec<&str> =
         rows[..first].iter().rev().map(|l| l.trim()).filter(|l| !l.is_empty()).take(8).collect();
-    let question = above
-        .iter()
-        .find(|l| l.ends_with('?'))
-        .or_else(|| above.first())
-        .map(|l| l.to_string())
-        .unwrap_or_default();
-    Some(Menu { question, options, cursor })
+    let q = above.iter().position(|l| l.ends_with('?')).unwrap_or(0);
+    let question = above.get(q).map(|l| l.to_string()).unwrap_or_default();
+    let mut detail: Vec<String> = above.iter().skip(q + 1).take(3).map(|l| l.to_string()).collect();
+    detail.reverse();
+    Some(Menu { question, detail, options, cursor })
 }
 
 /// The keys that choose option `to` from the cursor at `from`: arrows, then Enter. Arrows rather
